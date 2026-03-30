@@ -1,3 +1,4 @@
+pub mod csharp;
 pub mod go;
 pub mod python;
 pub mod rust_parser;
@@ -30,6 +31,7 @@ pub fn detect_language(path: &str) -> Option<&'static str> {
         "ts" | "tsx" => Some("typescript"),
         "js" | "jsx" => Some("javascript"),
         "swift" => Some("swift"),
+        "cs" => Some("csharp"),
         _ => None,
     }
 }
@@ -42,6 +44,7 @@ pub fn get_parser(language: &str) -> Option<Box<dyn LanguageParser>> {
         "python" => Some(Box::new(python::PythonParser::new())),
         "typescript" | "javascript" => Some(Box::new(typescript::TypeScriptParser::new(language))),
         "swift" => Some(Box::new(swift::SwiftParser::new())),
+        "csharp" => Some(Box::new(csharp::CSharpParser::new())),
         _ => None,
     }
 }
@@ -77,6 +80,7 @@ mod tests {
         assert_eq!(detect_language("app.js"), Some("javascript"));
         assert_eq!(detect_language("app.jsx"), Some("javascript"));
         assert_eq!(detect_language("main.swift"), Some("swift"));
+        assert_eq!(detect_language("Program.cs"), Some("csharp"));
         assert_eq!(detect_language("data.json"), None);
         assert_eq!(detect_language("Makefile"), None);
     }

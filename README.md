@@ -16,6 +16,7 @@ Helios parses source code with tree-sitter, extracts symbols, imports, and refer
 | TypeScript | `.ts`, `.tsx` |
 | JavaScript | `.js`, `.jsx` |
 | Swift | `.swift` |
+| C# | `.cs` |
 
 ## Installation
 
@@ -148,6 +149,7 @@ parsers/
   python.rs          Functions, classes, module constants
   typescript.rs      Functions, classes, types, interfaces, enums
   swift.rs           Classes, functions, structs
+  csharp.rs          Classes, structs, records, interfaces, enums, methods, properties
 db.rs                SQLite wrapper (files, symbols, imports, references)
 git.rs               Git integration (HEAD, diff, repo detection)
 ```

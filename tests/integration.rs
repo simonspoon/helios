@@ -119,6 +119,48 @@ class AppState {
     )
     .unwrap();
 
+    std::fs::write(
+        dir.path().join("Models.cs"),
+        r#"
+using System;
+using System.Collections.Generic;
+
+namespace MyApp.Models {
+    public class Person {
+        public string Name { get; set; }
+        public int Age { get; set; }
+
+        public Person(string name, int age) {
+            Name = name;
+            Age = age;
+        }
+
+        public void Greet() {
+            Console.WriteLine("Hello " + Name);
+        }
+    }
+
+    public interface IRepository<T> {
+        T GetById(int id);
+        void Delete(int id);
+    }
+
+    public enum Status {
+        Active,
+        Inactive
+    }
+
+    public record Point(int X, int Y);
+
+    public struct Vector {
+        public double X;
+        public double Y;
+    }
+}
+"#,
+    )
+    .unwrap();
+
     dir
 }
 
@@ -401,10 +443,10 @@ fn test_multi_language_index() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json: serde_json::Value = serde_json::from_str(&stdout).expect("parsing JSON");
 
-    // Should index all 4 files (rs, py, go, ts)
+    // Should index all 5 files (rs, py, go, ts, cs)
     assert!(
-        json["files_indexed"].as_u64().unwrap() >= 4,
-        "Should index at least 4 files, got: {}",
+        json["files_indexed"].as_u64().unwrap() >= 5,
+        "Should index at least 5 files, got: {}",
         json["files_indexed"]
     );
 
@@ -434,4 +476,97 @@ fn test_multi_language_index() {
     assert!(files.contains("lib.py"), "should have Python symbols");
     assert!(files.contains("server.go"), "should have Go symbols");
     assert!(files.contains("app.ts"), "should have TypeScript symbols");
+    assert!(files.contains("Models.cs"), "should have C# symbols");
+}
+
+#[test]
+fn test_csharp_indexing() {
+    let dir = create_test_project();
+    let bin = helios_bin();
+
+    // Init the project
+    Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("init");
+
+    // Query C# symbols by file
+    let output = Command::new(&bin)
+        .args(["--json", "symbols", "--file", "Models.cs"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --file Models.cs");
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let symbols: Vec<serde_json::Value> = serde_json::from_str(&stdout).expect("parsing JSON");
+
+    // Collect symbol names and kinds
+    let sym_info: Vec<(String, String)> = symbols
+        .iter()
+        .map(|s| {
+            (
+                s["name"].as_str().unwrap().to_string(),
+                s["kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+
+    // Verify key C# symbols were extracted
+    assert!(
+        sym_info.iter().any(|(n, k)| n == "Person" && k == "class"),
+        "Should find Person class, got: {:?}",
+        sym_info
+    );
+    assert!(
+        sym_info
+            .iter()
+            .any(|(n, k)| n == "IRepository" && k == "interface"),
+        "Should find IRepository interface, got: {:?}",
+        sym_info
+    );
+    assert!(
+        sym_info.iter().any(|(n, k)| n == "Status" && k == "enum"),
+        "Should find Status enum, got: {:?}",
+        sym_info
+    );
+    assert!(
+        sym_info.iter().any(|(n, k)| n == "Vector" && k == "struct"),
+        "Should find Vector struct, got: {:?}",
+        sym_info
+    );
+    assert!(
+        sym_info.iter().any(|(n, k)| n == "Greet" && k == "fn"),
+        "Should find Greet method, got: {:?}",
+        sym_info
+    );
+    assert!(
+        sym_info.iter().any(|(n, k)| n == "Name" && k == "fn"),
+        "Should find Name property, got: {:?}",
+        sym_info
+    );
+
+    // Verify namespace was captured
+    assert!(
+        sym_info
+            .iter()
+            .any(|(n, k)| n == "MyApp.Models" && k == "mod"),
+        "Should find MyApp.Models namespace, got: {:?}",
+        sym_info
+    );
+
+    // Verify the file is recognized as csharp
+    let output = Command::new(&bin)
+        .args(["--json", "summary"])
+        .current_dir(dir.path())
+        .output()
+        .expect("summary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Models.cs"),
+        "Summary should include the C# file"
+    );
 }
