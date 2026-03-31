@@ -1446,3 +1446,260 @@ fn test_status_compact_json() {
         serde_json::from_str(trimmed).expect("compact output must be valid JSON");
     assert_eq!(json["indexed"], serde_json::json!(true));
 }
+
+// --- Diff command tests ---
+
+/// Helper: create a git-backed test project, index it, and return (temp_dir, binary_path)
+fn setup_git_indexed_project() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    // Init git repo
+    let output = Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git init");
+    assert!(output.status.success(), "git init failed");
+
+    // Configure git user for commits
+    Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git config email");
+    Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git config name");
+
+    // Create a source file
+    std::fs::write(
+        dir.path().join("main.rs"),
+        r#"pub fn hello() {
+    println!("hello");
+}
+
+pub struct Config {
+    pub name: String,
+}
+
+fn helper() -> i32 {
+    42
+}
+"#,
+    )
+    .unwrap();
+
+    // Commit
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(dir.path())
+        .output()
+        .expect("git add");
+    Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git commit");
+
+    // Index with helios
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(
+        output.status.success(),
+        "helios init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    (dir, bin)
+}
+
+#[test]
+fn test_diff_no_changes() {
+    let (dir, bin) = setup_git_indexed_project();
+
+    let output = Command::new(&bin)
+        .arg("diff")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios diff");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No symbol changes"),
+        "expected no changes, got: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_diff_after_modification() {
+    let (dir, bin) = setup_git_indexed_project();
+
+    // Modify the file: add a function, remove helper, shift Config
+    std::fs::write(
+        dir.path().join("main.rs"),
+        r#"pub fn hello() {
+    println!("hello world");
+}
+
+pub fn new_function() {
+    println!("new");
+}
+
+pub struct Config {
+    pub name: String,
+    pub value: i32,
+}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("diff")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios diff");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // new_function should be added
+    assert!(
+        stdout.contains("+ fn new_function"),
+        "expected new_function added, got: {}",
+        stdout
+    );
+
+    // helper was removed
+    assert!(
+        stdout.contains("- fn helper"),
+        "expected helper removed, got: {}",
+        stdout
+    );
+
+    // Config moved lines
+    assert!(
+        stdout.contains("~ struct Config"),
+        "expected Config modified, got: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_diff_json_output() {
+    let (dir, bin) = setup_git_indexed_project();
+
+    // Modify: add a new function
+    std::fs::write(
+        dir.path().join("main.rs"),
+        r#"pub fn hello() {
+    println!("hello");
+}
+
+pub fn brand_new() -> bool {
+    true
+}
+
+pub struct Config {
+    pub name: String,
+}
+
+fn helper() -> i32 {
+    42
+}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .args(["--json", "diff"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios --json diff");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("parsing JSON output");
+
+    // Verify structure has added/removed/modified arrays
+    assert!(json["added"].is_array(), "expected added array");
+    assert!(json["removed"].is_array(), "expected removed array");
+    assert!(json["modified"].is_array(), "expected modified array");
+
+    // brand_new should be in added
+    let added = json["added"].as_array().unwrap();
+    assert!(
+        added.iter().any(|s| s["name"] == "brand_new"),
+        "expected brand_new in added: {:?}",
+        added
+    );
+
+    // Each added entry should have file, name, kind, line
+    for entry in added {
+        assert!(entry["file"].is_string(), "added entry missing file");
+        assert!(entry["name"].is_string(), "added entry missing name");
+        assert!(entry["kind"].is_string(), "added entry missing kind");
+        assert!(entry["line"].is_number(), "added entry missing line");
+    }
+}
+
+#[test]
+fn test_diff_deleted_file() {
+    let (dir, bin) = setup_git_indexed_project();
+
+    // Stage the deletion so git diff sees it
+    std::fs::remove_file(dir.path().join("main.rs")).unwrap();
+    Command::new("git")
+        .args(["add", "main.rs"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git add deleted file");
+
+    let output = Command::new(&bin)
+        .arg("diff")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios diff");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // All symbols from the deleted file should show as removed
+    assert!(
+        stdout.contains("- fn hello"),
+        "expected hello removed, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("- struct Config"),
+        "expected Config removed, got: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_diff_no_index() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    let output = Command::new(&bin)
+        .arg("diff")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios diff");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No index found"),
+        "expected no index message, got: {}",
+        stdout
+    );
+}

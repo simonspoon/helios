@@ -62,6 +62,8 @@ enum Command {
         /// Path to summarize (defaults to project root)
         path: Option<String>,
     },
+    /// Show symbol changes since last index
+    Diff,
     /// Show index status and staleness info
     Status,
     /// Dump full index to markdown
@@ -93,6 +95,7 @@ fn main() {
             compact,
             *body,
         ),
+        Command::Diff => commands::diff::run(cli.json, compact),
         Command::Deps { target } => commands::deps::run(target, cli.json, compact),
         Command::Summary { path } => commands::summary::run(path.as_deref(), cli.json, compact),
         Command::Status => commands::status::run(cli.json, compact),
