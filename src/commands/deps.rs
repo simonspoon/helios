@@ -3,6 +3,7 @@ use std::collections::{HashSet, VecDeque};
 use anyhow::{Context, Result};
 
 use crate::db::Database;
+use crate::errors::NoIndexError;
 
 /// BFS traversal result: (path, depth_level)
 struct BfsResult {
@@ -48,7 +49,7 @@ pub fn run(target: &str, json: bool, compact: bool, depth: u32) -> Result<()> {
     let db_path = cwd.join(".helios/index.db");
 
     if !db_path.exists() {
-        anyhow::bail!("No index found. Run `helios init` first.");
+        return Err(NoIndexError.into());
     }
 
     let db = Database::open(&db_path).context("opening database")?;

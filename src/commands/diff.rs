@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 
 use crate::db::Database;
+use crate::errors::NoIndexError;
 use crate::git;
 use crate::parsers;
 
@@ -35,18 +36,7 @@ pub fn run(json: bool, compact: bool) -> Result<()> {
     let db_path = cwd.join(".helios/index.db");
 
     if !db_path.exists() {
-        if json {
-            let output = serde_json::json!({"error": "No index found. Run `helios init` first."});
-            let formatted = if compact {
-                serde_json::to_string(&output)?
-            } else {
-                serde_json::to_string_pretty(&output)?
-            };
-            println!("{}", formatted);
-        } else {
-            println!("No index found. Run `helios init` first.");
-        }
-        return Ok(());
+        return Err(NoIndexError.into());
     }
 
     if !git::is_git_repo() {

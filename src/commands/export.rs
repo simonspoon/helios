@@ -2,13 +2,14 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 
 use crate::db::Database;
+use crate::errors::NoIndexError;
 
 pub fn run(json: bool, compact: bool, limit: Option<i64>, offset: Option<i64>) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let db_path = cwd.join(".helios/index.db");
 
     if !db_path.exists() {
-        anyhow::bail!("No index found. Run `helios init` first.");
+        return Err(NoIndexError.into());
     }
 
     let db = Database::open(&db_path).context("opening database")?;

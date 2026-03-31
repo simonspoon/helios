@@ -1,16 +1,20 @@
 mod commands;
 mod db;
+pub mod errors;
 mod git;
 mod indexer;
 mod parsers;
 
 use clap::{Parser, Subcommand};
 
+use errors::NoIndexError;
+
 #[derive(Parser)]
 #[command(
     name = "helios",
     version,
-    about = "Code indexing tool for agent-driven codebase exploration"
+    about = "Code indexing tool for agent-driven codebase exploration",
+    after_help = "EXIT CODES:\n  0  Success\n  1  General error\n  2  No index found (run `helios init` first)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -136,6 +140,11 @@ fn main() {
     };
 
     if let Err(e) = result {
+        let exit_code = if e.downcast_ref::<NoIndexError>().is_some() {
+            2
+        } else {
+            1
+        };
         if cli.json {
             let err = serde_json::json!({"error": e.to_string()});
             let formatted = if compact {
@@ -147,6 +156,6 @@ fn main() {
         } else {
             eprintln!("error: {e:#}");
         }
-        std::process::exit(1);
+        std::process::exit(exit_code);
     }
 }

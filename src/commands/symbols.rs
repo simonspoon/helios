@@ -3,6 +3,7 @@ use regex::Regex;
 use std::collections::HashMap;
 
 use crate::db::Database;
+use crate::errors::NoIndexError;
 
 /// Read the body of a symbol from its source file.
 /// Returns the source lines from `line` to `end_line` (both 1-based).
@@ -56,7 +57,7 @@ pub fn run(
     let db_path = cwd.join(".helios/index.db");
 
     if !db_path.exists() {
-        anyhow::bail!("No index found. Run `helios init` first.");
+        return Err(NoIndexError.into());
     }
 
     let db = Database::open(&db_path).context("opening database")?;

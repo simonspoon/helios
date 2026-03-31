@@ -1695,12 +1695,16 @@ fn test_diff_no_index() {
         .output()
         .expect("helios diff");
 
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let code = output.status.code().expect("should have exit code");
+    assert_eq!(
+        code, 2,
+        "helios diff without index should exit 2, got {code}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("No index found"),
-        "expected no index message, got: {}",
-        stdout
+        stderr.contains("No index found"),
+        "expected no index message on stderr, got: {}",
+        stderr
     );
 }
 
@@ -2459,5 +2463,144 @@ fn test_quiet_error_stderr() {
     assert!(
         stderr.contains("No index found"),
         "stderr should contain error message, got: {stderr}"
+    );
+}
+
+// --- Exit code tests ---
+
+#[test]
+fn test_exit_code_no_index() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    // All commands that require an index should exit 2 when none exists.
+    for subcommand in &[
+        "symbols",
+        "deps dummy",
+        "export",
+        "summary",
+        "diff",
+        "files",
+        "update",
+    ] {
+        let args: Vec<&str> = subcommand.split_whitespace().collect();
+        let output = Command::new(&bin)
+            .args(&args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap_or_else(|_| panic!("helios {subcommand}"));
+
+        let code = output.status.code().expect("should have exit code");
+        assert_eq!(
+            code, 2,
+            "helios {subcommand} without index should exit 2, got {code}"
+        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("No index found"),
+            "helios {subcommand} stderr should mention missing index, got: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_exit_code_no_index_json() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    // JSON mode should also exit 2 for no-index errors.
+    let output = Command::new(&bin)
+        .args(["--json", "symbols"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios --json symbols");
+
+    let code = output.status.code().expect("should have exit code");
+    assert_eq!(
+        code, 2,
+        "helios --json symbols without index should exit 2, got {code}"
+    );
+}
+
+#[test]
+fn test_exit_code_success() {
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .arg("symbols")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios symbols");
+
+    let code = output.status.code().expect("should have exit code");
+    assert_eq!(
+        code, 0,
+        "helios symbols with index should exit 0, got {code}"
+    );
+}
+
+#[test]
+fn test_exit_code_status_no_index() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    // status gracefully reports no index and exits 0.
+    let output = Command::new(&bin)
+        .arg("status")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios status");
+
+    let code = output.status.code().expect("should have exit code");
+    assert_eq!(
+        code, 0,
+        "helios status without index should exit 0 (graceful), got {code}"
+    );
+}
+
+#[test]
+fn test_exit_code_general_error() {
+    let (dir, bin) = setup_indexed_project();
+
+    // Provide an invalid regex to symbols --grep to trigger a general error (exit 1).
+    let output = Command::new(&bin)
+        .args(["symbols", "--grep", "[invalid"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios symbols --grep invalid");
+
+    let code = output.status.code().expect("should have exit code");
+    assert_eq!(
+        code, 1,
+        "helios symbols with bad regex should exit 1, got {code}"
+    );
+}
+
+#[test]
+fn test_help_shows_exit_codes() {
+    let bin = helios_bin();
+
+    let output = Command::new(&bin)
+        .arg("--help")
+        .output()
+        .expect("helios --help");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("EXIT CODES:"),
+        "help should contain EXIT CODES section, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("0  Success"),
+        "help should document exit code 0"
+    );
+    assert!(
+        stdout.contains("1  General error"),
+        "help should document exit code 1"
+    );
+    assert!(
+        stdout.contains("2  No index found"),
+        "help should document exit code 2"
     );
 }

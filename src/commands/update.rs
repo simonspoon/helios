@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::time::Instant;
 
 use crate::db::Database;
+use crate::errors::NoIndexError;
 use crate::git;
 use crate::indexer;
 
@@ -10,7 +11,7 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
     let db_path = cwd.join(".helios/index.db");
 
     if !db_path.exists() {
-        anyhow::bail!("No index found. Run `helios init` first.");
+        return Err(NoIndexError.into());
     }
 
     let db = Database::open(&db_path).context("opening database")?;
