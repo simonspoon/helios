@@ -46,6 +46,16 @@ pub struct ReferenceRecord {
     pub column: i64,
 }
 
+/// Per-file metadata with aggregated symbol/import counts.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FileWithCounts {
+    pub path: String,
+    pub language: String,
+    pub symbol_count: i64,
+    pub import_count: i64,
+    pub last_indexed_at: String,
+}
+
 /// Parsed symbol data before insertion (no id yet)
 #[derive(Debug, Clone)]
 pub struct ParsedSymbol {
@@ -583,6 +593,45 @@ impl Database {
         })?;
         rows.collect::<Result<Vec<_>, _>>()
             .context("counting files by language")
+    }
+
+    /// Return files with per-file symbol and import counts, optionally filtered by language.
+    pub fn files_with_counts(&self, language: Option<&str>) -> Result<Vec<FileWithCounts>> {
+        let mut sql = String::from(
+            "SELECT f.path, f.language,
+                    COALESCE(s.cnt, 0) AS symbol_count,
+                    COALESCE(i.cnt, 0) AS import_count,
+                    f.last_indexed_at
+             FROM files f
+             LEFT JOIN (SELECT file_id, COUNT(*) AS cnt FROM symbols GROUP BY file_id) s
+               ON s.file_id = f.id
+             LEFT JOIN (SELECT source_file_id, COUNT(*) AS cnt FROM imports GROUP BY source_file_id) i
+               ON i.source_file_id = f.id",
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(lang) = language {
+            params_vec.push(Box::new(lang.to_string()));
+            sql.push_str(&format!(" WHERE f.language = ?{}", params_vec.len()));
+        }
+
+        sql.push_str(" ORDER BY f.path");
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_refs.as_slice(), |row| {
+            Ok(FileWithCounts {
+                path: row.get(0)?,
+                language: row.get(1)?,
+                symbol_count: row.get(2)?,
+                import_count: row.get(3)?,
+                last_indexed_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("querying files with counts")
     }
 
     pub fn symbols_in_directory(&self, dir_prefix: &str) -> Result<Vec<(SymbolRecord, String)>> {

@@ -75,6 +75,12 @@ enum Command {
     Diff,
     /// Show index status and staleness info
     Status,
+    /// List indexed files with symbol/import counts
+    Files {
+        /// Filter by language (e.g. rust, python, go)
+        #[arg(long)]
+        language: Option<String>,
+    },
     /// Dump full index to markdown
     Export {
         /// Maximum number of symbols to return
@@ -115,6 +121,7 @@ fn main() {
             *limit,
             *offset,
         ),
+        Command::Files { language } => commands::files::run(language.as_deref(), cli.json, compact),
         Command::Diff => commands::diff::run(cli.json, compact),
         Command::Deps { target, depth } => commands::deps::run(target, cli.json, compact, *depth),
         Command::Summary { path } => commands::summary::run(path.as_deref(), cli.json, compact),

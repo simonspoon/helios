@@ -2299,3 +2299,100 @@ export function b(): string { return a(); }
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// --- Files command tests ---
+
+#[test]
+fn test_files_command() {
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .arg("files")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios files");
+
+    assert!(
+        output.status.success(),
+        "files command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Header row
+    assert!(stdout.contains("PATH"), "should have PATH header");
+    assert!(stdout.contains("LANGUAGE"), "should have LANGUAGE header");
+    assert!(stdout.contains("SYMBOLS"), "should have SYMBOLS header");
+    assert!(stdout.contains("IMPORTS"), "should have IMPORTS header");
+
+    // Should list the test files
+    assert!(stdout.contains("main.rs"), "should list main.rs");
+    assert!(stdout.contains("lib.py"), "should list lib.py");
+}
+
+#[test]
+fn test_files_language_filter() {
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .args(["files", "--language", "rust"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios files --language rust");
+
+    assert!(
+        output.status.success(),
+        "files --language rust failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("main.rs"), "should list rust file");
+    assert!(
+        !stdout.contains("lib.py"),
+        "should not list python file when filtering for rust"
+    );
+    assert!(
+        !stdout.contains("server.go"),
+        "should not list go file when filtering for rust"
+    );
+}
+
+#[test]
+fn test_files_json() {
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .args(["files", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios files --json");
+
+    assert!(
+        output.status.success(),
+        "files --json failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON output");
+
+    let arr = parsed.as_array().expect("should be an array");
+    assert!(!arr.is_empty(), "should have at least one file");
+
+    // Check that each entry has expected fields
+    for entry in arr {
+        assert!(entry.get("path").is_some(), "entry should have path");
+        assert!(
+            entry.get("language").is_some(),
+            "entry should have language"
+        );
+        assert!(entry.get("symbols").is_some(), "entry should have symbols");
+        assert!(entry.get("imports").is_some(), "entry should have imports");
+        assert!(
+            entry.get("last_indexed_at").is_some(),
+            "entry should have last_indexed_at"
+        );
+    }
+}
