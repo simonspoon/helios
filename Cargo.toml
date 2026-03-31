@@ -19,6 +19,7 @@ tree-sitter-python = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-swift = "0.7"
 tree-sitter-typescript = "0.23"
+regex = "1"
 walkdir = "2"
 
 [dev-dependencies]

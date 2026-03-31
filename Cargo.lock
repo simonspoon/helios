@@ -348,6 +348,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ignore",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

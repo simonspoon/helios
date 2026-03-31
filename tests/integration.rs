@@ -1885,3 +1885,153 @@ fn test_pagination_export() {
     assert_eq!(page2["total_symbols"].as_i64().unwrap(), 2);
     assert_eq!(page2["offset"].as_i64().unwrap(), 2);
 }
+
+// --- Regex grep tests ---
+
+#[test]
+fn test_grep_regex_anchor() {
+    let (dir, bin) = setup_indexed_project();
+
+    // ^main$ should match exactly "main", not "maintain" or "domain"
+    let output = Command::new(&bin)
+        .args(["--json", "symbols", "--grep", "^main$"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --grep ^main$");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let symbols: Vec<serde_json::Value> = serde_json::from_str(&stdout).expect("parsing JSON");
+
+    assert_eq!(symbols.len(), 1, "^main$ should match exactly one symbol");
+    assert_eq!(symbols[0]["name"].as_str().unwrap(), "main");
+}
+
+#[test]
+fn test_grep_regex_pattern() {
+    let (dir, bin) = setup_indexed_project();
+
+    // process.* should match names starting with "process"
+    let output = Command::new(&bin)
+        .args(["--json", "symbols", "--grep", "^process"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --grep ^process");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let symbols: Vec<serde_json::Value> = serde_json::from_str(&stdout).expect("parsing JSON");
+
+    // The test project has process_files in lib.py
+    assert!(
+        !symbols.is_empty(),
+        "^process should match process_files from lib.py"
+    );
+    for sym in &symbols {
+        let name = sym["name"].as_str().unwrap();
+        assert!(
+            name.starts_with("process"),
+            "all matches should start with 'process', got: {name}"
+        );
+    }
+}
+
+#[test]
+fn test_grep_regex_invalid() {
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .args(["symbols", "--grep", "[invalid"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --grep [invalid");
+
+    assert!(
+        !output.status.success(),
+        "invalid regex should fail with non-zero exit"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid regex") || stderr.contains("regex parse error"),
+        "error should mention regex: {stderr}"
+    );
+}
+
+#[test]
+fn test_grep_backward_compat() {
+    let (dir, bin) = setup_indexed_project();
+
+    // Simple substring "Config" should still work (backward compatible)
+    let output = Command::new(&bin)
+        .args(["--json", "symbols", "--grep", "Config"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --grep Config");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let symbols: Vec<serde_json::Value> = serde_json::from_str(&stdout).expect("parsing JSON");
+
+    // The test project has Config in main.rs and AppConfig in app.ts
+    assert!(
+        symbols.len() >= 2,
+        "substring 'Config' should match Config and AppConfig, got: {}",
+        symbols.len()
+    );
+    for sym in &symbols {
+        let name = sym["name"].as_str().unwrap();
+        assert!(
+            name.contains("Config"),
+            "all matches should contain 'Config', got: {name}"
+        );
+    }
+}
+
+#[test]
+fn test_grep_regex_end_anchor() {
+    let (dir, bin) = setup_indexed_project();
+
+    // .*Server$ should match names ending with "Server"
+    let output = Command::new(&bin)
+        .args(["--json", "symbols", "--grep", "Server$"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --grep Server$");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let symbols: Vec<serde_json::Value> = serde_json::from_str(&stdout).expect("parsing JSON");
+
+    // The test project has Server and NewServer in server.go
+    assert!(!symbols.is_empty(), "Server$ should match at least Server");
+    for sym in &symbols {
+        let name = sym["name"].as_str().unwrap();
+        assert!(
+            name.ends_with("Server"),
+            "all matches should end with 'Server', got: {name}"
+        );
+    }
+}
+
+#[test]
+fn test_grep_regex_with_pagination() {
+    let (dir, bin) = setup_indexed_project();
+
+    // Regex with pagination: total_count should reflect regex-filtered count, not LIKE count
+    let output = Command::new(&bin)
+        .args(["--json", "symbols", "--grep", "^main$", "--limit", "10"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --grep ^main$ --limit 10");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let result: serde_json::Value = serde_json::from_str(&stdout).expect("parsing JSON");
+
+    let total = result["total_count"].as_i64().unwrap();
+    let symbols = result["symbols"].as_array().unwrap();
+
+    assert_eq!(total, 1, "total_count should be 1 for ^main$ regex");
+    assert_eq!(symbols.len(), 1, "should return exactly 1 symbol");
+    assert_eq!(symbols[0]["name"].as_str().unwrap(), "main");
+}

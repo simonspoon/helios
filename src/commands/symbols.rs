@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use regex::Regex;
 use std::collections::HashMap;
 
 use crate::db::Database;
@@ -59,7 +60,70 @@ pub fn run(
     }
 
     let db = Database::open(&db_path).context("opening database")?;
-    let results = db.query_symbols(file, kind, grep, scope, visibility, limit, offset)?;
+
+    // Compile grep pattern as regex (if provided) before querying.
+    // The SQL LIKE pre-filter narrows results; the regex does precise matching.
+    let grep_re = match grep {
+        Some(pattern) => {
+            Some(Regex::new(pattern).with_context(|| format!("invalid regex pattern: {pattern}"))?)
+        }
+        None => None,
+    };
+
+    // Extract a LIKE-friendly substring from the regex for SQL pre-filtering.
+    // Strip regex metacharacters, keep the longest literal run for LIKE narrowing.
+    let like_hint = grep.and_then(|pattern| {
+        let literal: String = pattern
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if literal.is_empty() {
+            None
+        } else {
+            Some(literal)
+        }
+    });
+
+    // regex_total_count holds the true count after regex filtering (only set when regex is active).
+    let (results, regex_total_count) = if let Some(ref re) = grep_re {
+        // When regex filtering, fetch all LIKE-matched results (no SQL limit/offset)
+        // so we can apply regex, then handle pagination in Rust.
+        // Pass the literal hint to LIKE for pre-filtering, not the raw regex.
+        let all = db.query_symbols(
+            file,
+            kind,
+            like_hint.as_deref(),
+            scope,
+            visibility,
+            None,
+            None,
+        )?;
+        let filtered: Vec<_> = all
+            .into_iter()
+            .filter(|(sym, _)| re.is_match(&sym.name))
+            .collect();
+        let total = filtered.len() as i64;
+
+        // Apply limit/offset in Rust after regex filtering
+        let start = offset.unwrap_or(0) as usize;
+        let page = if limit.is_some() || offset.is_some() {
+            let end = match limit {
+                Some(l) => (start + l as usize).min(filtered.len()),
+                None => filtered.len(),
+            };
+            if start < filtered.len() {
+                filtered[start..end].to_vec()
+            } else {
+                Vec::new()
+            }
+        } else {
+            filtered
+        };
+        (page, Some(total))
+    } else {
+        let r = db.query_symbols(file, kind, grep, scope, visibility, limit, offset)?;
+        (r, None)
+    };
 
     let paginated = limit.is_some() || offset.is_some();
 
@@ -88,7 +152,10 @@ pub fn run(
             .collect();
 
         if paginated {
-            let total_count = db.count_symbols(file, kind, grep, scope, visibility)?;
+            let total_count = match regex_total_count {
+                Some(c) => c,
+                None => db.count_symbols(file, kind, grep, scope, visibility)?,
+            };
             let output = serde_json::json!({
                 "symbols": items,
                 "total_count": total_count,
@@ -135,7 +202,10 @@ pub fn run(
             println!("No symbols found");
         }
         if paginated {
-            let total_count = db.count_symbols(file, kind, grep, scope, visibility)?;
+            let total_count = match regex_total_count {
+                Some(c) => c,
+                None => db.count_symbols(file, kind, grep, scope, visibility)?,
+            };
             let offset_val = offset.unwrap_or(0);
             let start = offset_val + 1;
             let end = offset_val + results.len() as i64;
