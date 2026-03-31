@@ -1703,3 +1703,185 @@ fn test_diff_no_index() {
         stdout
     );
 }
+
+// --- Pagination tests ---
+
+#[test]
+fn test_pagination_limit() {
+    let (dir, bin) = setup_indexed_project();
+
+    // Get total count first (no limit)
+    let output = Command::new(&bin)
+        .args(["symbols"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols");
+    let all_stdout = String::from_utf8_lossy(&output.stdout);
+    let total_lines: Vec<&str> = all_stdout.lines().collect();
+    assert!(
+        total_lines.len() > 3,
+        "need at least 4 symbols for pagination test, got {}",
+        total_lines.len()
+    );
+
+    // Now query with --limit 3
+    let output = Command::new(&bin)
+        .args(["symbols", "--limit", "3"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --limit 3");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Text output: 3 symbol lines + 1 pagination footer
+    let lines: Vec<&str> = stdout.lines().collect();
+    let symbol_lines: Vec<&&str> = lines.iter().filter(|l| l.contains(":")).collect();
+    assert_eq!(
+        symbol_lines.len(),
+        3,
+        "expected exactly 3 symbol lines, got: {:?}",
+        symbol_lines
+    );
+    assert!(
+        stdout.contains("Showing 1-3 of"),
+        "expected pagination footer, got: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_pagination_offset() {
+    let (dir, bin) = setup_indexed_project();
+
+    // Get all symbols first
+    let output = Command::new(&bin)
+        .args(["--json", "symbols"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --json");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let all_symbols: serde_json::Value = serde_json::from_str(&stdout).expect("parsing JSON");
+    let all_arr = all_symbols.as_array().unwrap();
+    assert!(all_arr.len() > 3, "need at least 4 symbols");
+
+    // Get first 2
+    let output = Command::new(&bin)
+        .args(["--json", "symbols", "--limit", "2"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --limit 2");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let page1: serde_json::Value = serde_json::from_str(&stdout).expect("parsing JSON page1");
+    let page1_syms = page1["symbols"].as_array().unwrap();
+    assert_eq!(page1_syms.len(), 2);
+
+    // Get next 2 with offset
+    let output = Command::new(&bin)
+        .args(["--json", "symbols", "--limit", "2", "--offset", "2"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --limit 2 --offset 2");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let page2: serde_json::Value = serde_json::from_str(&stdout).expect("parsing JSON page2");
+    let page2_syms = page2["symbols"].as_array().unwrap();
+    assert_eq!(page2_syms.len(), 2);
+
+    // Verify offset actually skipped: page2 first symbol should equal all_arr[2]
+    assert_eq!(
+        page2_syms[0]["name"], all_arr[2]["name"],
+        "offset should skip first 2 symbols"
+    );
+}
+
+#[test]
+fn test_pagination_json_total_count() {
+    let (dir, bin) = setup_indexed_project();
+
+    // Without pagination: plain array (backward compat)
+    let output = Command::new(&bin)
+        .args(["--json", "symbols"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --json");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let no_page: serde_json::Value = serde_json::from_str(&stdout).expect("parsing JSON");
+    assert!(
+        no_page.is_array(),
+        "without pagination, output should be a plain array"
+    );
+    let total = no_page.as_array().unwrap().len();
+
+    // With pagination: wrapped object with total_count
+    let output = Command::new(&bin)
+        .args(["--json", "symbols", "--limit", "2"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --json --limit 2");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let paginated: serde_json::Value = serde_json::from_str(&stdout).expect("parsing JSON");
+    assert!(
+        paginated.is_object(),
+        "with pagination, output should be an object"
+    );
+    assert_eq!(
+        paginated["total_count"].as_i64().unwrap() as usize,
+        total,
+        "total_count should match full symbol count"
+    );
+    assert_eq!(paginated["limit"].as_i64().unwrap(), 2);
+    assert_eq!(paginated["offset"].as_i64().unwrap(), 0);
+    assert_eq!(paginated["symbols"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn test_pagination_export() {
+    let (dir, bin) = setup_indexed_project();
+
+    // Get total symbol count from unpaginated export
+    let output = Command::new(&bin)
+        .args(["--json", "export"])
+        .current_dir(dir.path())
+        .output()
+        .expect("export --json");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let full_export: serde_json::Value = serde_json::from_str(&stdout).expect("parsing JSON");
+    let total_symbols = full_export["total_symbols"].as_i64().unwrap();
+    assert!(total_symbols > 3, "need symbols for pagination test");
+    // Without pagination, no total_count key
+    assert!(
+        full_export.get("total_count").is_none(),
+        "unpaginated export should not have total_count"
+    );
+
+    // With limit
+    let output = Command::new(&bin)
+        .args(["--json", "export", "--limit", "3"])
+        .current_dir(dir.path())
+        .output()
+        .expect("export --json --limit 3");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let paginated: serde_json::Value = serde_json::from_str(&stdout).expect("parsing JSON");
+    assert_eq!(paginated["total_symbols"].as_i64().unwrap(), 3);
+    assert!(
+        paginated["total_count"].is_number(),
+        "paginated export should have total_count"
+    );
+    assert_eq!(
+        paginated["total_count"].as_i64().unwrap(),
+        total_symbols,
+        "total_count should match full count"
+    );
+    assert_eq!(paginated["limit"].as_i64().unwrap(), 3);
+    assert_eq!(paginated["offset"].as_i64().unwrap(), 0);
+
+    // With limit + offset
+    let output = Command::new(&bin)
+        .args(["--json", "export", "--limit", "2", "--offset", "2"])
+        .current_dir(dir.path())
+        .output()
+        .expect("export --json --limit 2 --offset 2");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let page2: serde_json::Value = serde_json::from_str(&stdout).expect("parsing JSON");
+    assert_eq!(page2["total_symbols"].as_i64().unwrap(), 2);
+    assert_eq!(page2["offset"].as_i64().unwrap(), 2);
+}

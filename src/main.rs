@@ -51,6 +51,12 @@ enum Command {
         /// Show symbol body/source code
         #[arg(long)]
         body: bool,
+        /// Maximum number of symbols to return
+        #[arg(long)]
+        limit: Option<i64>,
+        /// Number of symbols to skip
+        #[arg(long)]
+        offset: Option<i64>,
     },
     /// Show dependencies for a symbol or file
     Deps {
@@ -67,7 +73,14 @@ enum Command {
     /// Show index status and staleness info
     Status,
     /// Dump full index to markdown
-    Export,
+    Export {
+        /// Maximum number of symbols to return
+        #[arg(long)]
+        limit: Option<i64>,
+        /// Number of symbols to skip
+        #[arg(long)]
+        offset: Option<i64>,
+    },
 }
 
 fn main() {
@@ -85,6 +98,8 @@ fn main() {
             scope,
             visibility,
             body,
+            limit,
+            offset,
         } => commands::symbols::run(
             file.as_deref(),
             kind.as_deref(),
@@ -94,12 +109,16 @@ fn main() {
             cli.json,
             compact,
             *body,
+            *limit,
+            *offset,
         ),
         Command::Diff => commands::diff::run(cli.json, compact),
         Command::Deps { target } => commands::deps::run(target, cli.json, compact),
         Command::Summary { path } => commands::summary::run(path.as_deref(), cli.json, compact),
         Command::Status => commands::status::run(cli.json, compact),
-        Command::Export => commands::export::run(cli.json, compact),
+        Command::Export { limit, offset } => {
+            commands::export::run(cli.json, compact, *limit, *offset)
+        }
     };
 
     if let Err(e) = result {

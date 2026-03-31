@@ -250,6 +250,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn query_symbols(
         &self,
         file: Option<&str>,
@@ -257,6 +258,8 @@ impl Database {
         grep: Option<&str>,
         scope: Option<&str>,
         visibility: Option<&str>,
+        limit: Option<i64>,
+        offset: Option<i64>,
     ) -> Result<Vec<(SymbolRecord, String)>> {
         let mut sql = String::from(
             "SELECT s.id, s.name, s.kind, s.file_id, s.line, s.column, s.end_line, s.visibility, s.scope, f.path
@@ -287,6 +290,15 @@ impl Database {
 
         sql.push_str(" ORDER BY f.path, s.line");
 
+        if let Some(l) = limit {
+            params_vec.push(Box::new(l));
+            sql.push_str(&format!(" LIMIT ?{}", params_vec.len()));
+        }
+        if let Some(o) = offset {
+            params_vec.push(Box::new(o));
+            sql.push_str(&format!(" OFFSET ?{}", params_vec.len()));
+        }
+
         let params_refs: Vec<&dyn rusqlite::types::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
 
@@ -309,6 +321,50 @@ impl Database {
         })?;
         rows.collect::<Result<Vec<_>, _>>()
             .context("querying symbols")
+    }
+
+    /// Count symbols matching the given filters (for pagination metadata).
+    pub fn count_symbols(
+        &self,
+        file: Option<&str>,
+        kind: Option<&str>,
+        grep: Option<&str>,
+        scope: Option<&str>,
+        visibility: Option<&str>,
+    ) -> Result<i64> {
+        let mut sql = String::from(
+            "SELECT COUNT(*)
+             FROM symbols s JOIN files f ON s.file_id = f.id WHERE 1=1",
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(f) = file {
+            params_vec.push(Box::new(format!("%{f}%")));
+            sql.push_str(&format!(" AND f.path LIKE ?{}", params_vec.len()));
+        }
+        if let Some(k) = kind {
+            params_vec.push(Box::new(k.to_string()));
+            sql.push_str(&format!(" AND s.kind = ?{}", params_vec.len()));
+        }
+        if let Some(g) = grep {
+            params_vec.push(Box::new(format!("%{g}%")));
+            sql.push_str(&format!(" AND s.name LIKE ?{}", params_vec.len()));
+        }
+        if let Some(s) = scope {
+            params_vec.push(Box::new(s.to_string()));
+            sql.push_str(&format!(" AND s.scope = ?{}", params_vec.len()));
+        }
+        if let Some(v) = visibility {
+            params_vec.push(Box::new(v.to_string()));
+            sql.push_str(&format!(" AND s.visibility = ?{}", params_vec.len()));
+        }
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+
+        self.conn
+            .query_row(&sql, params_refs.as_slice(), |row| row.get(0))
+            .context("counting symbols")
     }
 
     pub fn find_symbol_by_name(&self, name: &str) -> Result<Vec<(SymbolRecord, String)>> {
@@ -611,49 +667,51 @@ mod tests {
         let sym_id = db.insert_symbol(file_id, &sym).unwrap();
         assert!(sym_id > 0);
 
-        let results = db.query_symbols(None, None, None, None, None).unwrap();
+        let results = db
+            .query_symbols(None, None, None, None, None, None, None)
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.name, "my_function");
 
         // Filter by kind
         let results = db
-            .query_symbols(None, Some("fn"), None, None, None)
+            .query_symbols(None, Some("fn"), None, None, None, None, None)
             .unwrap();
         assert_eq!(results.len(), 1);
         let results = db
-            .query_symbols(None, Some("struct"), None, None, None)
+            .query_symbols(None, Some("struct"), None, None, None, None, None)
             .unwrap();
         assert_eq!(results.len(), 0);
 
         // Filter by grep
         let results = db
-            .query_symbols(None, None, Some("my_func"), None, None)
+            .query_symbols(None, None, Some("my_func"), None, None, None, None)
             .unwrap();
         assert_eq!(results.len(), 1);
 
         // Filter by scope
         let results = db
-            .query_symbols(None, None, None, Some("MyStruct"), None)
+            .query_symbols(None, None, None, Some("MyStruct"), None, None, None)
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.name, "my_function");
 
         // Non-matching scope returns nothing
         let results = db
-            .query_symbols(None, None, None, Some("NonExistent"), None)
+            .query_symbols(None, None, None, Some("NonExistent"), None, None, None)
             .unwrap();
         assert_eq!(results.len(), 0);
 
         // Filter by visibility
         let results = db
-            .query_symbols(None, None, None, None, Some("pub"))
+            .query_symbols(None, None, None, None, Some("pub"), None, None)
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.visibility, "pub");
 
         // Non-matching visibility returns nothing
         let results = db
-            .query_symbols(None, None, None, None, Some("private"))
+            .query_symbols(None, None, None, None, Some("private"), None, None)
             .unwrap();
         assert_eq!(results.len(), 0);
 

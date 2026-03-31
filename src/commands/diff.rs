@@ -252,7 +252,7 @@ pub fn run(json: bool, compact: bool) -> Result<()> {
 /// Get symbols for an exact file path from the DB.
 /// query_symbols uses LIKE with substring match, so we query then filter for exact path.
 fn get_exact_file_symbols(db: &Database, file_path: &str) -> Result<Vec<crate::db::SymbolRecord>> {
-    let results = db.query_symbols(Some(file_path), None, None, None, None)?;
+    let results = db.query_symbols(Some(file_path), None, None, None, None, None, None)?;
     Ok(results
         .into_iter()
         .filter(|(_, path)| path == file_path)

@@ -48,6 +48,8 @@ pub fn run(
     json: bool,
     compact: bool,
     body: bool,
+    limit: Option<i64>,
+    offset: Option<i64>,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let db_path = cwd.join(".helios/index.db");
@@ -57,7 +59,9 @@ pub fn run(
     }
 
     let db = Database::open(&db_path).context("opening database")?;
-    let results = db.query_symbols(file, kind, grep, scope, visibility)?;
+    let results = db.query_symbols(file, kind, grep, scope, visibility, limit, offset)?;
+
+    let paginated = limit.is_some() || offset.is_some();
 
     let mut file_cache: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -82,12 +86,29 @@ pub fn run(
                 obj
             })
             .collect();
-        let formatted = if compact {
-            serde_json::to_string(&items)?
+
+        if paginated {
+            let total_count = db.count_symbols(file, kind, grep, scope, visibility)?;
+            let output = serde_json::json!({
+                "symbols": items,
+                "total_count": total_count,
+                "limit": limit,
+                "offset": offset.unwrap_or(0),
+            });
+            let formatted = if compact {
+                serde_json::to_string(&output)?
+            } else {
+                serde_json::to_string_pretty(&output)?
+            };
+            println!("{}", formatted);
         } else {
-            serde_json::to_string_pretty(&items)?
-        };
-        println!("{}", formatted);
+            let formatted = if compact {
+                serde_json::to_string(&items)?
+            } else {
+                serde_json::to_string_pretty(&items)?
+            };
+            println!("{}", formatted);
+        }
     } else {
         for (sym, path) in &results {
             if body {
@@ -112,6 +133,13 @@ pub fn run(
         }
         if results.is_empty() {
             println!("No symbols found");
+        }
+        if paginated {
+            let total_count = db.count_symbols(file, kind, grep, scope, visibility)?;
+            let offset_val = offset.unwrap_or(0);
+            let start = offset_val + 1;
+            let end = offset_val + results.len() as i64;
+            println!("Showing {}-{} of {} symbols", start, end, total_count);
         }
     }
 
