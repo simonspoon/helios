@@ -2396,3 +2396,68 @@ fn test_files_json() {
         );
     }
 }
+
+// ---- Quiet mode tests ----
+
+#[test]
+fn test_quiet_init() {
+    let dir = create_test_project();
+    let bin = helios_bin();
+
+    let output = Command::new(&bin)
+        .args(["--quiet", "init"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios --quiet init");
+
+    assert!(output.status.success(), "exit code should be 0");
+    assert!(
+        output.stdout.is_empty(),
+        "stdout should be empty with --quiet, got: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn test_quiet_update() {
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .args(["--quiet", "update"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios --quiet update");
+
+    assert!(output.status.success(), "exit code should be 0");
+    assert!(
+        output.stdout.is_empty(),
+        "stdout should be empty with --quiet, got: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn test_quiet_error_stderr() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    // Run update without init — should fail with error on stderr
+    let output = Command::new(&bin)
+        .args(["--quiet", "update"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios --quiet update (no index)");
+
+    assert!(!output.status.success(), "should fail without index");
+    assert!(
+        output.stdout.is_empty(),
+        "stdout should be empty even on error with --quiet, got: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.is_empty(), "error should still appear on stderr");
+    assert!(
+        stderr.contains("No index found"),
+        "stderr should contain error message, got: {stderr}"
+    );
+}

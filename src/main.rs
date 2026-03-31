@@ -23,6 +23,10 @@ struct Cli {
     /// Use compact single-line JSON (requires --json)
     #[arg(long, global = true)]
     compact: bool,
+
+    /// Suppress all output (overrides --json)
+    #[arg(long, global = true)]
+    quiet: bool,
 }
 
 #[derive(Subcommand)]
@@ -98,8 +102,8 @@ fn main() {
     let compact = cli.compact;
 
     let result = match &cli.command {
-        Command::Init => commands::init::run(cli.json, compact),
-        Command::Update => commands::update::run(cli.json, compact),
+        Command::Init => commands::init::run(cli.json, compact, cli.quiet),
+        Command::Update => commands::update::run(cli.json, compact, cli.quiet),
         Command::Symbols {
             file,
             kind,

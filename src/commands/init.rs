@@ -5,7 +5,7 @@ use crate::db::Database;
 use crate::git;
 use crate::indexer;
 
-pub fn run(json: bool, compact: bool) -> Result<()> {
+pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let helios_dir = cwd.join(".helios");
 
@@ -30,54 +30,56 @@ pub fn run(json: bool, compact: bool) -> Result<()> {
     let total_files = db.file_count()?;
     let total_symbols = db.symbol_count()?;
 
-    if json {
-        let output = serde_json::json!({
-            "files_indexed": stats.files_indexed,
-            "files_unchanged": total_files as usize - stats.files_indexed,
-            "files_errored": stats.files_errored,
-            "total_files": total_files,
-            "total_symbols": total_symbols,
-            "elapsed_ms": elapsed.as_millis(),
-        });
-        let formatted = if compact {
-            serde_json::to_string(&output)?
+    if !quiet {
+        if json {
+            let output = serde_json::json!({
+                "files_indexed": stats.files_indexed,
+                "files_unchanged": total_files as usize - stats.files_indexed,
+                "files_errored": stats.files_errored,
+                "total_files": total_files,
+                "total_symbols": total_symbols,
+                "elapsed_ms": elapsed.as_millis(),
+            });
+            let formatted = if compact {
+                serde_json::to_string(&output)?
+            } else {
+                serde_json::to_string_pretty(&output)?
+            };
+            println!("{}", formatted);
         } else {
-            serde_json::to_string_pretty(&output)?
-        };
-        println!("{}", formatted);
-    } else {
-        if stats.symbols_found > 0 {
-            println!(
-                "Indexed {} files ({} symbols) in {:.2}s",
-                stats.files_indexed,
-                stats.symbols_found,
-                elapsed.as_secs_f64()
-            );
-        } else {
-            println!(
-                "Index up to date ({} files, {} symbols) in {:.2}s",
-                total_files,
-                total_symbols,
-                elapsed.as_secs_f64()
-            );
-        }
-        if stats.files_errored > 0 {
-            println!(
-                "{} files had errors (see warnings above)",
-                stats.files_errored
-            );
-        }
-        println!("Database: {}", db_path.display());
-
-        // Suggest adding .helios to .gitignore
-        let gitignore = cwd.join(".gitignore");
-        if gitignore.exists() {
-            let content = std::fs::read_to_string(&gitignore).unwrap_or_default();
-            if !content.contains(".helios") {
-                println!("\nTip: Add .helios/ to your .gitignore");
+            if stats.symbols_found > 0 {
+                println!(
+                    "Indexed {} files ({} symbols) in {:.2}s",
+                    stats.files_indexed,
+                    stats.symbols_found,
+                    elapsed.as_secs_f64()
+                );
+            } else {
+                println!(
+                    "Index up to date ({} files, {} symbols) in {:.2}s",
+                    total_files,
+                    total_symbols,
+                    elapsed.as_secs_f64()
+                );
             }
-        } else {
-            println!("\nTip: Create a .gitignore with .helios/ entry");
+            if stats.files_errored > 0 {
+                println!(
+                    "{} files had errors (see warnings above)",
+                    stats.files_errored
+                );
+            }
+            println!("Database: {}", db_path.display());
+
+            // Suggest adding .helios to .gitignore
+            let gitignore = cwd.join(".gitignore");
+            if gitignore.exists() {
+                let content = std::fs::read_to_string(&gitignore).unwrap_or_default();
+                if !content.contains(".helios") {
+                    println!("\nTip: Add .helios/ to your .gitignore");
+                }
+            } else {
+                println!("\nTip: Create a .gitignore with .helios/ entry");
+            }
         }
     }
 
