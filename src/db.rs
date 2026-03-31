@@ -256,6 +256,7 @@ impl Database {
         kind: Option<&str>,
         grep: Option<&str>,
         scope: Option<&str>,
+        visibility: Option<&str>,
     ) -> Result<Vec<(SymbolRecord, String)>> {
         let mut sql = String::from(
             "SELECT s.id, s.name, s.kind, s.file_id, s.line, s.column, s.end_line, s.visibility, s.scope, f.path
@@ -278,6 +279,10 @@ impl Database {
         if let Some(s) = scope {
             params_vec.push(Box::new(s.to_string()));
             sql.push_str(&format!(" AND s.scope = ?{}", params_vec.len()));
+        }
+        if let Some(v) = visibility {
+            params_vec.push(Box::new(v.to_string()));
+            sql.push_str(&format!(" AND s.visibility = ?{}", params_vec.len()));
         }
 
         sql.push_str(" ORDER BY f.path, s.line");
@@ -600,30 +605,49 @@ mod tests {
         let sym_id = db.insert_symbol(file_id, &sym).unwrap();
         assert!(sym_id > 0);
 
-        let results = db.query_symbols(None, None, None, None).unwrap();
+        let results = db.query_symbols(None, None, None, None, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.name, "my_function");
 
         // Filter by kind
-        let results = db.query_symbols(None, Some("fn"), None, None).unwrap();
+        let results = db
+            .query_symbols(None, Some("fn"), None, None, None)
+            .unwrap();
         assert_eq!(results.len(), 1);
-        let results = db.query_symbols(None, Some("struct"), None, None).unwrap();
+        let results = db
+            .query_symbols(None, Some("struct"), None, None, None)
+            .unwrap();
         assert_eq!(results.len(), 0);
 
         // Filter by grep
-        let results = db.query_symbols(None, None, Some("my_func"), None).unwrap();
+        let results = db
+            .query_symbols(None, None, Some("my_func"), None, None)
+            .unwrap();
         assert_eq!(results.len(), 1);
 
         // Filter by scope
         let results = db
-            .query_symbols(None, None, None, Some("MyStruct"))
+            .query_symbols(None, None, None, Some("MyStruct"), None)
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.name, "my_function");
 
         // Non-matching scope returns nothing
         let results = db
-            .query_symbols(None, None, None, Some("NonExistent"))
+            .query_symbols(None, None, None, Some("NonExistent"), None)
+            .unwrap();
+        assert_eq!(results.len(), 0);
+
+        // Filter by visibility
+        let results = db
+            .query_symbols(None, None, None, None, Some("pub"))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.visibility, "pub");
+
+        // Non-matching visibility returns nothing
+        let results = db
+            .query_symbols(None, None, None, None, Some("private"))
             .unwrap();
         assert_eq!(results.len(), 0);
 

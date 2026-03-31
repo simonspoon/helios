@@ -38,11 +38,13 @@ fn read_body(
     Some(lines[start..end].join("\n"))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     file: Option<&str>,
     kind: Option<&str>,
     grep: Option<&str>,
     scope: Option<&str>,
+    visibility: Option<&str>,
     json: bool,
     compact: bool,
     body: bool,
@@ -55,7 +57,7 @@ pub fn run(
     }
 
     let db = Database::open(&db_path).context("opening database")?;
-    let results = db.query_symbols(file, kind, grep, scope)?;
+    let results = db.query_symbols(file, kind, grep, scope, visibility)?;
 
     let mut file_cache: HashMap<String, Vec<String>> = HashMap::new();
 

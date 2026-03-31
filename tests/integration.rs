@@ -1118,3 +1118,176 @@ fn test_scope_with_kind_filter() {
         symbols
     );
 }
+
+#[test]
+fn test_visibility_filter_pub() {
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .args([
+            "--json",
+            "symbols",
+            "--visibility",
+            "pub",
+            "--file",
+            "main.rs",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --visibility pub --file main.rs");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let symbols: Vec<serde_json::Value> = serde_json::from_str(&stdout).expect("parsing JSON");
+
+    // All returned symbols should have visibility == "pub"
+    assert!(!symbols.is_empty(), "should find pub symbols in main.rs");
+    for sym in &symbols {
+        assert_eq!(
+            sym["visibility"].as_str(),
+            Some("pub"),
+            "every symbol should be pub, got: {:?}",
+            sym
+        );
+    }
+
+    // Should contain known pub symbols
+    let names: Vec<&str> = symbols
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"main"),
+        "should contain pub fn main, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"Config"),
+        "should contain pub struct Config, got: {:?}",
+        names
+    );
+
+    // Should NOT contain the private helper function
+    assert!(
+        !names.contains(&"helper"),
+        "should not contain private fn helper, got: {:?}",
+        names
+    );
+}
+
+#[test]
+fn test_visibility_filter_private() {
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .args([
+            "--json",
+            "symbols",
+            "--visibility",
+            "private",
+            "--file",
+            "main.rs",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --visibility private --file main.rs");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let symbols: Vec<serde_json::Value> = serde_json::from_str(&stdout).expect("parsing JSON");
+
+    // All returned symbols should have visibility == "private"
+    for sym in &symbols {
+        assert_eq!(
+            sym["visibility"].as_str(),
+            Some("private"),
+            "every symbol should be private, got: {:?}",
+            sym
+        );
+    }
+
+    // Should contain the private helper function
+    let names: Vec<&str> = symbols
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"helper"),
+        "should contain private fn helper, got: {:?}",
+        names
+    );
+
+    // Should NOT contain pub symbols
+    assert!(
+        !names.contains(&"main"),
+        "should not contain pub fn main, got: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"Config"),
+        "should not contain pub struct Config, got: {:?}",
+        names
+    );
+}
+
+#[test]
+fn test_visibility_with_kind() {
+    let (dir, bin) = setup_indexed_project();
+
+    // Combine --visibility pub with --kind fn
+    let output = Command::new(&bin)
+        .args([
+            "--json",
+            "symbols",
+            "--visibility",
+            "pub",
+            "--kind",
+            "fn",
+            "--file",
+            "main.rs",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --visibility pub --kind fn --file main.rs");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let symbols: Vec<serde_json::Value> = serde_json::from_str(&stdout).expect("parsing JSON");
+
+    // All should be pub AND fn
+    for sym in &symbols {
+        assert_eq!(
+            sym["visibility"].as_str(),
+            Some("pub"),
+            "every symbol should be pub, got: {:?}",
+            sym
+        );
+        assert_eq!(
+            sym["kind"].as_str(),
+            Some("fn"),
+            "every symbol should be fn, got: {:?}",
+            sym
+        );
+    }
+
+    // Should contain pub fn main but not pub struct Config or private fn helper
+    let names: Vec<&str> = symbols
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"main"),
+        "should contain pub fn main, got: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"Config"),
+        "should not contain Config (it's a struct), got: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"helper"),
+        "should not contain helper (it's private), got: {:?}",
+        names
+    );
+}

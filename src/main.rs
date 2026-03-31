@@ -45,6 +45,9 @@ enum Command {
         /// Filter by scope (e.g. impl block or class name)
         #[arg(long)]
         scope: Option<String>,
+        /// Filter by visibility (pub or private)
+        #[arg(long)]
+        visibility: Option<String>,
         /// Show symbol body/source code
         #[arg(long)]
         body: bool,
@@ -76,12 +79,14 @@ fn main() {
             kind,
             grep,
             scope,
+            visibility,
             body,
         } => commands::symbols::run(
             file.as_deref(),
             kind.as_deref(),
             grep.as_deref(),
             scope.as_deref(),
+            visibility.as_deref(),
             cli.json,
             compact,
             *body,
