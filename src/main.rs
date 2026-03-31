@@ -42,6 +42,9 @@ enum Command {
         /// Filter by name pattern (regex)
         #[arg(long)]
         grep: Option<String>,
+        /// Show symbol body/source code
+        #[arg(long)]
+        body: bool,
     },
     /// Show dependencies for a symbol or file
     Deps {
@@ -65,12 +68,18 @@ fn main() {
     let result = match &cli.command {
         Command::Init => commands::init::run(cli.json, compact),
         Command::Update => commands::update::run(cli.json, compact),
-        Command::Symbols { file, kind, grep } => commands::symbols::run(
+        Command::Symbols {
+            file,
+            kind,
+            grep,
+            body,
+        } => commands::symbols::run(
             file.as_deref(),
             kind.as_deref(),
             grep.as_deref(),
             cli.json,
             compact,
+            *body,
         ),
         Command::Deps { target } => commands::deps::run(target, cli.json, compact),
         Command::Summary { path } => commands::summary::run(path.as_deref(), cli.json, compact),

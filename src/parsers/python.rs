@@ -87,11 +87,14 @@ impl LanguageParser for PythonParser {
                 let visibility = Self::visibility_from_name(&sym_text);
                 let scope = find_class_scope(src, c.node);
 
+                // Use the parent definition node for end_line
+                let def_node = c.node.parent().unwrap_or(c.node);
                 result.symbols.push(ParsedSymbol {
                     name: sym_text,
                     kind: kind.to_string(),
                     line: c.node.start_position().row as i64 + 1,
                     column: c.node.start_position().column as i64,
+                    end_line: def_node.end_position().row as i64 + 1,
                     visibility: visibility.to_string(),
                     scope,
                 });
@@ -114,11 +117,14 @@ impl LanguageParser for PythonParser {
             for c in m.captures {
                 let sym_text = text_from(src, c.node);
                 if sym_text.chars().all(|c| c.is_uppercase() || c == '_') && !sym_text.is_empty() {
+                    // Use the grandparent (expression_statement) for end_line
+                    let def_node = c.node.parent().and_then(|p| p.parent()).unwrap_or(c.node);
                     result.symbols.push(ParsedSymbol {
                         name: sym_text,
                         kind: "const".to_string(),
                         line: c.node.start_position().row as i64 + 1,
                         column: c.node.start_position().column as i64,
+                        end_line: def_node.end_position().row as i64 + 1,
                         visibility: "pub".to_string(),
                         scope: None,
                     });

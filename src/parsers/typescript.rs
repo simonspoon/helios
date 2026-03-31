@@ -134,11 +134,14 @@ impl LanguageParser for TypeScriptParser {
                     None
                 };
 
+                // Use def_node for end_line, falling back to parent node for methods
+                let end_node = def_node.or_else(|| node.parent()).unwrap_or(node);
                 result.symbols.push(ParsedSymbol {
                     name: sym_text,
                     kind: kind.to_string(),
                     line: node.start_position().row as i64 + 1,
                     column: node.start_position().column as i64,
+                    end_line: end_node.end_position().row as i64 + 1,
                     visibility: visibility.to_string(),
                     scope,
                 });

@@ -22,6 +22,7 @@ pub struct SymbolRecord {
     pub file_id: i64,
     pub line: i64,
     pub column: i64,
+    pub end_line: i64,
     pub visibility: String,
     pub scope: Option<String>,
 }
@@ -52,6 +53,7 @@ pub struct ParsedSymbol {
     pub kind: String,
     pub line: i64,
     pub column: i64,
+    pub end_line: i64,
     pub visibility: String,
     pub scope: Option<String>,
 }
@@ -77,6 +79,7 @@ impl Database {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         let db = Self { conn };
         db.create_tables()?;
+        db.migrate()?;
         Ok(db)
     }
 
@@ -85,6 +88,7 @@ impl Database {
         let conn = Connection::open_in_memory()?;
         let db = Self { conn };
         db.create_tables()?;
+        db.migrate()?;
         Ok(db)
     }
 
@@ -105,6 +109,7 @@ impl Database {
                 file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
                 line INTEGER NOT NULL,
                 column INTEGER NOT NULL,
+                end_line INTEGER NOT NULL DEFAULT 0,
                 visibility TEXT NOT NULL DEFAULT 'private',
                 scope TEXT
             );
@@ -138,6 +143,23 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_refs_file ON references_(file_id);
             CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);",
         )?;
+        Ok(())
+    }
+
+    /// Run schema migrations for backward compatibility with older databases.
+    fn migrate(&self) -> Result<()> {
+        // Check if end_line column exists in symbols table
+        let has_end_line: bool = self
+            .conn
+            .prepare("SELECT end_line FROM symbols LIMIT 0")
+            .is_ok();
+
+        if !has_end_line {
+            self.conn.execute_batch(
+                "ALTER TABLE symbols ADD COLUMN end_line INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -206,14 +228,15 @@ impl Database {
 
     pub fn insert_symbol(&self, file_id: i64, sym: &ParsedSymbol) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO symbols (name, kind, file_id, line, column, visibility, scope)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO symbols (name, kind, file_id, line, column, end_line, visibility, scope)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 sym.name,
                 sym.kind,
                 file_id,
                 sym.line,
                 sym.column,
+                sym.end_line,
                 sym.visibility,
                 sym.scope,
             ],
@@ -234,7 +257,7 @@ impl Database {
         grep: Option<&str>,
     ) -> Result<Vec<(SymbolRecord, String)>> {
         let mut sql = String::from(
-            "SELECT s.id, s.name, s.kind, s.file_id, s.line, s.column, s.visibility, s.scope, f.path
+            "SELECT s.id, s.name, s.kind, s.file_id, s.line, s.column, s.end_line, s.visibility, s.scope, f.path
              FROM symbols s JOIN files f ON s.file_id = f.id WHERE 1=1",
         );
         let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -267,10 +290,11 @@ impl Database {
                     file_id: row.get(3)?,
                     line: row.get(4)?,
                     column: row.get(5)?,
-                    visibility: row.get(6)?,
-                    scope: row.get(7)?,
+                    end_line: row.get(6)?,
+                    visibility: row.get(7)?,
+                    scope: row.get(8)?,
                 },
-                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -279,7 +303,7 @@ impl Database {
 
     pub fn find_symbol_by_name(&self, name: &str) -> Result<Vec<(SymbolRecord, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.id, s.name, s.kind, s.file_id, s.line, s.column, s.visibility, s.scope, f.path
+            "SELECT s.id, s.name, s.kind, s.file_id, s.line, s.column, s.end_line, s.visibility, s.scope, f.path
              FROM symbols s JOIN files f ON s.file_id = f.id
              WHERE s.name = ?1 ORDER BY f.path, s.line",
         )?;
@@ -292,10 +316,11 @@ impl Database {
                     file_id: row.get(3)?,
                     line: row.get(4)?,
                     column: row.get(5)?,
-                    visibility: row.get(6)?,
-                    scope: row.get(7)?,
+                    end_line: row.get(6)?,
+                    visibility: row.get(7)?,
+                    scope: row.get(8)?,
                 },
-                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -495,7 +520,7 @@ impl Database {
             format!("{dir_prefix}%")
         };
         let mut stmt = self.conn.prepare(
-            "SELECT s.id, s.name, s.kind, s.file_id, s.line, s.column, s.visibility, s.scope, f.path
+            "SELECT s.id, s.name, s.kind, s.file_id, s.line, s.column, s.end_line, s.visibility, s.scope, f.path
              FROM symbols s JOIN files f ON s.file_id = f.id
              WHERE f.path LIKE ?1
              ORDER BY f.path, s.line",
@@ -509,10 +534,11 @@ impl Database {
                     file_id: row.get(3)?,
                     line: row.get(4)?,
                     column: row.get(5)?,
-                    visibility: row.get(6)?,
-                    scope: row.get(7)?,
+                    end_line: row.get(6)?,
+                    visibility: row.get(7)?,
+                    scope: row.get(8)?,
                 },
-                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -562,6 +588,7 @@ mod tests {
             kind: "fn".to_string(),
             line: 10,
             column: 0,
+            end_line: 15,
             visibility: "pub".to_string(),
             scope: Some("MyStruct".to_string()),
         };

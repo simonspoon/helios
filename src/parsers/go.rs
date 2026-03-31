@@ -106,11 +106,14 @@ impl LanguageParser for GoParser {
                     None
                 };
 
+                // Use the parent declaration node for end_line
+                let def_node = c.node.parent().unwrap_or(c.node);
                 result.symbols.push(ParsedSymbol {
                     name: sym_text,
                     kind: kind.to_string(),
                     line: c.node.start_position().row as i64 + 1,
                     column: c.node.start_position().column as i64,
+                    end_line: def_node.end_position().row as i64 + 1,
                     visibility: visibility.to_string(),
                     scope,
                 });

@@ -170,6 +170,7 @@ impl LanguageParser for CSharpParser {
                     kind: kind.to_string(),
                     line: node.start_position().row as i64 + 1,
                     column: node.start_position().column as i64,
+                    end_line: def_node.end_position().row as i64 + 1,
                     visibility,
                     scope,
                 });

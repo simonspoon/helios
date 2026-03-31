@@ -730,3 +730,197 @@ fn test_compact_vs_pretty_difference() {
         "pretty and compact should produce identical data"
     );
 }
+
+#[test]
+fn test_symbols_body_text_mode() {
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .args(["symbols", "--body", "--file", "main.rs"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --body --file main.rs");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should contain header lines with file:line-end_line format
+    assert!(
+        stdout.contains("--- main.rs:"),
+        "body output should contain header lines, got:\n{}",
+        stdout
+    );
+
+    // Should contain actual function body content
+    assert!(
+        stdout.contains("pub fn main()"),
+        "body should contain main function definition, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("helper()"),
+        "body should contain helper call inside main, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("fn helper() -> i32"),
+        "body should contain helper function definition, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_symbols_body_json_mode() {
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .args(["--json", "symbols", "--body", "--file", "main.rs"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --body --json --file main.rs");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let symbols: Vec<serde_json::Value> = serde_json::from_str(&stdout).expect("parsing JSON");
+
+    // Every symbol should have a "body" field
+    for sym in &symbols {
+        assert!(
+            sym.get("body").is_some(),
+            "symbol {} should have a body field, got: {:?}",
+            sym["name"],
+            sym
+        );
+    }
+
+    // Find the main function and verify its body content
+    let main_sym = symbols
+        .iter()
+        .find(|s| s["name"] == "main" && s["kind"] == "fn")
+        .expect("should find main function");
+
+    let body = main_sym["body"].as_str().expect("body should be a string");
+    assert!(
+        body.contains("pub fn main()"),
+        "main body should contain function signature, got: {}",
+        body
+    );
+    assert!(
+        body.contains("HashMap::new()"),
+        "main body should contain HashMap::new() call, got: {}",
+        body
+    );
+
+    // Find Config struct and verify its body
+    let config_sym = symbols
+        .iter()
+        .find(|s| s["name"] == "Config" && s["kind"] == "struct")
+        .expect("should find Config struct");
+
+    let body = config_sym["body"]
+        .as_str()
+        .expect("body should be a string");
+    assert!(
+        body.contains("pub struct Config"),
+        "Config body should contain struct definition, got: {}",
+        body
+    );
+    assert!(
+        body.contains("pub name: String"),
+        "Config body should contain name field, got: {}",
+        body
+    );
+    assert!(
+        body.contains("pub value: i32"),
+        "Config body should contain value field, got: {}",
+        body
+    );
+}
+
+#[test]
+fn test_symbols_body_kind_filter() {
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .args(["symbols", "--body", "--kind", "struct", "--file", "main.rs"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --body --kind struct --file main.rs");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should contain struct body
+    assert!(
+        stdout.contains("pub struct Config"),
+        "should show Config struct body, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("pub name: String"),
+        "should contain struct fields, got:\n{}",
+        stdout
+    );
+
+    // Should NOT contain function bodies (filtered to structs only)
+    assert!(
+        !stdout.contains("fn main()"),
+        "should not contain fn main when filtered to structs, got:\n{}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("fn helper()"),
+        "should not contain fn helper when filtered to structs, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_symbols_body_matches_source() {
+    let (dir, bin) = setup_indexed_project();
+
+    // Read the actual source file
+    let source = std::fs::read_to_string(dir.path().join("main.rs")).expect("reading main.rs");
+
+    // Get symbols with body in JSON
+    let output = Command::new(&bin)
+        .args(["--json", "symbols", "--body", "--file", "main.rs"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --body --json --file main.rs");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let symbols: Vec<serde_json::Value> = serde_json::from_str(&stdout).expect("parsing JSON");
+
+    // For each symbol, verify its body is a substring of the actual source
+    for sym in &symbols {
+        if let Some(body) = sym["body"].as_str() {
+            assert!(
+                source.contains(body),
+                "body for {} should be found in source file.\nbody: {:?}\nsource excerpt around line {}: {:?}",
+                sym["name"],
+                body,
+                sym["line"],
+                source
+                    .lines()
+                    .skip((sym["line"].as_i64().unwrap() as usize).saturating_sub(1))
+                    .take(5)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    // Verify end_line is always >= line
+    for sym in &symbols {
+        let line = sym["line"].as_i64().unwrap();
+        let end_line = sym["end_line"].as_i64().unwrap();
+        assert!(
+            end_line >= line,
+            "end_line ({}) should be >= line ({}) for symbol {}",
+            end_line,
+            line,
+            sym["name"]
+        );
+    }
+}
