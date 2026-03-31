@@ -1291,3 +1291,158 @@ fn test_visibility_with_kind() {
         names
     );
 }
+
+// --- Status command tests ---
+
+#[test]
+fn test_status_with_index() {
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .args(["status"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios status");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should show the index path
+    assert!(
+        stdout.contains("Index: .helios/index.db"),
+        "should show index path, got:\n{}",
+        stdout
+    );
+    // Should show file and symbol counts
+    assert!(
+        stdout.contains("Files:"),
+        "should show file count, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Symbols:"),
+        "should show symbol count, got:\n{}",
+        stdout
+    );
+    // Should show languages
+    assert!(
+        stdout.contains("Languages:"),
+        "should show languages, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_status_without_index() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    let output = Command::new(&bin)
+        .args(["status"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios status");
+
+    // Status without index should succeed (exit 0), not error
+    assert!(
+        output.status.success(),
+        "status without index should exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No index found"),
+        "should say no index found, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_status_without_index_json() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    let output = Command::new(&bin)
+        .args(["--json", "status"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios --json status");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("parsing JSON");
+
+    assert_eq!(
+        json["indexed"],
+        serde_json::json!(false),
+        "should report indexed: false, got: {:?}",
+        json
+    );
+}
+
+#[test]
+fn test_status_json() {
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .args(["--json", "status"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios --json status");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("parsing JSON");
+
+    // Core fields
+    assert_eq!(json["indexed"], serde_json::json!(true));
+    assert!(
+        json["files"].as_i64().unwrap() >= 4,
+        "should have at least 4 files, got: {}",
+        json["files"]
+    );
+    assert!(
+        json["symbols"].as_i64().unwrap() > 0,
+        "should have symbols, got: {}",
+        json["symbols"]
+    );
+    assert!(
+        json["imports"].is_number(),
+        "should have imports count, got: {:?}",
+        json["imports"]
+    );
+    assert!(
+        json["languages"].is_array(),
+        "should have languages array, got: {:?}",
+        json["languages"]
+    );
+    assert_eq!(json["db_path"], serde_json::json!(".helios/index.db"));
+}
+
+#[test]
+fn test_status_compact_json() {
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .args(["--json", "--compact", "status"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios --json --compact status");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+
+    // Compact output must be a single line
+    assert_eq!(
+        trimmed.lines().count(),
+        1,
+        "compact JSON should be a single line, got:\n{}",
+        trimmed
+    );
+
+    // Must be valid JSON
+    let json: serde_json::Value =
+        serde_json::from_str(trimmed).expect("compact output must be valid JSON");
+    assert_eq!(json["indexed"], serde_json::json!(true));
+}

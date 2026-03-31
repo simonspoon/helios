@@ -512,6 +512,12 @@ impl Database {
             .context("counting symbols by kind")
     }
 
+    pub fn import_count(&self) -> Result<i64> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM imports", [], |row| row.get(0))
+            .context("counting imports")
+    }
+
     pub fn files_by_language(&self) -> Result<Vec<(String, i64)>> {
         let mut stmt = self
             .conn

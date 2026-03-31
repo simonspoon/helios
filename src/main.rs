@@ -62,6 +62,8 @@ enum Command {
         /// Path to summarize (defaults to project root)
         path: Option<String>,
     },
+    /// Show index status and staleness info
+    Status,
     /// Dump full index to markdown
     Export,
 }
@@ -93,6 +95,7 @@ fn main() {
         ),
         Command::Deps { target } => commands::deps::run(target, cli.json, compact),
         Command::Summary { path } => commands::summary::run(path.as_deref(), cli.json, compact),
+        Command::Status => commands::status::run(cli.json, compact),
         Command::Export => commands::export::run(cli.json, compact),
     };
 
