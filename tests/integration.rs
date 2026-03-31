@@ -924,3 +924,197 @@ fn test_symbols_body_matches_source() {
         );
     }
 }
+
+/// Helper: create a project with impl blocks for scope testing
+fn create_scoped_test_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+
+    std::fs::write(
+        dir.path().join("scoped.rs"),
+        r#"
+pub struct Parser {
+    input: String,
+}
+
+impl Parser {
+    pub fn new(input: String) -> Self {
+        Parser { input }
+    }
+
+    pub fn parse(&self) -> bool {
+        !self.input.is_empty()
+    }
+}
+
+pub struct Lexer {
+    source: String,
+}
+
+impl Lexer {
+    pub fn tokenize(&self) -> Vec<String> {
+        vec![]
+    }
+}
+
+pub fn standalone() -> i32 {
+    42
+}
+"#,
+    )
+    .unwrap();
+
+    dir
+}
+
+/// Helper: set up a scoped project with helios init
+fn setup_scoped_project() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = create_scoped_test_project();
+    let bin = helios_bin();
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(
+        output.status.success(),
+        "helios init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (dir, bin)
+}
+
+#[test]
+fn test_scope_filter() {
+    let (dir, bin) = setup_scoped_project();
+
+    // --scope Parser should return only Parser's methods
+    let output = Command::new(&bin)
+        .args(["symbols", "--scope", "Parser"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --scope Parser");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should contain Parser's methods
+    assert!(
+        stdout.contains("new"),
+        "should find 'new' method in Parser scope, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("parse"),
+        "should find 'parse' method in Parser scope, got:\n{}",
+        stdout
+    );
+
+    // Should NOT contain Lexer methods or standalone functions
+    assert!(
+        !stdout.contains("tokenize"),
+        "should not contain Lexer's tokenize, got:\n{}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("standalone"),
+        "should not contain standalone function, got:\n{}",
+        stdout
+    );
+
+    // Should NOT contain the struct definitions themselves (they have no scope)
+    assert!(
+        !stdout.contains("struct"),
+        "should not contain struct symbols (they have scope=None), got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_scope_filter_json() {
+    let (dir, bin) = setup_scoped_project();
+
+    let output = Command::new(&bin)
+        .args(["--json", "symbols", "--scope", "Parser"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --json --scope Parser");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let symbols: Vec<serde_json::Value> = serde_json::from_str(&stdout).expect("parsing JSON");
+
+    // All returned symbols should have scope == "Parser"
+    for sym in &symbols {
+        assert_eq!(
+            sym["scope"].as_str(),
+            Some("Parser"),
+            "every symbol should be scoped to Parser, got: {:?}",
+            sym
+        );
+    }
+
+    // Should have the expected methods
+    let names: Vec<&str> = symbols
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"new"),
+        "should contain 'new', got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"parse"),
+        "should contain 'parse', got: {:?}",
+        names
+    );
+    assert_eq!(
+        symbols.len(),
+        2,
+        "Parser scope should have exactly 2 methods, got: {:?}",
+        names
+    );
+}
+
+#[test]
+fn test_scope_with_kind_filter() {
+    let (dir, bin) = setup_scoped_project();
+
+    // Combine --scope and --kind to verify composability
+    let output = Command::new(&bin)
+        .args(["--json", "symbols", "--scope", "Lexer", "--kind", "fn"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --scope Lexer --kind fn");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let symbols: Vec<serde_json::Value> = serde_json::from_str(&stdout).expect("parsing JSON");
+
+    // Should return only Lexer's fn-kind symbols
+    assert_eq!(
+        symbols.len(),
+        1,
+        "Lexer should have exactly 1 fn, got: {:?}",
+        symbols
+    );
+    assert_eq!(symbols[0]["name"].as_str(), Some("tokenize"));
+    assert_eq!(symbols[0]["scope"].as_str(), Some("Lexer"));
+    assert_eq!(symbols[0]["kind"].as_str(), Some("fn"));
+
+    // Non-matching scope+kind combo should return empty
+    let output = Command::new(&bin)
+        .args(["--json", "symbols", "--scope", "Parser", "--kind", "struct"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --scope Parser --kind struct");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let symbols: Vec<serde_json::Value> = serde_json::from_str(&stdout).expect("parsing JSON");
+    assert!(
+        symbols.is_empty(),
+        "Parser scope should have no structs, got: {:?}",
+        symbols
+    );
+}

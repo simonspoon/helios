@@ -42,6 +42,9 @@ enum Command {
         /// Filter by name pattern (regex)
         #[arg(long)]
         grep: Option<String>,
+        /// Filter by scope (e.g. impl block or class name)
+        #[arg(long)]
+        scope: Option<String>,
         /// Show symbol body/source code
         #[arg(long)]
         body: bool,
@@ -72,11 +75,13 @@ fn main() {
             file,
             kind,
             grep,
+            scope,
             body,
         } => commands::symbols::run(
             file.as_deref(),
             kind.as_deref(),
             grep.as_deref(),
+            scope.as_deref(),
             cli.json,
             compact,
             *body,
