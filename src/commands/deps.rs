@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 
 use crate::db::Database;
 
-pub fn run(target: &str, json: bool) -> Result<()> {
+pub fn run(target: &str, json: bool, compact: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let db_path = cwd.join(".helios/index.db");
 
@@ -40,7 +40,12 @@ pub fn run(target: &str, json: bool) -> Result<()> {
             );
         }
 
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        let formatted = if compact {
+            serde_json::to_string(&output)?
+        } else {
+            serde_json::to_string_pretty(&output)?
+        };
+        println!("{}", formatted);
     } else {
         if is_file {
             let deps = db.file_dependencies(target)?;

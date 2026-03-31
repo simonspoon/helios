@@ -5,7 +5,7 @@ use crate::db::Database;
 use crate::git;
 use crate::indexer;
 
-pub fn run(json: bool) -> Result<()> {
+pub fn run(json: bool, compact: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let db_path = cwd.join(".helios/index.db");
 
@@ -24,7 +24,7 @@ pub fn run(json: bool) -> Result<()> {
         let stats = indexer::index_full(&db, &cwd)?;
         let elapsed = start.elapsed();
 
-        print_stats(&stats, elapsed, json)?;
+        print_stats(&stats, elapsed, json, compact)?;
         return Ok(());
     }
 
@@ -45,7 +45,7 @@ pub fn run(json: bool) -> Result<()> {
                 db.set_metadata("last_indexed_commit", &commit)?;
             }
 
-            print_stats(&stats, elapsed, json)?;
+            print_stats(&stats, elapsed, json, compact)?;
             return Ok(());
         }
     };
@@ -58,7 +58,12 @@ pub fn run(json: bool) -> Result<()> {
                 "files_indexed": 0,
                 "files_deleted": 0,
             });
-            println!("{}", serde_json::to_string_pretty(&output)?);
+            let formatted = if compact {
+                serde_json::to_string(&output)?
+            } else {
+                serde_json::to_string_pretty(&output)?
+            };
+            println!("{}", formatted);
         } else {
             println!("Index is up to date");
         }
@@ -74,7 +79,7 @@ pub fn run(json: bool) -> Result<()> {
         db.set_metadata("last_indexed_commit", &commit)?;
     }
 
-    print_stats(&stats, elapsed, json)?;
+    print_stats(&stats, elapsed, json, compact)?;
     Ok(())
 }
 
@@ -82,6 +87,7 @@ fn print_stats(
     stats: &indexer::IndexStats,
     elapsed: std::time::Duration,
     json: bool,
+    compact: bool,
 ) -> Result<()> {
     if json {
         let output = serde_json::json!({
@@ -92,7 +98,12 @@ fn print_stats(
             "imports_found": stats.imports_found,
             "elapsed_ms": elapsed.as_millis(),
         });
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        let formatted = if compact {
+            serde_json::to_string(&output)?
+        } else {
+            serde_json::to_string_pretty(&output)?
+        };
+        println!("{}", formatted);
     } else {
         println!(
             "Updated: {} files indexed, {} deleted ({} symbols, {} imports) in {:.2}s",

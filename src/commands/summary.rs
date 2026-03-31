@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 use crate::db::Database;
 
-pub fn run(path: Option<&str>, json: bool) -> Result<()> {
+pub fn run(path: Option<&str>, json: bool, compact: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let db_path = cwd.join(".helios/index.db");
 
@@ -39,7 +39,12 @@ pub fn run(path: Option<&str>, json: bool) -> Result<()> {
             "total_symbols": symbols.len(),
             "directories": dirs,
         });
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        let formatted = if compact {
+            serde_json::to_string(&output)?
+        } else {
+            serde_json::to_string_pretty(&output)?
+        };
+        println!("{}", formatted);
     } else {
         let file_count = db.file_count()?;
         let symbol_count = db.symbol_count()?;

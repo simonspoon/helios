@@ -19,6 +19,10 @@ struct Cli {
     /// Output in JSON format
     #[arg(long, global = true)]
     json: bool,
+
+    /// Use compact single-line JSON (requires --json)
+    #[arg(long, global = true)]
+    compact: bool,
 }
 
 #[derive(Subcommand)]
@@ -56,21 +60,32 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
 
+    let compact = cli.compact;
+
     let result = match &cli.command {
-        Command::Init => commands::init::run(cli.json),
-        Command::Update => commands::update::run(cli.json),
-        Command::Symbols { file, kind, grep } => {
-            commands::symbols::run(file.as_deref(), kind.as_deref(), grep.as_deref(), cli.json)
-        }
-        Command::Deps { target } => commands::deps::run(target, cli.json),
-        Command::Summary { path } => commands::summary::run(path.as_deref(), cli.json),
-        Command::Export => commands::export::run(cli.json),
+        Command::Init => commands::init::run(cli.json, compact),
+        Command::Update => commands::update::run(cli.json, compact),
+        Command::Symbols { file, kind, grep } => commands::symbols::run(
+            file.as_deref(),
+            kind.as_deref(),
+            grep.as_deref(),
+            cli.json,
+            compact,
+        ),
+        Command::Deps { target } => commands::deps::run(target, cli.json, compact),
+        Command::Summary { path } => commands::summary::run(path.as_deref(), cli.json, compact),
+        Command::Export => commands::export::run(cli.json, compact),
     };
 
     if let Err(e) = result {
         if cli.json {
             let err = serde_json::json!({"error": e.to_string()});
-            eprintln!("{}", serde_json::to_string_pretty(&err).unwrap_or_default());
+            let formatted = if compact {
+                serde_json::to_string(&err).unwrap_or_default()
+            } else {
+                serde_json::to_string_pretty(&err).unwrap_or_default()
+            };
+            eprintln!("{}", formatted);
         } else {
             eprintln!("error: {e:#}");
         }

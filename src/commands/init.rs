@@ -5,7 +5,7 @@ use crate::db::Database;
 use crate::git;
 use crate::indexer;
 
-pub fn run(json: bool) -> Result<()> {
+pub fn run(json: bool, compact: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let helios_dir = cwd.join(".helios");
 
@@ -39,7 +39,12 @@ pub fn run(json: bool) -> Result<()> {
             "total_symbols": total_symbols,
             "elapsed_ms": elapsed.as_millis(),
         });
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        let formatted = if compact {
+            serde_json::to_string(&output)?
+        } else {
+            serde_json::to_string_pretty(&output)?
+        };
+        println!("{}", formatted);
     } else {
         if stats.symbols_found > 0 {
             println!(

@@ -1,6 +1,19 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Helper: initialize a test project and return (temp_dir, helios_binary_path)
+fn setup_indexed_project() -> (tempfile::TempDir, PathBuf) {
+    let dir = create_test_project();
+    let bin = helios_bin();
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed during setup");
+    (dir, bin)
+}
+
 fn helios_bin() -> PathBuf {
     // Use cargo to find the binary
     let output = Command::new("cargo")
@@ -568,5 +581,152 @@ fn test_csharp_indexing() {
     assert!(
         stdout.contains("Models.cs"),
         "Summary should include the C# file"
+    );
+}
+
+#[test]
+fn test_compact_symbols_json() {
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .args(["--json", "--compact", "symbols"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --json --compact");
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+
+    // Compact output must be a single line
+    assert_eq!(
+        trimmed.lines().count(),
+        1,
+        "compact JSON should be a single line, got:\n{}",
+        trimmed
+    );
+
+    // Must be valid JSON (array of symbols)
+    let parsed: serde_json::Value =
+        serde_json::from_str(trimmed).expect("compact output must be valid JSON");
+    assert!(parsed.is_array(), "symbols output should be a JSON array");
+    assert!(
+        !parsed.as_array().unwrap().is_empty(),
+        "symbols array should not be empty"
+    );
+}
+
+#[test]
+fn test_compact_export_json() {
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .args(["--json", "--compact", "export"])
+        .current_dir(dir.path())
+        .output()
+        .expect("export --json --compact");
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+
+    // Compact output must be a single line
+    assert_eq!(
+        trimmed.lines().count(),
+        1,
+        "compact JSON should be a single line, got:\n{}",
+        trimmed
+    );
+
+    // Must be valid JSON with expected fields
+    let parsed: serde_json::Value =
+        serde_json::from_str(trimmed).expect("compact output must be valid JSON");
+    assert!(
+        parsed["files"].is_array(),
+        "export should contain 'files' array"
+    );
+    assert!(
+        parsed["total_files"].as_u64().unwrap() >= 4,
+        "export should report at least 4 files"
+    );
+}
+
+#[test]
+fn test_compact_summary_json() {
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .args(["--json", "--compact", "summary"])
+        .current_dir(dir.path())
+        .output()
+        .expect("summary --json --compact");
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+
+    // Compact output must be a single line
+    assert_eq!(
+        trimmed.lines().count(),
+        1,
+        "compact JSON should be a single line, got:\n{}",
+        trimmed
+    );
+
+    // Must be valid JSON with expected fields
+    let parsed: serde_json::Value =
+        serde_json::from_str(trimmed).expect("compact output must be valid JSON");
+    assert!(
+        parsed["total_symbols"].as_u64().unwrap() > 0,
+        "summary should report symbols"
+    );
+    assert!(
+        parsed["directories"].is_object(),
+        "summary should contain 'directories' object"
+    );
+}
+
+#[test]
+fn test_compact_vs_pretty_difference() {
+    let (dir, bin) = setup_indexed_project();
+
+    // Get pretty output
+    let pretty_output = Command::new(&bin)
+        .args(["--json", "symbols", "--kind", "fn"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --json (pretty)");
+
+    // Get compact output
+    let compact_output = Command::new(&bin)
+        .args(["--json", "--compact", "symbols", "--kind", "fn"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --json --compact");
+
+    let pretty = String::from_utf8_lossy(&pretty_output.stdout);
+    let compact = String::from_utf8_lossy(&compact_output.stdout);
+
+    // Pretty should have multiple lines, compact should have one
+    assert!(
+        pretty.trim().lines().count() > 1,
+        "pretty output should span multiple lines"
+    );
+    assert_eq!(
+        compact.trim().lines().count(),
+        1,
+        "compact output should be a single line"
+    );
+
+    // Both should parse to the same JSON value
+    let pretty_val: serde_json::Value = serde_json::from_str(pretty.trim()).expect("pretty JSON");
+    let compact_val: serde_json::Value =
+        serde_json::from_str(compact.trim()).expect("compact JSON");
+    assert_eq!(
+        pretty_val, compact_val,
+        "pretty and compact should produce identical data"
     );
 }
