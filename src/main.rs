@@ -62,6 +62,9 @@ enum Command {
     Deps {
         /// Symbol name or file path to query
         target: String,
+        /// Transitive traversal depth (default: 1, file targets only)
+        #[arg(long, default_value = "1")]
+        depth: u32,
     },
     /// Directory-level overview
     Summary {
@@ -113,7 +116,7 @@ fn main() {
             *offset,
         ),
         Command::Diff => commands::diff::run(cli.json, compact),
-        Command::Deps { target } => commands::deps::run(target, cli.json, compact),
+        Command::Deps { target, depth } => commands::deps::run(target, cli.json, compact, *depth),
         Command::Summary { path } => commands::summary::run(path.as_deref(), cli.json, compact),
         Command::Status => commands::status::run(cli.json, compact),
         Command::Export { limit, offset } => {

@@ -2035,3 +2035,267 @@ fn test_grep_regex_with_pagination() {
     assert_eq!(symbols.len(), 1, "should return exactly 1 symbol");
     assert_eq!(symbols[0]["name"].as_str().unwrap(), "main");
 }
+
+/// Create a test project with a chain of TypeScript imports for transitive dep testing:
+/// chain_base.ts -> chain_mid.ts -> chain_leaf.ts
+fn create_chain_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+
+    // chain_leaf.ts: no imports from project files
+    std::fs::write(
+        dir.path().join("chain_leaf.ts"),
+        r#"
+export function leaf(): string {
+    return "leaf";
+}
+"#,
+    )
+    .unwrap();
+
+    // chain_mid.ts: imports from chain_leaf (use .ts extension so LIKE match works)
+    std::fs::write(
+        dir.path().join("chain_mid.ts"),
+        r#"
+import { leaf } from './chain_leaf.ts';
+
+export function mid(): string {
+    return leaf() + "_mid";
+}
+"#,
+    )
+    .unwrap();
+
+    // chain_base.ts: imports from chain_mid (use .ts extension so LIKE match works)
+    std::fs::write(
+        dir.path().join("chain_base.ts"),
+        r#"
+import { mid } from './chain_mid.ts';
+
+export function base(): string {
+    return mid() + "_base";
+}
+"#,
+    )
+    .unwrap();
+
+    dir
+}
+
+fn setup_chain_project() -> (tempfile::TempDir, PathBuf) {
+    let dir = create_chain_project();
+    let bin = helios_bin();
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(
+        output.status.success(),
+        "helios init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (dir, bin)
+}
+
+#[test]
+fn test_deps_depth_default() {
+    // Default depth=1 behavior should be unchanged from before --depth was added
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .args(["deps", "main.rs"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps main.rs");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should show direct dependencies only
+    assert!(
+        stdout.contains("Dependencies"),
+        "should show dependencies section"
+    );
+}
+
+#[test]
+fn test_deps_depth_flag_accepted() {
+    // Verify --depth flag is accepted by the CLI
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .args(["deps", "main.rs", "--depth", "2"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps --depth 2");
+
+    assert!(
+        output.status.success(),
+        "deps --depth 2 should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_deps_depth_2_dependents() {
+    // chain_leaf.ts is imported by chain_mid.ts, which is imported by chain_base.ts.
+    // With --depth 2, dependents of chain_leaf should include chain_base transitively.
+    let (dir, bin) = setup_chain_project();
+
+    let output = Command::new(&bin)
+        .args(["deps", "chain_leaf.ts", "--depth", "2"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps chain_leaf.ts --depth 2");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // chain_mid.ts imports chain_leaf -> should appear at depth 1
+    assert!(
+        stdout.contains("chain_mid.ts"),
+        "should find chain_mid.ts as dependent, got:\n{stdout}"
+    );
+    // chain_base.ts imports chain_mid -> should appear at depth 2
+    assert!(
+        stdout.contains("chain_base.ts"),
+        "should find chain_base.ts as transitive dependent at depth 2, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_deps_depth_1_no_transitive() {
+    // With --depth 1, dependents of chain_leaf should NOT include chain_base.
+    let (dir, bin) = setup_chain_project();
+
+    let output = Command::new(&bin)
+        .args(["deps", "chain_leaf.ts", "--depth", "1"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps chain_leaf.ts --depth 1");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("chain_mid.ts"),
+        "should find chain_mid.ts at depth 1, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("chain_base.ts"),
+        "should NOT find chain_base.ts at depth 1, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_deps_depth_json() {
+    // JSON output should include depth info per dependency
+    let (dir, bin) = setup_chain_project();
+
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "chain_leaf.ts", "--depth", "2"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps --json --depth 2");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let result: serde_json::Value = serde_json::from_str(&stdout).expect("parsing JSON");
+
+    // Check structure
+    assert_eq!(result["target"].as_str().unwrap(), "chain_leaf.ts");
+    assert_eq!(result["depth"].as_u64().unwrap(), 2);
+
+    // Dependents should have depth field
+    let dependents = result["dependents"].as_array().expect("dependents array");
+    assert!(
+        !dependents.is_empty(),
+        "should have dependents, got: {result}"
+    );
+
+    // Find chain_mid at depth 1
+    let mid_entry = dependents
+        .iter()
+        .find(|e| e["path"].as_str().is_some_and(|p| p.contains("chain_mid")))
+        .expect("should find chain_mid in dependents");
+    assert_eq!(
+        mid_entry["depth"].as_u64().unwrap(),
+        1,
+        "chain_mid should be at depth 1"
+    );
+
+    // Find chain_base at depth 2
+    let base_entry = dependents
+        .iter()
+        .find(|e| e["path"].as_str().is_some_and(|p| p.contains("chain_base")))
+        .expect("should find chain_base in dependents");
+    assert_eq!(
+        base_entry["depth"].as_u64().unwrap(),
+        2,
+        "chain_base should be at depth 2"
+    );
+}
+
+#[test]
+fn test_deps_depth_symbol_ignores_depth() {
+    // Symbol targets should work with --depth flag without error,
+    // but depth > 1 has no special effect for symbols
+    let (dir, bin) = setup_indexed_project();
+
+    let output = Command::new(&bin)
+        .args(["deps", "main", "--depth", "3"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps symbol --depth 3");
+
+    assert!(
+        output.status.success(),
+        "symbol deps with --depth should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_deps_depth_cycle_detection() {
+    // Create files with circular imports to verify no infinite loop
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    // cycle_a.ts imports cycle_b, cycle_b imports cycle_a
+    std::fs::write(
+        dir.path().join("cycle_a.ts"),
+        r#"
+import { b } from './cycle_b';
+export function a(): string { return b(); }
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        dir.path().join("cycle_b.ts"),
+        r#"
+import { a } from './cycle_a';
+export function b(): string { return a(); }
+"#,
+    )
+    .unwrap();
+
+    let init = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("init");
+    assert!(init.status.success());
+
+    // This should complete without hanging (cycle detection via HashSet)
+    let output = Command::new(&bin)
+        .args(["deps", "cycle_a.ts", "--depth", "10"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps with cycle --depth 10");
+
+    assert!(
+        output.status.success(),
+        "should handle cycles gracefully, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
