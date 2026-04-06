@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="icon.png" width="128" height="128" alt="helios">
+</p>
+
 # helios
 
 Tree-sitter code indexing CLI with SQLite. Built for agent-driven codebase exploration.
