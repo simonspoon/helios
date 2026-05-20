@@ -74,18 +74,22 @@ helios symbols --kind fn
 # Symbols in a directory
 helios symbols --file src/
 
-# Search by name
-helios symbols --grep "parse"
+# Search by name (regex)
+helios symbols --grep "^parse_"
 
-# Combine filters
-helios symbols --kind struct --file src/parsers/
+# Combine filters and paginate
+helios symbols --kind struct --file src/parsers/ --limit 20 --offset 40
 ```
 
 Options:
 - `--file <PATH>` — Filter by file path (substring match)
 - `--kind <KIND>` — Filter by symbol kind: `fn`, `struct`, `trait`, `enum`, `class`, `interface`, `type`, `const`, `mod`
-- `--grep <PATTERN>` — Filter by symbol name (substring match)
-- `--json` — JSON output
+- `--grep <PATTERN>` — Filter by symbol name (regex)
+- `--scope <SCOPE>` — Filter by scope (e.g. impl block or class name)
+- `--visibility <pub|private>` — Filter by visibility
+- `--body` — Include each symbol's source body in the output
+- `--limit <N>` — Maximum number of symbols to return
+- `--offset <N>` — Number of symbols to skip
 
 Output format:
 
@@ -94,7 +98,7 @@ src/main.rs:42:0 fn pub main
 src/lib.rs:10:4 struct pub Parser
 ```
 
-### `helios deps <TARGET>`
+### `helios deps <TARGET> [--depth <N>]`
 
 Show dependencies and dependents for a symbol or file. Auto-detects the target type: paths containing `/` or `.` are treated as files, otherwise as symbols.
 
@@ -106,9 +110,14 @@ helios deps "src/parser.rs"
 # Dependents (what imports src/parser.rs):
 #   src/main.rs -> src/parser.rs (import)
 
+# Transitive file dependencies (depth 3)
+helios deps "src/parser.rs" --depth 3
+
 # Symbol references
 helios deps "parse_token"
 ```
+
+- `--depth <N>` — Transitive traversal depth (default: 1, file targets only)
 
 ### `helios summary [PATH]`
 
@@ -121,18 +130,52 @@ helios summary src/parsers/
 
 Output is markdown by default, listing files and their exported symbols grouped by directory.
 
-### `helios export`
+### `helios diff`
+
+Show symbol changes (added, removed, modified) since the last indexed commit. Useful for surfacing what a working-tree change actually altered.
+
+```bash
+helios diff
+```
+
+### `helios status`
+
+Report index health: last indexed commit, file/symbol counts, and staleness vs. the working tree.
+
+```bash
+helios status
+```
+
+### `helios files [--language <LANG>]`
+
+List indexed files with per-file symbol and import counts.
+
+```bash
+helios files
+helios files --language rust
+```
+
+### `helios export [--limit <N>] [--offset <N>]`
 
 Dump the entire index to markdown or JSON.
 
 ```bash
 helios export > index.md
 helios export --json > index.json
+helios export --limit 500 --offset 1000
 ```
 
-### Global Flag
+### Global Flags
 
-- `--json` — Available on all commands. Output results as JSON.
+- `--json` — Output results as JSON (available on all commands).
+- `--compact` — Emit single-line JSON instead of pretty-printed (requires `--json`).
+- `--quiet` — Suppress all stdout. Useful for scripting `init`/`update`.
+
+### Exit Codes
+
+- `0` — Success
+- `1` — General error
+- `2` — No index found (run `helios init` first)
 
 ## Architecture
 
@@ -142,8 +185,11 @@ commands/
   init.rs            Full indexing
   update.rs          Incremental indexing (git-aware)
   symbols.rs         Symbol search & filtering
-  deps.rs            Dependency analysis
+  deps.rs            Dependency analysis (transitive via --depth)
   summary.rs         Directory-level overview
+  diff.rs            Symbol changes since last index
+  status.rs          Index health & staleness
+  files.rs           File-level metadata listing
   export.rs          Full index export
 indexer.rs           Coordinates parsing and DB insertion
 parsers/
@@ -156,6 +202,7 @@ parsers/
   csharp.rs          Classes, structs, records, interfaces, enums, methods, properties
 db.rs                SQLite wrapper (files, symbols, imports, references)
 git.rs               Git integration (HEAD, diff, repo detection)
+errors.rs            Typed errors (e.g. NoIndexError -> exit code 2)
 ```
 
 ### Database Schema
