@@ -29,6 +29,7 @@ pub fn run(json: bool, compact: bool) -> Result<()> {
     let import_count = db.import_count()?;
     let by_lang = db.files_by_language()?;
     let last_commit = db.get_metadata("last_indexed_commit")?;
+    let csharp_resolver = db.get_metadata("csharp_resolver")?;
 
     // Git staleness info
     let in_git = git::is_git_repo();
@@ -71,6 +72,9 @@ pub fn run(json: bool, compact: bool) -> Result<()> {
         if last_commit.is_some() && in_git {
             output["stale_files"] = serde_json::json!(stale_count);
         }
+        if let Some(ref resolver) = csharp_resolver {
+            output["csharp_resolver"] = serde_json::json!(resolver);
+        }
 
         let formatted = if compact {
             serde_json::to_string(&output)?
@@ -101,6 +105,9 @@ pub fn run(json: bool, compact: bool) -> Result<()> {
         }
         if last_commit.is_some() && in_git {
             println!("Stale files: {}", stale_count);
+        }
+        if let Some(ref resolver) = csharp_resolver {
+            println!("C# resolver: {}", resolver);
         }
     }
 

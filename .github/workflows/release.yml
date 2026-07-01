@@ -63,8 +63,36 @@ jobs:
           name: ${{ matrix.name }}
           path: ${{ matrix.name }}
 
+  # The Roslyn helper is pure IL — one framework-dependent, platform-neutral
+  # bundle serves every OS/arch. Runs on the user's .NET runtime (RollForward
+  # LatestMajor), so no per-platform matrix and no bundled runtime.
+  build-helper:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Publish helper (framework-dependent)
+        run: dotnet publish helios-roslyn -c Release -o helper-publish
+
+      - name: Zip helper bundle
+        run: |
+          cd helper-publish
+          zip -r ../helios-roslyn.zip .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-roslyn.zip
+          path: helios-roslyn.zip
+
   release:
-    needs: build
+    needs: [build, build-helper]
     runs-on: ubuntu-latest
 
     steps:

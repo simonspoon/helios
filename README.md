@@ -40,6 +40,53 @@ Download a pre-built binary from [Releases](https://github.com/simonspoon/helios
 cargo install --git https://github.com/simonspoon/helios.git
 ```
 
+## Semantic C# mode (optional)
+
+By default helios resolves C# references syntactically with tree-sitter. An optional
+Roslyn-based helper (`helios-roslyn`) upgrades `.cs` reference resolution to full
+compiler-level accuracy: overloads, inheritance, interfaces, generics, and inferred
+types resolve to the exact symbol instead of a name match.
+
+Helios works fully without the helper — when it is absent, `helios init` silently
+uses the tree-sitter path. Nothing else changes.
+
+### Requirements
+
+- .NET SDK 8.0 or later on your PATH (`dotnet --version`). Projects with a
+  `.csproj`/`.sln` need the SDK; repos of loose `.cs` files need only the runtime.
+
+### Install the helper
+
+Download `helios-roslyn.zip` from [Releases](https://github.com/simonspoon/helios/releases)
+and extract it next to the `helios` binary:
+
+```bash
+unzip helios-roslyn.zip -d "$(dirname "$(which helios)")"
+```
+
+Or place it anywhere and point `HELIOS_ROSLYN` at the dll (takes precedence):
+
+```bash
+export HELIOS_ROSLYN=/path/to/helios-roslyn.dll
+```
+
+Building from source instead: `dotnet publish helios-roslyn -c Release -o <dir>`,
+then set `HELIOS_ROSLYN=<dir>/helios-roslyn.dll`.
+
+### Verify
+
+Run `helios init` in a C# project, then:
+
+```bash
+helios status
+# ...
+# C# resolver: roslyn
+```
+
+`C# resolver: treesitter` means the helper wasn't used — a `warning:` line during
+`init` says why (dotnet missing, runtime below .NET 8, helper failed). A missing
+helper with no `HELIOS_ROSLYN` set falls back silently by design.
+
 ## Usage
 
 ### `helios init`
@@ -202,7 +249,9 @@ parsers/
   csharp.rs          Classes, structs, records, interfaces, enums, methods, properties
 db.rs                SQLite wrapper (files, symbols, imports, references)
 git.rs               Git integration (HEAD, diff, repo detection)
+sidecar.rs           Roslyn helper detection + invocation (semantic C# mode)
 errors.rs            Typed errors (e.g. NoIndexError -> exit code 2)
+helios-roslyn/       Optional .NET helper: Roslyn-based C# reference resolution
 ```
 
 ### Database Schema
