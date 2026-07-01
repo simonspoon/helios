@@ -289,6 +289,7 @@ impl LanguageParser for CSharpParser {
                         symbol_name: text,
                         line: c.node.start_position().row as i64 + 1,
                         column: c.node.start_position().column as i64,
+                        from_scope: find_scope(src, c.node),
                     });
                 }
             }

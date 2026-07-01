@@ -196,6 +196,7 @@ impl LanguageParser for TypeScriptParser {
                     symbol_name: text,
                     line: c.node.start_position().row as i64 + 1,
                     column: c.node.start_position().column as i64,
+                    from_scope: None,
                 });
             }
         }

@@ -81,6 +81,10 @@ pub struct ParsedReference {
     pub symbol_name: String,
     pub line: i64,
     pub column: i64,
+    /// Enclosing scope (class/namespace) of the reference site, when known.
+    /// Used at index time to prefer a same-scope definition over same-named
+    /// definitions elsewhere. `None` when the parser cannot supply scope.
+    pub from_scope: Option<String>,
 }
 
 impl Database {

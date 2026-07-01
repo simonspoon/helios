@@ -665,6 +665,101 @@ namespace App {
     );
 }
 
+/// Scope-aware C# resolution: a call to a method defined in the caller's OWN
+/// class must resolve to that class's definition, not a same-named method in a
+/// sibling class. When the name is ambiguous but no candidate shares the caller's
+/// scope, resolution still links to all candidates (story 174 behavior preserved).
+#[test]
+fn test_csharp_scope_aware_reference_resolution() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    std::fs::write(
+        dir.path().join("Scoped.cs"),
+        r#"
+namespace App {
+    public class Alpha {
+        public void Compute() { }
+
+        public void Run() {
+            // In-scope call: Alpha also declares Compute, so this must resolve
+            // to Alpha.Compute ONLY, not Beta.Compute.
+            Compute();
+        }
+    }
+
+    public class Beta {
+        public void Compute() { }
+    }
+
+    public class Gamma {
+        public void Shared() { }
+    }
+
+    public class Delta {
+        public void Shared() { }
+    }
+
+    public class Runner {
+        public void Go() {
+            // Runner declares no Shared method — no scope match, so this stays
+            // ambiguous and links to BOTH Gamma.Shared and Delta.Shared.
+            Shared();
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let bin = helios_bin();
+    let init = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("init");
+    assert!(init.status.success(), "helios init failed");
+
+    let dependents = |target: &str| -> Vec<serde_json::Value> {
+        let output = Command::new(&bin)
+            .args(["--json", "deps", target])
+            .current_dir(dir.path())
+            .output()
+            .unwrap_or_else(|_| panic!("deps {target}"));
+        assert!(
+            output.status.success(),
+            "deps {target} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+        value["dependents"]
+            .as_array()
+            .cloned()
+            .expect("dependents array")
+    };
+
+    // "Compute" is declared in Alpha and Beta. The single call site lives inside
+    // Alpha, so scope-aware resolution narrows it to Alpha.Compute alone — exactly
+    // ONE linked usage. Under the pre-scope (story 174) behavior this would have
+    // linked to both definitions, yielding 2.
+    let compute_refs = dependents("Compute");
+    assert_eq!(
+        compute_refs.len(),
+        1,
+        "in-scope 'Compute' call should resolve to its own class only, got: {:?}",
+        compute_refs
+    );
+
+    // "Shared" is declared in Gamma and Delta; the call site (Runner) matches
+    // neither scope, so it stays ambiguous and links to BOTH definitions.
+    let shared_refs = dependents("Shared");
+    assert_eq!(
+        shared_refs.len(),
+        2,
+        "unresolvable-by-scope 'Shared' call should link to all candidates, got: {:?}",
+        shared_refs
+    );
+}
+
 #[test]
 fn test_compact_symbols_json() {
     let (dir, bin) = setup_indexed_project();

@@ -3,8 +3,37 @@ use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-use crate::db::Database;
+use crate::db::{Database, SymbolRecord};
 use crate::parsers;
+
+/// Choose which candidate definitions a reference resolves to.
+///
+/// Reference resolution is scope-aware: if the reference site's enclosing scope
+/// (`from_scope`, e.g. its C# class or namespace) is known and one or more
+/// candidates were declared in that same scope, only those in-scope definitions
+/// are linked — a call to a method defined in its own class resolves to that
+/// class's definition rather than a same-named method elsewhere.
+///
+/// When there is no scope context, or no candidate matches the scope, we fall
+/// back to linking ALL candidates. This preserves the behavior for unambiguous
+/// names (a single candidate) and for genuinely ambiguous names that cannot be
+/// disambiguated by scope (link to every candidate rather than guessing).
+fn resolve_reference_candidates(
+    from_scope: Option<&str>,
+    candidates: &[(SymbolRecord, String)],
+) -> Vec<i64> {
+    if let Some(scope) = from_scope {
+        let in_scope: Vec<i64> = candidates
+            .iter()
+            .filter(|(sym, _)| sym.scope.as_deref() == Some(scope))
+            .map(|(sym, _)| sym.id)
+            .collect();
+        if !in_scope.is_empty() {
+            return in_scope;
+        }
+    }
+    candidates.iter().map(|(sym, _)| sym.id).collect()
+}
 
 /// Index all supported files in a directory
 pub fn index_full(db: &Database, root: &Path) -> Result<IndexStats> {
@@ -116,13 +145,15 @@ pub fn index_file(
         import_count += 1;
     }
 
-    // Insert references — resolve to known symbols. When a name is ambiguous
-    // (declared in 2+ places) we link the reference to ALL candidates instead of
-    // arbitrarily picking one, so `helios deps` never attributes a usage to the
-    // wrong definition.
+    // Insert references — resolve to known symbols. Scope-aware: when the
+    // reference site's enclosing scope is known and one or more candidates share
+    // it, we link only those in-scope definitions (same class/namespace wins over
+    // same-named definitions elsewhere). When no scope context is available or no
+    // candidate matches, we fall back to linking ALL candidates — preserving the
+    // ambiguous-name behavior so `helios deps` never silently drops a usage.
     for reference in &parse_result.references {
-        let symbols = db.find_symbol_by_name(&reference.symbol_name)?;
-        let symbol_ids: Vec<i64> = symbols.iter().map(|(sym, _)| sym.id).collect();
+        let candidates = db.find_symbol_by_name(&reference.symbol_name)?;
+        let symbol_ids = resolve_reference_candidates(reference.from_scope.as_deref(), &candidates);
         db.insert_references(&symbol_ids, file_id, reference.line, reference.column)?;
     }
 
