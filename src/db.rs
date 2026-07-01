@@ -514,6 +514,25 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Record a reference against every candidate symbol it may resolve to.
+    ///
+    /// When a name is ambiguous (declared in 2+ places) we cannot statically
+    /// decide which definition a usage targets, so we link the reference to all
+    /// candidates rather than silently picking one and attributing the usage to
+    /// the wrong definition. Returns the number of reference rows inserted.
+    pub fn insert_references(
+        &self,
+        symbol_ids: &[i64],
+        file_id: i64,
+        line: i64,
+        column: i64,
+    ) -> Result<usize> {
+        for &symbol_id in symbol_ids {
+            self.insert_reference(symbol_id, file_id, line, column)?;
+        }
+        Ok(symbol_ids.len())
+    }
+
     pub fn delete_references_for_file(&self, file_id: i64) -> Result<()> {
         self.conn.execute(
             "DELETE FROM references_ WHERE file_id = ?1",

@@ -584,6 +584,87 @@ fn test_csharp_indexing() {
     );
 }
 
+/// An ambiguous C# method name (declared in 2+ classes) must link a usage to
+/// ALL candidate definitions rather than silently picking one. Unambiguous
+/// names must still resolve to their single definition (no regression).
+#[test]
+fn test_csharp_ambiguous_reference_links_all_candidates() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    std::fs::write(
+        dir.path().join("Ambiguous.cs"),
+        r#"
+namespace App {
+    public class Alpha {
+        public void Compute() { }
+    }
+
+    public class Beta {
+        public void Compute() { }
+    }
+
+    public class Solo {
+        public void OnlyHere() { }
+    }
+
+    public class Runner {
+        public void Run() {
+            Compute();
+            OnlyHere();
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let bin = helios_bin();
+    let init = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("init");
+    assert!(init.status.success(), "helios init failed");
+
+    let dependents = |target: &str| -> Vec<serde_json::Value> {
+        let output = Command::new(&bin)
+            .args(["--json", "deps", target])
+            .current_dir(dir.path())
+            .output()
+            .unwrap_or_else(|_| panic!("deps {target}"));
+        assert!(
+            output.status.success(),
+            "deps {target} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+        value["dependents"]
+            .as_array()
+            .cloned()
+            .expect("dependents array")
+    };
+
+    // "Compute" is declared in both Alpha and Beta. The single call site must be
+    // linked to BOTH candidate definitions (2 reference rows), not one arbitrary
+    // pick (which would yield 1) and not dropped (which would yield 0).
+    let compute_refs = dependents("Compute");
+    assert_eq!(
+        compute_refs.len(),
+        2,
+        "ambiguous 'Compute' usage should link to both definitions, got: {:?}",
+        compute_refs
+    );
+
+    // "OnlyHere" is declared once — no regression: exactly one linked usage.
+    let only_here_refs = dependents("OnlyHere");
+    assert_eq!(
+        only_here_refs.len(),
+        1,
+        "unambiguous 'OnlyHere' usage should link to its single definition, got: {:?}",
+        only_here_refs
+    );
+}
+
 #[test]
 fn test_compact_symbols_json() {
     let (dir, bin) = setup_indexed_project();

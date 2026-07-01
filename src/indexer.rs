@@ -116,12 +116,14 @@ pub fn index_file(
         import_count += 1;
     }
 
-    // Insert references — try to resolve to known symbols
+    // Insert references — resolve to known symbols. When a name is ambiguous
+    // (declared in 2+ places) we link the reference to ALL candidates instead of
+    // arbitrarily picking one, so `helios deps` never attributes a usage to the
+    // wrong definition.
     for reference in &parse_result.references {
         let symbols = db.find_symbol_by_name(&reference.symbol_name)?;
-        if let Some((sym, _)) = symbols.first() {
-            db.insert_reference(sym.id, file_id, reference.line, reference.column)?;
-        }
+        let symbol_ids: Vec<i64> = symbols.iter().map(|(sym, _)| sym.id).collect();
+        db.insert_references(&symbol_ids, file_id, reference.line, reference.column)?;
     }
 
     Ok(FileStats {
