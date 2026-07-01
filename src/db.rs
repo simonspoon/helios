@@ -190,9 +190,8 @@ impl Database {
         // Index must be created here (after the column is ensured), not in
         // create_tables: on a pre-existing DB the CREATE TABLE IF NOT EXISTS
         // is a no-op and the docid column does not exist yet at that point.
-        self.conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_symbols_docid ON symbols(docid)",
-        )?;
+        self.conn
+            .execute_batch("CREATE INDEX IF NOT EXISTS idx_symbols_docid ON symbols(docid)")?;
 
         Ok(())
     }

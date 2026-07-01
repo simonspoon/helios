@@ -120,10 +120,9 @@ impl Sidecar {
         match run_with_timeout(cmd, PING_TIMEOUT) {
             Err(RunError::Spawn(e)) => ProbeResult::PingSpawnFailed(e.to_string()),
             Err(RunError::Wait(e)) => ProbeResult::PingFailed(e.to_string()),
-            Err(RunError::TimedOut) => ProbeResult::PingFailed(format!(
-                "timed out after {}s",
-                PING_TIMEOUT.as_secs()
-            )),
+            Err(RunError::TimedOut) => {
+                ProbeResult::PingFailed(format!("timed out after {}s", PING_TIMEOUT.as_secs()))
+            }
             Ok(out) if !out.status.success() => ProbeResult::PingFailed(format!(
                 "exited with {}: {}",
                 out.status,
@@ -284,12 +283,12 @@ fn parse_analyze(stdout: &str) -> Result<(AnalyzeOutput, Vec<String>)> {
         let value: serde_json::Value = serde_json::from_str(line)
             .with_context(|| format!("unparseable NDJSON line from helios-roslyn: {line}"))?;
         match value.get("type").and_then(|t| t.as_str()) {
-            Some("definition") => output.definitions.push(
-                serde_json::from_value(value).context("malformed definition record")?,
-            ),
-            Some("reference") => output.references.push(
-                serde_json::from_value(value).context("malformed reference record")?,
-            ),
+            Some("definition") => output
+                .definitions
+                .push(serde_json::from_value(value).context("malformed definition record")?),
+            Some("reference") => output
+                .references
+                .push(serde_json::from_value(value).context("malformed reference record")?),
             Some("warning") => {
                 if let Some(message) = value.get("message").and_then(|m| m.as_str()) {
                     warnings.push(message.to_string());

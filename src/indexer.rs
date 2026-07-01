@@ -374,10 +374,7 @@ mod tests {
         // Each usage attributed to the right definition; wire col - 1 stored
         assert_eq!(
             all_refs(&db),
-            vec![
-                (save_a, file_main, 10, 8),
-                (save_b, file_main, 11, 12),
-            ]
+            vec![(save_a, file_main, 10, 8), (save_b, file_main, 11, 12),]
         );
         assert_eq!(
             db.get_metadata("csharp_resolver").unwrap().as_deref(),
@@ -397,7 +394,13 @@ mod tests {
         let output = AnalyzeOutput {
             // no symbol row at (Program.cs, 99, Nope) — stamp skips silently
             definitions: vec![def("M:App.Nope", "Nope", "Program.cs", 99)],
-            references: vec![wire_ref("M:System.Console.WriteLine", "Program.cs", 4, 9, false)],
+            references: vec![wire_ref(
+                "M:System.Console.WriteLine",
+                "Program.cs",
+                4,
+                9,
+                false,
+            )],
         };
         ingest_semantic(&db, Some(&output)).unwrap();
 
