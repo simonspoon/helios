@@ -125,7 +125,8 @@ impl Database {
                 column INTEGER NOT NULL,
                 end_line INTEGER NOT NULL DEFAULT 0,
                 visibility TEXT NOT NULL DEFAULT 'private',
-                scope TEXT
+                scope TEXT,
+                docid TEXT
             );
 
             CREATE TABLE IF NOT EXISTS imports (
@@ -173,6 +174,24 @@ impl Database {
                 "ALTER TABLE symbols ADD COLUMN end_line INTEGER NOT NULL DEFAULT 0",
             )?;
         }
+
+        // Check if docid column exists in symbols table
+        let has_docid: bool = self
+            .conn
+            .prepare("SELECT docid FROM symbols LIMIT 0")
+            .is_ok();
+
+        if !has_docid {
+            self.conn
+                .execute_batch("ALTER TABLE symbols ADD COLUMN docid TEXT")?;
+        }
+
+        // Index must be created here (after the column is ensured), not in
+        // create_tables: on a pre-existing DB the CREATE TABLE IF NOT EXISTS
+        // is a no-op and the docid column does not exist yet at that point.
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_symbols_docid ON symbols(docid)",
+        )?;
 
         Ok(())
     }
@@ -824,5 +843,142 @@ mod tests {
         );
 
         assert!(db.get_metadata("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_fresh_db_has_docid_column_and_index() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Column exists and is queryable
+        assert!(db.conn.prepare("SELECT docid FROM symbols LIMIT 0").is_ok());
+
+        // Column is nullable: inserting through the existing symbol path
+        // (which never mentions docid) reads back NULL
+        let file_id = db.upsert_file("src/a.cs", "hash", "csharp").unwrap();
+        let sym = ParsedSymbol {
+            name: "Greet".to_string(),
+            kind: "fn".to_string(),
+            line: 3,
+            column: 4,
+            end_line: 5,
+            visibility: "pub".to_string(),
+            scope: Some("Person".to_string()),
+        };
+        let sym_id = db.insert_symbol(file_id, &sym).unwrap();
+        let docid: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT docid FROM symbols WHERE id = ?1",
+                params![sym_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(docid.is_none());
+
+        // Index exists
+        let mut stmt = db.conn.prepare("PRAGMA index_list('symbols')").unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(
+            names.iter().any(|n| n == "idx_symbols_docid"),
+            "idx_symbols_docid missing from {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_legacy_db_migrates_docid() {
+        // Hand-create a DB with the v0.15.0 schema (no docid column) and rows,
+        // then reopen through Database::open to exercise the migration.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    id INTEGER PRIMARY KEY,
+                    path TEXT NOT NULL UNIQUE,
+                    content_hash TEXT NOT NULL,
+                    language TEXT NOT NULL,
+                    last_indexed_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE symbols (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    line INTEGER NOT NULL,
+                    column INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL DEFAULT 0,
+                    visibility TEXT NOT NULL DEFAULT 'private',
+                    scope TEXT
+                );
+                CREATE TABLE imports (
+                    id INTEGER PRIMARY KEY,
+                    source_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    import_path TEXT NOT NULL,
+                    alias TEXT,
+                    resolved_file_id INTEGER REFERENCES files(id) ON DELETE SET NULL
+                );
+                CREATE TABLE references_ (
+                    id INTEGER PRIMARY KEY,
+                    symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+                    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    line INTEGER NOT NULL,
+                    column INTEGER NOT NULL
+                );
+                CREATE TABLE metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO files (id, path, content_hash, language) VALUES (1, 'src/a.cs', 'h1', 'csharp');
+                INSERT INTO symbols (name, kind, file_id, line, column, end_line, visibility, scope)
+                    VALUES ('Greet', 'fn', 1, 3, 4, 5, 'pub', 'Person');
+                INSERT INTO symbols (name, kind, file_id, line, column, end_line, visibility, scope)
+                    VALUES ('Person', 'class', 1, 1, 0, 10, 'pub', NULL);
+                INSERT INTO references_ (symbol_id, file_id, line, column) VALUES (1, 1, 8, 2);",
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(&db_path).unwrap();
+
+        // No data loss
+        assert_eq!(db.symbol_count().unwrap(), 2);
+        assert_eq!(db.file_count().unwrap(), 1);
+        let ref_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM references_", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ref_count, 1);
+
+        // All prior rows have docid = NULL
+        let null_docids: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE docid IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_docids, 2);
+
+        // Existing row data intact
+        let results = db
+            .query_symbols(None, None, Some("Greet"), None, None, None, None)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.scope.as_deref(), Some("Person"));
+
+        // Index created by migration
+        let mut stmt = db.conn.prepare("PRAGMA index_list('symbols')").unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(names.iter().any(|n| n == "idx_symbols_docid"));
     }
 }
