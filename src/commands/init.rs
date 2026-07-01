@@ -19,10 +19,8 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
     // Roslyn sidecar: detect once per run, analyze before the walk. Any
     // failure in the ladder (dotnet absent, helper missing, ping fails,
     // analyze errors or times out) falls back to the tree-sitter path with a
-    // single warning and init still succeeds (P3-M1, P3-M2, P3-S1). The
-    // semantic ingest that consumes this output lands with story 182; until
-    // then `.cs` references below still come from the tree-sitter path.
-    let _semantic: Option<sidecar::AnalyzeOutput> =
+    // single warning and init still succeeds (P3-M1, P3-M2, P3-S1).
+    let semantic: Option<sidecar::AnalyzeOutput> =
         sidecar::detect().and_then(|s| match s.analyze(&cwd) {
             Ok(output) => Some(output),
             Err(e) => {
@@ -34,7 +32,11 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
         });
 
     let start = Instant::now();
-    let stats = indexer::index_full(&db, &cwd)?;
+    // In semantic mode the walk skips `.cs` reference resolution; the ingest
+    // below stamps DocIds and inserts the exact reference set instead, and
+    // either way records the resolver provenance (P3-M3..M7).
+    let stats = indexer::index_full(&db, &cwd, semantic.is_some())?;
+    indexer::ingest_semantic(&db, semantic.as_ref())?;
     let elapsed = start.elapsed();
 
     // Store current git commit if in a git repo

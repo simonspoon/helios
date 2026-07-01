@@ -22,7 +22,8 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
             println!("Not a git repo — performing full re-index");
         }
         let start = Instant::now();
-        let stats = indexer::index_full(&db, &cwd)?;
+        // `update` keeps the tree-sitter path for `.cs` (W1) — syntactic.
+        let stats = indexer::index_full(&db, &cwd, false)?;
         let elapsed = start.elapsed();
 
         print_stats(&stats, elapsed, json, compact, quiet)?;
@@ -39,7 +40,8 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
                 println!("No previous index commit — performing full re-index");
             }
             let start = Instant::now();
-            let stats = indexer::index_full(&db, &cwd)?;
+            // `update` keeps the tree-sitter path for `.cs` (W1) — syntactic.
+            let stats = indexer::index_full(&db, &cwd, false)?;
             let elapsed = start.elapsed();
 
             if let Some(commit) = git::head_commit()? {

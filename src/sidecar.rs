@@ -37,7 +37,6 @@ pub struct AnalyzeOutput {
 /// remaining wire fields (kind, start_col, visibility, scope, …) are ignored
 /// per the forward-compat rule.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // consumed by the semantic ingest (story 182)
 pub struct Definition {
     pub docid: String,
     pub name: String,
@@ -47,7 +46,6 @@ pub struct Definition {
 
 /// A `reference` record.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // consumed by the semantic ingest (story 182)
 pub struct Reference {
     pub docid: String,
     pub file: String,

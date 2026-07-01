@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashMap;
 
 pub struct Database {
     pub conn: Connection,
@@ -562,6 +563,56 @@ impl Database {
             params![file_id],
         )?;
         Ok(())
+    }
+
+    /// Delete every reference whose *source* file has the given language.
+    ///
+    /// Used by the semantic ingest: in semantic mode the sidecar output is the
+    /// entire `.cs` reference set, so stale rows — including those on
+    /// hash-unchanged files that `clear_file_data` never touched — are cleared
+    /// before the exact rows are inserted. Rows sourced from other languages'
+    /// files are untouched (P3-M8).
+    pub fn delete_references_from_language(&self, language: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM references_ WHERE file_id IN (SELECT id FROM files WHERE language = ?1)",
+            params![language],
+        )?;
+        Ok(())
+    }
+
+    /// Stamp a sidecar DocId onto the symbol row(s) `index_file` inserted for
+    /// this `(file_id, line, name)` (P3-M3). Returns the number of rows
+    /// updated; 0 means no match (e.g. a symbol kind the tree-sitter path does
+    /// not index) — callers skip those silently.
+    pub fn stamp_symbol_docid(
+        &self,
+        file_id: i64,
+        line: i64,
+        name: &str,
+        docid: &str,
+    ) -> Result<usize> {
+        let updated = self.conn.execute(
+            "UPDATE symbols SET docid = ?4 WHERE file_id = ?1 AND line = ?2 AND name = ?3",
+            params![file_id, line, name, docid],
+        )?;
+        Ok(updated)
+    }
+
+    /// In-memory DocId → symbol-id map over stamped rows (P3-M4). A docid
+    /// stamped onto multiple rows (partial types) maps to all of them.
+    pub fn docid_symbol_map(&self) -> Result<HashMap<String, Vec<i64>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT docid, id FROM symbols WHERE docid IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut map: HashMap<String, Vec<i64>> = HashMap::new();
+        for row in rows {
+            let (docid, id) = row?;
+            map.entry(docid).or_default().push(id);
+        }
+        Ok(map)
     }
 
     // --- Metadata operations ---
