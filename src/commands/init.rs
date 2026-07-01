@@ -4,6 +4,7 @@ use std::time::Instant;
 use crate::db::Database;
 use crate::git;
 use crate::indexer;
+use crate::sidecar;
 
 pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
@@ -14,6 +15,23 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
 
     let db_path = helios_dir.join("index.db");
     let db = Database::open(&db_path).context("opening database")?;
+
+    // Roslyn sidecar: detect once per run, analyze before the walk. Any
+    // failure in the ladder (dotnet absent, helper missing, ping fails,
+    // analyze errors or times out) falls back to the tree-sitter path with a
+    // single warning and init still succeeds (P3-M1, P3-M2, P3-S1). The
+    // semantic ingest that consumes this output lands with story 182; until
+    // then `.cs` references below still come from the tree-sitter path.
+    let _semantic: Option<sidecar::AnalyzeOutput> =
+        sidecar::detect().and_then(|s| match s.analyze(&cwd) {
+            Ok(output) => Some(output),
+            Err(e) => {
+                eprintln!(
+                    "warning: helios-roslyn analyze failed ({e:#}); resolving C# references with tree-sitter"
+                );
+                None
+            }
+        });
 
     let start = Instant::now();
     let stats = indexer::index_full(&db, &cwd)?;

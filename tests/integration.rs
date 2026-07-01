@@ -2780,3 +2780,127 @@ fn test_help_shows_exit_codes() {
         "help should document exit code 2"
     );
 }
+
+// --- Roslyn sidecar degradation ladder (story 181: P3-M1, P3-M2, P3-S1) ---
+//
+// These tests must not require dotnet: with `HELIOS_ROSLYN` set but broken,
+// the ladder degrades identically whether dotnet is absent (spawn fails) or
+// present (ping exits non-zero) — exit 0, exactly one warning, tree-sitter
+// references, usable index.
+
+fn create_csharp_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    std::fs::write(
+        dir.path().join("Person.cs"),
+        r#"
+namespace App {
+    public class Person {
+        public void Greet() { }
+    }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("Program.cs"),
+        r#"
+namespace App {
+    public class Runner {
+        public void Go() {
+            Greet();
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    dir
+}
+
+/// Init with a broken/missing sidecar must exit 0, emit exactly one
+/// `warning:` line, and still produce a usable index with `.cs` references
+/// resolved via the tree-sitter path.
+fn assert_sidecar_degrades(dir: &tempfile::TempDir, helios_roslyn: &str) {
+    let bin = helios_bin();
+    let output = Command::new(&bin)
+        .arg("init")
+        .env("HELIOS_ROSLYN", helios_roslyn)
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+
+    // Never hard-fail: exit 0.
+    assert!(
+        output.status.success(),
+        "init must exit 0 despite sidecar failure, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Exactly one warning line on stderr.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected exactly one warning line, got stderr: {stderr:?}"
+    );
+    assert!(
+        lines[0].starts_with("warning:"),
+        "line must use the warning channel, got: {}",
+        lines[0]
+    );
+
+    // Index usable: symbols present.
+    let symbols = Command::new(&bin)
+        .args(["--json", "symbols", "--file", "Person.cs"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols");
+    assert!(symbols.status.success(), "symbols query failed");
+    let value: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&symbols.stdout)).expect("symbols JSON");
+    let names: Vec<&str> = value
+        .as_array()
+        .expect("symbols array")
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(names.contains(&"Greet"), "index missing Greet: {names:?}");
+
+    // `.cs` references resolved via the tree-sitter path: the single Greet()
+    // call site links to the single Greet definition.
+    let deps = Command::new(&bin)
+        .args(["--json", "deps", "Greet"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps Greet");
+    assert!(
+        deps.status.success(),
+        "deps failed: {}",
+        String::from_utf8_lossy(&deps.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&deps.stdout)).expect("deps JSON");
+    let dependents = value["dependents"].as_array().expect("dependents array");
+    assert_eq!(
+        dependents.len(),
+        1,
+        "Greet() usage should resolve via tree-sitter, got: {dependents:?}"
+    );
+}
+
+#[test]
+fn test_sidecar_helper_missing_degrades_to_treesitter() {
+    let dir = create_csharp_project();
+    assert_sidecar_degrades(&dir, "/nonexistent/helios-roslyn.dll");
+}
+
+#[test]
+fn test_sidecar_helper_broken_degrades_to_treesitter() {
+    let dir = create_csharp_project();
+    // A file that exists but is not a runnable helper: ping fails whether
+    // dotnet is installed (non-zero exit) or not (spawn failure).
+    let broken = dir.path().join("broken.dll");
+    std::fs::write(&broken, "not a dotnet assembly").unwrap();
+    assert_sidecar_degrades(&dir, broken.to_str().unwrap());
+}
