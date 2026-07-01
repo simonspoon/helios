@@ -2788,10 +2788,9 @@ fn test_help_shows_exit_codes() {
 // present (ping exits non-zero) — exit 0, exactly one warning, tree-sitter
 // references, usable index.
 
-fn create_csharp_project() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("creating temp dir");
+fn write_csharp_files(dir: &std::path::Path) {
     std::fs::write(
-        dir.path().join("Person.cs"),
+        dir.join("Person.cs"),
         r#"
 namespace App {
     public class Person {
@@ -2802,7 +2801,7 @@ namespace App {
     )
     .unwrap();
     std::fs::write(
-        dir.path().join("Program.cs"),
+        dir.join("Program.cs"),
         r#"
 namespace App {
     public class Runner {
@@ -2814,7 +2813,26 @@ namespace App {
 "#,
     )
     .unwrap();
+}
+
+fn create_csharp_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    write_csharp_files(dir.path());
     dir
+}
+
+/// Open the index database `helios init` produced in `dir`.
+fn index_db(dir: &std::path::Path) -> rusqlite::Connection {
+    rusqlite::Connection::open(dir.join(".helios").join("index.db")).expect("open index.db")
+}
+
+/// Read a `metadata` row from the index in `dir`.
+fn metadata_value(dir: &std::path::Path, key: &str) -> Option<String> {
+    index_db(dir)
+        .query_row("SELECT value FROM metadata WHERE key = ?1", [key], |r| {
+            r.get(0)
+        })
+        .ok()
 }
 
 /// Init with a broken/missing sidecar must exit 0, emit exactly one
@@ -2887,6 +2905,13 @@ fn assert_sidecar_degrades(dir: &tempfile::TempDir, helios_roslyn: &str) {
         1,
         "Greet() usage should resolve via tree-sitter, got: {dependents:?}"
     );
+
+    // Provenance records the fallback resolver (P3-M7, leg B).
+    assert_eq!(
+        metadata_value(dir.path(), "csharp_resolver").as_deref(),
+        Some("treesitter"),
+        "fallback leg must record csharp_resolver=treesitter"
+    );
 }
 
 #[test]
@@ -2903,4 +2928,289 @@ fn test_sidecar_helper_broken_degrades_to_treesitter() {
     let broken = dir.path().join("broken.dll");
     std::fs::write(&broken, "not a dotnet assembly").unwrap();
     assert_sidecar_degrades(&dir, broken.to_str().unwrap());
+}
+
+// --- End-to-end: semantic leg + mixed-language invariance (story 183: P3-M7/M8/M9) ---
+//
+// Leg B (fallback) runs unconditionally — the two degradation tests above.
+// Leg A (semantic) is gated per spec A4: it needs a dotnet runtime and a
+// dev-built helper DLL (CI builds `helios-roslyn` before `cargo test`); when
+// either is missing the test skips with a note instead of failing.
+
+/// Leg A prerequisites: dotnet on PATH and a built helper DLL — from
+/// `HELIOS_ROSLYN` if set, else the dev-build path (`dotnet build helios-roslyn`).
+/// `None` = skip (spec A4); leg B coverage is unaffected.
+fn built_roslyn_dll() -> Option<PathBuf> {
+    let dotnet_ok = Command::new("dotnet")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !dotnet_ok {
+        eprintln!("skipping leg A e2e: dotnet not available");
+        return None;
+    }
+    let dll = match std::env::var("HELIOS_ROSLYN") {
+        Ok(path) if !path.is_empty() => PathBuf::from(path),
+        _ => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("helios-roslyn/bin/Debug/net8.0/helios-roslyn.dll"),
+    };
+    if !dll.is_file() {
+        eprintln!(
+            "skipping leg A e2e: helper DLL not built at {}",
+            dll.display()
+        );
+        return None;
+    }
+    Some(dll)
+}
+
+/// Run `helios init` in `dir` with `HELIOS_ROSLYN` pointing at `dll`; assert
+/// exit 0 and the expected provenance row.
+fn init_with_sidecar(dir: &std::path::Path, dll: &std::path::Path, expected_resolver: &str) {
+    let bin = helios_bin();
+    let output = Command::new(&bin)
+        .arg("init")
+        .env("HELIOS_ROSLYN", dll)
+        .current_dir(dir)
+        .output()
+        .expect("helios init");
+    assert!(
+        output.status.success(),
+        "init must exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        metadata_value(dir, "csharp_resolver").as_deref(),
+        Some(expected_resolver),
+        "csharp_resolver provenance mismatch (P3-M7), stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// 1-based line of the first fixture line containing `needle`.
+fn line_of(content: &str, needle: &str) -> i64 {
+    content
+        .lines()
+        .position(|l| l.contains(needle))
+        .unwrap_or_else(|| panic!("fixture missing {needle:?}")) as i64
+        + 1
+}
+
+const AMBIGUOUS_MODELS_CS: &str = r#"
+namespace App {
+    public class Alpha {
+        public void Save() { }
+    }
+    public class Beta {
+        public void Save() { }
+    }
+}
+"#;
+
+const AMBIGUOUS_PROGRAM_CS: &str = r#"
+namespace App {
+    public class Runner {
+        public void Go(Alpha a, Beta b) {
+            a.Save();
+            b.Save();
+        }
+    }
+}
+"#;
+
+/// Leg A (P3-M9): with dotnet + built helper, `helios init` resolves the
+/// ambiguous-name case tree-sitter cannot — each `Save()` call site links to
+/// exactly the right class's method, DocId-exact — and records
+/// `csharp_resolver=roslyn`.
+#[test]
+fn test_e2e_semantic_leg_docid_exact_references_and_roslyn_provenance() {
+    let Some(dll) = built_roslyn_dll() else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    std::fs::write(dir.path().join("Models.cs"), AMBIGUOUS_MODELS_CS).unwrap();
+    std::fs::write(dir.path().join("Program.cs"), AMBIGUOUS_PROGRAM_CS).unwrap();
+
+    init_with_sidecar(dir.path(), &dll, "roslyn");
+
+    // Symbols carry stamped DocIds (P3-M3).
+    let conn = index_db(dir.path());
+    let stamped: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE docid IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(stamped > 0, "no symbols carry a stamped docid");
+
+    // Each Save() usage in Program.cs resolves to exactly one symbol, and the
+    // symbol's docid is the intended definition's DocId (P3-M4/P3-M9 leg A).
+    let mut stmt = conn
+        .prepare(
+            "SELECT r.line, s.docid FROM references_ r
+             JOIN symbols s ON s.id = r.symbol_id
+             JOIN files f ON f.id = r.file_id
+             WHERE f.path = 'Program.cs' AND s.name = 'Save'",
+        )
+        .unwrap();
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    let alpha_line = line_of(AMBIGUOUS_PROGRAM_CS, "a.Save()");
+    let beta_line = line_of(AMBIGUOUS_PROGRAM_CS, "b.Save()");
+    let at = |line: i64| -> Vec<&str> {
+        rows.iter()
+            .filter(|(l, _)| *l == line)
+            .map(|(_, d)| d.as_str())
+            .collect()
+    };
+    assert_eq!(
+        at(alpha_line),
+        vec!["M:App.Alpha.Save"],
+        "a.Save() must resolve to exactly Alpha.Save, got rows: {rows:?}"
+    );
+    assert_eq!(
+        at(beta_line),
+        vec!["M:App.Beta.Save"],
+        "b.Save() must resolve to exactly Beta.Save, got rows: {rows:?}"
+    );
+}
+
+fn write_mixed_fixture(dir: &std::path::Path) {
+    write_csharp_files(dir);
+    // Rust file: an intra-file reference (helper) plus a call sharing the C#
+    // symbol's name (Greet) — a cross-language name-match row sourced from a
+    // non-.cs file, which the semantic `.cs` reference reset must not touch.
+    std::fs::write(
+        dir.join("main.rs"),
+        r#"
+pub fn build() -> i32 {
+    Greet();
+    helper()
+}
+
+fn helper() -> i32 {
+    7
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("lib.py"),
+        r#"
+def fetch(path):
+    return path
+
+
+def run():
+    return fetch("data.txt")
+"#,
+    )
+    .unwrap();
+}
+
+/// Canonical dump of all non-C# symbol and reference rows, independent of
+/// rowids and walk order, for byte-identical comparison across legs (P3-M8).
+fn dump_non_cs_rows(conn: &rusqlite::Connection) -> String {
+    let mut out = String::new();
+    let mut stmt = conn
+        .prepare(
+            "SELECT f.path, s.name, s.kind, s.line, s.\"column\", s.end_line, s.visibility,
+                    COALESCE(s.scope, ''), COALESCE(s.docid, '')
+             FROM symbols s JOIN files f ON f.id = s.file_id
+             WHERE f.language <> 'csharp'
+             ORDER BY f.path, s.line, s.\"column\", s.name, s.kind",
+        )
+        .unwrap();
+    let symbols = stmt
+        .query_map([], |r| {
+            Ok(format!(
+                "symbol|{}|{}|{}|{}|{}|{}|{}|{}|{}\n",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, String>(8)?,
+            ))
+        })
+        .unwrap();
+    for row in symbols {
+        out.push_str(&row.unwrap());
+    }
+    // References *sourced from* non-C# files, keyed by target symbol identity
+    // (file/name/line) rather than rowid.
+    let mut stmt = conn
+        .prepare(
+            "SELECT sf.path, r.line, r.\"column\", df.path, s.name, s.line
+             FROM references_ r
+             JOIN files sf ON sf.id = r.file_id
+             JOIN symbols s ON s.id = r.symbol_id
+             JOIN files df ON df.id = s.file_id
+             WHERE sf.language <> 'csharp'
+             ORDER BY sf.path, r.line, r.\"column\", df.path, s.name, s.line",
+        )
+        .unwrap();
+    let refs = stmt
+        .query_map([], |r| {
+            Ok(format!(
+                "reference|{}|{}|{}|{}|{}|{}\n",
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })
+        .unwrap();
+    for row in refs {
+        out.push_str(&row.unwrap());
+    }
+    out
+}
+
+/// P3-M8: on a mixed-language fixture, non-C# symbol and reference rows are
+/// byte-identical with the sidecar (leg A) and without it (leg B). Gated with
+/// leg A since it needs a real semantic run to compare against.
+#[test]
+fn test_e2e_mixed_language_non_cs_rows_invariant_across_legs() {
+    let Some(dll) = built_roslyn_dll() else {
+        return;
+    };
+
+    let with_sidecar = tempfile::tempdir().expect("creating temp dir");
+    write_mixed_fixture(with_sidecar.path());
+    init_with_sidecar(with_sidecar.path(), &dll, "roslyn");
+
+    let without_sidecar = tempfile::tempdir().expect("creating temp dir");
+    write_mixed_fixture(without_sidecar.path());
+    init_with_sidecar(
+        without_sidecar.path(),
+        std::path::Path::new("/nonexistent/helios-roslyn.dll"),
+        "treesitter",
+    );
+
+    let semantic_rows = dump_non_cs_rows(&index_db(with_sidecar.path()));
+    let syntactic_rows = dump_non_cs_rows(&index_db(without_sidecar.path()));
+    assert!(
+        !semantic_rows.is_empty(),
+        "mixed fixture produced no non-C# rows — invariance check is vacuous"
+    );
+    assert!(
+        semantic_rows.contains("reference|"),
+        "mixed fixture produced no non-C# reference rows — invariance check is vacuous"
+    );
+    assert_eq!(
+        semantic_rows, syntactic_rows,
+        "non-C# rows must be byte-identical with and without the sidecar (P3-M8)"
+    );
 }

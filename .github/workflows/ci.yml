@@ -20,6 +20,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Leg A of the Roslyn sidecar e2e tests needs dotnet + a built helper
+      # DLL; the tests self-skip when either is missing, so leg B (fallback)
+      # coverage never depends on this step (spec A4).
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build helios-roslyn helper
+        run: dotnet build helios-roslyn
+
       - name: Check
         run: cargo check --all-targets
 
