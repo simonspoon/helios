@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RollForward>LatestMajor</RollForward>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Puts helios-roslyn.dll (+ runtimeconfig/deps) next to the test assembly so
+         tests can drive it as a real child process. -->
+    <ProjectReference Include="../helios-roslyn.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../fixtures/**" LinkBase="fixtures" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="golden/**" LinkBase="golden" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

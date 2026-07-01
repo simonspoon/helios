@@ -1,2 +1,4 @@
 .helios/
 target/
+helios-roslyn/**/bin/
+helios-roslyn/**/obj/
