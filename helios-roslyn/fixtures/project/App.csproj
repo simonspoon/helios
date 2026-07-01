@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Only an MSBuild load honors this; the adhoc file walk would still see Ghost. -->
+    <Compile Remove="Excluded.cs" />
+  </ItemGroup>
+
+</Project>

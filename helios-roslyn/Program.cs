@@ -1,8 +1,10 @@
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.FindSymbols;
+using Microsoft.CodeAnalysis.MSBuild;
 using Microsoft.CodeAnalysis.Text;
 
 namespace HeliosRoslyn;
@@ -96,11 +98,29 @@ internal static class Program
             return 1;
         }
 
-        var csFiles = EnumerateCsFiles(root);
-        var (compilation, solution) = await LoadAdhocWorkspace(root, csFiles);
-        var symbols = CollectIndexedSymbols(compilation);
+        var (solution, compilations) = await LoadWorkspace(root, projects, stdout);
 
-        foreach (var symbol in symbols)
+        // Dedupe across compilations: a multi-project workspace can surface the same
+        // declaration/usage more than once (linked files, cascade groups).
+        var emittedDefinitions = new HashSet<(string, string, int, int)>();
+        var emittedReferences = new HashSet<(string, string, int, int)>();
+        foreach (var compilation in compilations)
+        {
+            await EmitCompilation(compilation, solution, root, stdout, emittedDefinitions, emittedReferences);
+        }
+
+        return 0;
+    }
+
+    private static async Task EmitCompilation(
+        Compilation compilation,
+        Solution solution,
+        string root,
+        TextWriter stdout,
+        HashSet<(string, string, int, int)> emittedDefinitions,
+        HashSet<(string, string, int, int)> emittedReferences)
+    {
+        foreach (var symbol in CollectIndexedSymbols(compilation))
         {
             var docid = symbol.GetDocumentationCommentId();
             if (docid is null)
@@ -112,14 +132,23 @@ internal static class Program
             foreach (var location in symbol.Locations.Where(l => l.IsInSource))
             {
                 var span = location.GetLineSpan();
+                var file = RelativePath(root, span.Path);
+                if (IsOutsideRoot(file))
+                {
+                    continue; // contract: only symbols declared under --root are emitted
+                }
                 declarationSites.Add((span.Path, span.StartLinePosition.Line, span.StartLinePosition.Character));
+                if (!emittedDefinitions.Add((docid, file, span.StartLinePosition.Line + 1, span.StartLinePosition.Character + 1)))
+                {
+                    continue;
+                }
                 WriteRecord(stdout, new
                 {
                     type = "definition",
                     docid,
                     name = symbol.Name,
                     kind = KindOf(symbol),
-                    file = RelativePath(root, span.Path),
+                    file,
                     start_line = span.StartLinePosition.Line + 1,
                     start_col = span.StartLinePosition.Character + 1,
                     end_line = DeclarationEndLine(symbol, location),
@@ -132,15 +161,37 @@ internal static class Program
                 {
                     type = "reference",
                     docid,
-                    file = RelativePath(root, span.Path),
+                    file,
                     line = span.StartLinePosition.Line + 1,
                     col = span.StartLinePosition.Character + 1,
                     is_definition = true,
                 });
             }
 
+            if (declarationSites.Count == 0)
+            {
+                continue; // declared wholly outside --root: suppress (arch §1.2)
+            }
+
             foreach (var referenced in await SymbolFinder.FindReferencesAsync(symbol, solution))
             {
+                // FindReferencesAsync cascades to related symbols (interface member ↔
+                // implementation, overrides, explicit ctors) and returns each as its own
+                // group. Those groups' locations resolve to the *related* symbol, not this
+                // one — emitting them under this docid would misattribute the reference
+                // (e.g. `shape.Area()` credited to Circle.Area instead of IShape.Area).
+                // Each related source symbol gets its own pass, so skip foreign groups.
+                // Implicitly-declared group symbols (default ctors) never get their own
+                // pass; keep their locations under this docid (`new Person()` stays a
+                // reference to T:Person).
+                var groupDefinition = referenced.Definition.OriginalDefinition;
+                if (!groupDefinition.IsImplicitlyDeclared
+                    && groupDefinition.GetDocumentationCommentId() is { } groupDocid
+                    && groupDocid != docid)
+                {
+                    continue;
+                }
+
                 foreach (var refLoc in referenced.Locations)
                 {
                     if (refLoc.IsImplicit || refLoc.IsCandidateLocation || !refLoc.Location.IsInSource)
@@ -149,15 +200,24 @@ internal static class Program
                     }
 
                     var span = refLoc.Location.GetLineSpan();
+                    var file = RelativePath(root, span.Path);
+                    if (IsOutsideRoot(file))
+                    {
+                        continue;
+                    }
                     if (declarationSites.Contains((span.Path, span.StartLinePosition.Line, span.StartLinePosition.Character)))
                     {
                         continue; // declaration sites are emitted once, flagged is_definition:true
+                    }
+                    if (!emittedReferences.Add((docid, file, span.StartLinePosition.Line + 1, span.StartLinePosition.Character + 1)))
+                    {
+                        continue;
                     }
                     WriteRecord(stdout, new
                     {
                         type = "reference",
                         docid,
-                        file = RelativePath(root, span.Path),
+                        file,
                         line = span.StartLinePosition.Line + 1,
                         col = span.StartLinePosition.Character + 1,
                         is_definition = false,
@@ -165,18 +225,93 @@ internal static class Program
                 }
             }
         }
-
-        return 0;
     }
 
-    private static List<string> EnumerateCsFiles(string root)
+    /// <summary>
+    /// Picks the load path: explicit --project args, else a discovered .sln, else all
+    /// discovered .csproj files (all via MSBuildWorkspace), else AdhocWorkspace over loose .cs.
+    /// </summary>
+    private static async Task<(Solution Solution, List<Compilation> Compilations)> LoadWorkspace(
+        string root, List<string> projectArgs, TextWriter stdout)
+    {
+        var projectPaths = projectArgs
+            .Select(p => Path.GetFullPath(Path.IsPathRooted(p) ? p : Path.Combine(root, p)))
+            .ToList();
+
+        string? solutionPath = null;
+        if (projectPaths.Count == 0)
+        {
+            solutionPath = EnumerateFiles(root, "*.sln")
+                .OrderBy(p => RelativePath(root, p).Count(c => c == '/'))
+                .ThenBy(p => p, StringComparer.Ordinal)
+                .FirstOrDefault();
+            if (solutionPath is null)
+            {
+                projectPaths = EnumerateFiles(root, "*.csproj");
+            }
+        }
+
+        if (solutionPath is null && projectPaths.Count == 0)
+        {
+            return await LoadAdhocWorkspace(root, EnumerateFiles(root, "*.cs"));
+        }
+        return await LoadMsBuildWorkspace(solutionPath, projectPaths, stdout);
+    }
+
+    private static async Task<(Solution, List<Compilation>)> LoadMsBuildWorkspace(
+        string? solutionPath, List<string> projectPaths, TextWriter stdout)
+    {
+        // Load failures inside an otherwise-good run surface as warning records (arch §1.2);
+        // queued because workspace events may fire off-thread while we own stdout.
+        var failures = new ConcurrentQueue<string>();
+        var workspace = MSBuildWorkspace.Create();
+        workspace.WorkspaceFailed += (_, e) =>
+        {
+            if (e.Diagnostic.Kind == WorkspaceDiagnosticKind.Failure)
+            {
+                failures.Enqueue(e.Diagnostic.Message);
+            }
+        };
+
+        if (solutionPath is not null)
+        {
+            await workspace.OpenSolutionAsync(solutionPath);
+        }
+        else
+        {
+            foreach (var path in projectPaths)
+            {
+                // Skip projects already pulled in transitively via ProjectReference.
+                if (workspace.CurrentSolution.Projects.All(p => p.FilePath != path))
+                {
+                    await workspace.OpenProjectAsync(path);
+                }
+            }
+        }
+
+        while (failures.TryDequeue(out var message))
+        {
+            WriteRecord(stdout, new { type = "warning", message });
+        }
+
+        var solution = workspace.CurrentSolution;
+        var compilations = new List<Compilation>();
+        foreach (var project in solution.Projects.Where(p => p.Language == LanguageNames.CSharp))
+        {
+            compilations.Add(await project.GetCompilationAsync()
+                ?? throw new InvalidOperationException($"project produced no compilation: {project.Name}"));
+        }
+        return (solution, compilations);
+    }
+
+    private static List<string> EnumerateFiles(string root, string pattern)
     {
         var options = new EnumerationOptions
         {
             RecurseSubdirectories = true,
             AttributesToSkip = FileAttributes.Hidden | FileAttributes.System,
         };
-        return Directory.EnumerateFiles(root, "*.cs", options)
+        return Directory.EnumerateFiles(root, pattern, options)
             .Where(p =>
             {
                 var rel = RelativePath(root, p);
@@ -187,7 +322,7 @@ internal static class Program
             .ToList();
     }
 
-    private static async Task<(Compilation Compilation, Solution Solution)> LoadAdhocWorkspace(string root, List<string> csFiles)
+    private static async Task<(Solution, List<Compilation>)> LoadAdhocWorkspace(string root, List<string> csFiles)
     {
         var workspace = new AdhocWorkspace();
         var projectId = ProjectId.CreateNewId();
@@ -217,7 +352,7 @@ internal static class Program
 
         var compilation = await solution.GetProject(projectId)!.GetCompilationAsync()
             ?? throw new InvalidOperationException("workspace produced no compilation");
-        return (compilation, solution);
+        return (solution, [compilation]);
     }
 
     /// <summary>Reference the running runtime's assemblies so fixture code type-checks.</summary>
@@ -323,6 +458,10 @@ internal static class Program
 
     private static string RelativePath(string root, string path) =>
         Path.GetRelativePath(root, path).Replace('\\', '/');
+
+    /// <summary>A repo-relative path that escapes the analysis root.</summary>
+    private static bool IsOutsideRoot(string relativePath) =>
+        relativePath == ".." || relativePath.StartsWith("../", StringComparison.Ordinal);
 
     private static void WriteRecord(TextWriter stdout, object record) =>
         stdout.WriteLine(JsonSerializer.Serialize(record, JsonOpts));
