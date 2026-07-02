@@ -51,6 +51,25 @@ public class HelperProcessTests
         Assert.Equal(expected, actual);
     }
 
+    [Fact] // --files: the caller-supplied list is the file vocabulary, overriding the bin/obj heuristic
+    public void Analyze_FilesList_LimitsOutputToListedFiles()
+    {
+        var list = Path.Combine(Path.GetTempPath(), $"helios-files-{Guid.NewGuid():N}.txt");
+        File.WriteAllText(list, "Person.cs\n");
+        try
+        {
+            var records = HelperHarness.Analyze("--root", LooseFixture, "--files", list);
+
+            Assert.Contains(records.Definitions, d => d.File == "Person.cs");
+            Assert.DoesNotContain(records.Definitions, d => d.File == "Program.cs");
+            Assert.DoesNotContain(records.References, r => r.File == "Program.cs");
+        }
+        finally
+        {
+            File.Delete(list);
+        }
+    }
+
     [Fact] // P2-S1: unloadable root → non-zero exit, stderr diagnostic, stdout NDJSON-only
     public void Analyze_UnloadableRoot_FailsCleanly()
     {

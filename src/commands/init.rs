@@ -20,16 +20,35 @@ pub fn run(json: bool, compact: bool, quiet: bool, timeout_secs: u64) -> Result<
     // failure in the ladder (dotnet absent, helper missing, ping fails,
     // analyze errors or times out) falls back to the tree-sitter path with a
     // single warning and init still succeeds (P3-M1, P3-M2, P3-S1).
-    let semantic: Option<sidecar::AnalyzeOutput> =
-        sidecar::detect().and_then(|s| match s.analyze(&cwd, Duration::from_secs(timeout_secs)) {
-            Ok(output) => Some(output),
-            Err(e) => {
-                eprintln!(
-                    "warning: helios-roslyn analyze failed ({e:#}); resolving C# references with tree-sitter"
-                );
-                None
-            }
-        });
+    // The walk's indexed .cs set: the helper reports on exactly these files,
+    // keeping its output aligned with what ingest_semantic can stamp. Snapshot
+    // taken before the analyze/walk, so a .cs file created mid-run is indexed
+    // without semantic references until the next init. An empty set skips the
+    // sidecar entirely — no dotnet spawns, nothing the ingest could keep.
+    let cs_files = match indexer::indexed_csharp_files(&cwd) {
+        Ok(files) => files,
+        Err(e) => {
+            eprintln!(
+                "warning: listing C# files failed ({e:#}); resolving C# references with tree-sitter"
+            );
+            Vec::new()
+        }
+    };
+    let semantic: Option<sidecar::AnalyzeOutput> = if cs_files.is_empty() {
+        None
+    } else {
+        sidecar::detect().and_then(
+            |s| match s.analyze(&cwd, &cs_files, Duration::from_secs(timeout_secs)) {
+                Ok(output) => Some(output),
+                Err(e) => {
+                    eprintln!(
+                        "warning: helios-roslyn analyze failed ({e:#}); resolving C# references with tree-sitter"
+                    );
+                    None
+                }
+            },
+        )
+    };
 
     let start = Instant::now();
     // In semantic mode the walk skips `.cs` reference resolution; the ingest

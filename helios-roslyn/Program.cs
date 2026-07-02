@@ -3,7 +3,7 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
-using Microsoft.CodeAnalysis.FindSymbols;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.MSBuild;
 using Microsoft.CodeAnalysis.Text;
 
@@ -42,7 +42,7 @@ internal static class Program
                     stdout.Flush();
                     return code;
                 default:
-                    Console.Error.WriteLine("helios-roslyn: usage: helios-roslyn <ping | analyze --root <path> [--project <csproj> ...]>");
+                    Console.Error.WriteLine("helios-roslyn: usage: helios-roslyn <ping | analyze --root <path> [--project <csproj> ...] [--files <list-file>]>");
                     return 2;
             }
         }
@@ -68,6 +68,7 @@ internal static class Program
     private static async Task<int> Analyze(string[] args, TextWriter stdout)
     {
         string? rootArg = null;
+        string? filesArg = null;
         var projects = new List<string>(); // accepted for forward compat; used by the MSBuild path (P2b)
         for (var i = 0; i < args.Length; i++)
         {
@@ -78,6 +79,9 @@ internal static class Program
                     break;
                 case "--project" when i + 1 < args.Length:
                     projects.Add(args[++i]);
+                    break;
+                case "--files" when i + 1 < args.Length:
+                    filesArg = args[++i];
                     break;
                 default:
                     Console.Error.WriteLine($"helios-roslyn: unknown or incomplete argument: {args[i]}");
@@ -98,27 +102,52 @@ internal static class Program
             return 1;
         }
 
-        var (solution, compilations) = await LoadWorkspace(root, projects, stdout);
+        // The caller-supplied indexed-file list (one root-relative path per line):
+        // the Rust host owns the indexed-file vocabulary (its gitignore-driven walk),
+        // so it tells us exactly which files to report on. Without --files (direct
+        // CLI use, tests) fall back to the bin/obj/dot-dir heuristic.
+        HashSet<string>? indexedFiles = null;
+        if (filesArg is not null)
+        {
+            indexedFiles = File.ReadLines(filesArg)
+                .Where(l => l.Length > 0)
+                .Select(l => l.Replace('\\', '/'))
+                .ToHashSet(StringComparer.Ordinal);
+        }
 
-        // Dedupe across compilations: a multi-project workspace can surface the same
-        // declaration/usage more than once (linked files, cascade groups).
-        var emittedDefinitions = new HashSet<(string, string, int, int)>();
-        var emittedReferences = new HashSet<(string, string, int, int)>();
+        var compilations = await LoadWorkspace(root, projects, stdout);
+
+        // Two passes. Pass 1 emits every definition declared in an indexed file and
+        // records the declaration sites. Pass 2 binds each indexed file once and
+        // emits a reference per resolved node whose target is a pass-1 docid — work
+        // scales with source under --root, not with symbol count × solution size
+        // (the old per-symbol FindReferencesAsync was quadratic and unusable on
+        // large multi-TFM workspaces). Dedupe sets span compilations: a multi-TFM
+        // project surfaces the same file once per target framework, and walking
+        // each TFM's tree keeps references inside `#if` regions.
+        var emittedDefinitions = new HashSet<(string Docid, string File, int Line, int Col)>();
+        var emittedReferences = new HashSet<(string Docid, string File, int Line, int Col)>();
+        var declarationSites = new HashSet<(string Path, int Line, int Col)>();
         foreach (var compilation in compilations)
         {
-            await EmitCompilation(compilation, solution, root, stdout, emittedDefinitions, emittedReferences);
+            EmitDefinitions(compilation, root, stdout, indexedFiles, emittedDefinitions, declarationSites);
+        }
+        var rootDocids = emittedDefinitions.Select(d => d.Docid).ToHashSet(StringComparer.Ordinal);
+        foreach (var compilation in compilations)
+        {
+            EmitReferences(compilation, root, stdout, indexedFiles, rootDocids, declarationSites, emittedReferences);
         }
 
         return 0;
     }
 
-    private static async Task EmitCompilation(
+    private static void EmitDefinitions(
         Compilation compilation,
-        Solution solution,
         string root,
         TextWriter stdout,
-        HashSet<(string, string, int, int)> emittedDefinitions,
-        HashSet<(string, string, int, int)> emittedReferences)
+        HashSet<string>? indexedFiles,
+        HashSet<(string Docid, string File, int Line, int Col)> emittedDefinitions,
+        HashSet<(string Path, int Line, int Col)> declarationSites)
     {
         foreach (var symbol in CollectIndexedSymbols(compilation))
         {
@@ -128,14 +157,13 @@ internal static class Program
                 continue; // contract: records with a null DocId are not emitted
             }
 
-            var declarationSites = new HashSet<(string File, int Line, int Col)>();
             foreach (var location in symbol.Locations.Where(l => l.IsInSource))
             {
                 var span = location.GetLineSpan();
                 var file = RelativePath(root, span.Path);
-                if (IsOutsideRoot(file))
+                if (!IsIndexedFile(file, indexedFiles))
                 {
-                    continue; // contract: only symbols declared under --root are emitted
+                    continue; // contract: only symbols declared in indexed files are emitted
                 }
                 declarationSites.Add((span.Path, span.StartLinePosition.Line, span.StartLinePosition.Character));
                 if (!emittedDefinitions.Add((docid, file, span.StartLinePosition.Line + 1, span.StartLinePosition.Character + 1)))
@@ -157,81 +185,137 @@ internal static class Program
                 });
 
                 // The declaration site itself, flagged so the consumer never inserts it.
-                WriteRecord(stdout, new
+                WriteReference(stdout, docid, file, span, isDefinition: true);
+            }
+        }
+    }
+
+    private static void EmitReferences(
+        Compilation compilation,
+        string root,
+        TextWriter stdout,
+        HashSet<string>? indexedFiles,
+        HashSet<string> rootDocids,
+        HashSet<(string Path, int Line, int Col)> declarationSites,
+        HashSet<(string Docid, string File, int Line, int Col)> emittedReferences)
+    {
+        foreach (var tree in compilation.SyntaxTrees)
+        {
+            if (tree.FilePath.Length == 0)
+            {
+                continue; // in-memory tree: never an indexed file
+            }
+            var file = RelativePath(root, tree.FilePath);
+            if (!IsIndexedFile(file, indexedFiles))
+            {
+                continue; // also skips source-generator trees (pseudo paths are never indexed)
+            }
+
+            var model = compilation.GetSemanticModel(tree);
+            // descendIntoTrivia keeps doc-comment cref references.
+            foreach (var node in tree.GetRoot().DescendantNodes(descendIntoTrivia: true))
+            {
+                ISymbol? symbol;
+                Location location;
+                switch (node)
                 {
-                    type = "reference",
-                    docid,
-                    file,
-                    line = span.StartLinePosition.Line + 1,
-                    col = span.StartLinePosition.Character + 1,
-                    is_definition = true,
-                });
-            }
+                    case IdentifierNameSyntax { IsVar: true }:
+                        continue; // `var` binds to the inferred type; not an explicit usage
+                    case SimpleNameSyntax name:
+                        symbol = ResolveReferencedSymbol(model, name);
+                        location = name.GetLocation();
+                        break;
+                    // `class D() : B(5)` is NOT handled: its type name is already
+                    // visited as a SimpleNameSyntax at the same position, and the
+                    // old FindReferences path treated the base invocation as
+                    // implicit — emitting the ctor here would double-report the site.
+                    case ConstructorInitializerSyntax init: // `: this(...)` / `: base(...)`
+                        symbol = NormalizeConstructor(model.GetSymbolInfo(init).Symbol);
+                        location = init.ThisOrBaseKeyword.GetLocation();
+                        break;
+                    case ElementAccessExpressionSyntax element: // indexer usage `x[i]`
+                        symbol = model.GetSymbolInfo(element).Symbol?.OriginalDefinition;
+                        location = element.ArgumentList.OpenBracketToken.GetLocation();
+                        break;
+                    case ElementBindingExpressionSyntax binding: // conditional indexer usage `x?[i]`
+                        symbol = model.GetSymbolInfo(binding).Symbol?.OriginalDefinition;
+                        location = binding.ArgumentList.OpenBracketToken.GetLocation();
+                        break;
+                    default:
+                        continue;
+                }
 
-            if (declarationSites.Count == 0)
-            {
-                continue; // declared wholly outside --root: suppress (arch §1.2)
-            }
+                var docid = symbol?.GetDocumentationCommentId();
+                if (docid is null || !rootDocids.Contains(docid))
+                {
+                    continue; // framework/NuGet targets and locals are not indexed
+                }
 
-            foreach (var referenced in await SymbolFinder.FindReferencesAsync(symbol, solution))
-            {
-                // FindReferencesAsync cascades to related symbols (interface member ↔
-                // implementation, overrides, explicit ctors) and returns each as its own
-                // group. Those groups' locations resolve to the *related* symbol, not this
-                // one — emitting them under this docid would misattribute the reference
-                // (e.g. `shape.Area()` credited to Circle.Area instead of IShape.Area).
-                // Each related source symbol gets its own pass, so skip foreign groups.
-                // Implicitly-declared group symbols (default ctors) never get their own
-                // pass; keep their locations under this docid (`new Person()` stays a
-                // reference to T:Person).
-                var groupDefinition = referenced.Definition.OriginalDefinition;
-                if (!groupDefinition.IsImplicitlyDeclared
-                    && groupDefinition.GetDocumentationCommentId() is { } groupDocid
-                    && groupDocid != docid)
+                var span = location.GetLineSpan();
+                if (declarationSites.Contains((span.Path, span.StartLinePosition.Line, span.StartLinePosition.Character)))
+                {
+                    continue; // declaration sites are emitted once, flagged is_definition:true
+                }
+                if (!emittedReferences.Add((docid, file, span.StartLinePosition.Line + 1, span.StartLinePosition.Character + 1)))
                 {
                     continue;
                 }
-
-                foreach (var refLoc in referenced.Locations)
-                {
-                    if (refLoc.IsImplicit || refLoc.IsCandidateLocation || !refLoc.Location.IsInSource)
-                    {
-                        continue; // only explicit, exactly-resolved usages
-                    }
-
-                    var span = refLoc.Location.GetLineSpan();
-                    var file = RelativePath(root, span.Path);
-                    if (IsOutsideRoot(file))
-                    {
-                        continue;
-                    }
-                    if (declarationSites.Contains((span.Path, span.StartLinePosition.Line, span.StartLinePosition.Character)))
-                    {
-                        continue; // declaration sites are emitted once, flagged is_definition:true
-                    }
-                    if (!emittedReferences.Add((docid, file, span.StartLinePosition.Line + 1, span.StartLinePosition.Character + 1)))
-                    {
-                        continue;
-                    }
-                    WriteRecord(stdout, new
-                    {
-                        type = "reference",
-                        docid,
-                        file,
-                        line = span.StartLinePosition.Line + 1,
-                        col = span.StartLinePosition.Character + 1,
-                        is_definition = false,
-                    });
-                }
+                WriteReference(stdout, docid, file, span, isDefinition: false);
             }
         }
     }
 
     /// <summary>
+    /// The symbol a name node refers to, normalized to the docid vocabulary pass 1
+    /// emits: only exactly-resolved usages (no candidate/ambiguous bindings),
+    /// constructed generics and reduced extension methods back to their original
+    /// definitions, `new T()` to the explicit constructor when one exists and to
+    /// the type when the constructor is the implicit default.
+    /// </summary>
+    private static ISymbol? ResolveReferencedSymbol(SemanticModel model, SimpleNameSyntax node)
+    {
+        // Climb to the full name this simple name completes (`new My.Ns.Foo()`,
+        // `new global::Foo()`) so the creation check below sees creation.Type.
+        SyntaxNode typeNode = node;
+        while ((typeNode.Parent is QualifiedNameSyntax qualified && qualified.Right == typeNode)
+               || (typeNode.Parent is AliasQualifiedNameSyntax aliased && aliased.Name == typeNode))
+        {
+            typeNode = typeNode.Parent;
+        }
+        if (typeNode.Parent is ObjectCreationExpressionSyntax creation && creation.Type == typeNode
+            && model.GetSymbolInfo(creation).Symbol is IMethodSymbol { IsImplicitlyDeclared: false } ctor)
+        {
+            return ctor.OriginalDefinition;
+        }
+
+        var symbol = model.GetSymbolInfo(node).Symbol;
+        if (symbol is null)
+        {
+            return null;
+        }
+        if (symbol is IMethodSymbol { ReducedFrom: { } reduced })
+        {
+            symbol = reduced;
+        }
+        return NormalizeConstructor(symbol);
+    }
+
+    /// <summary>
+    /// Implicitly-declared default constructors have no emitted definition;
+    /// credit the containing type (`new Person()`, `[MyAttr]`, `: base()`).
+    /// </summary>
+    private static ISymbol? NormalizeConstructor(ISymbol? symbol) => symbol switch
+    {
+        IMethodSymbol { MethodKind: MethodKind.Constructor, IsImplicitlyDeclared: true } ctor =>
+            ctor.ContainingType.OriginalDefinition,
+        _ => symbol?.OriginalDefinition,
+    };
+
+    /// <summary>
     /// Picks the load path: explicit --project args, else a discovered .sln, else all
     /// discovered .csproj files (all via MSBuildWorkspace), else AdhocWorkspace over loose .cs.
     /// </summary>
-    private static async Task<(Solution Solution, List<Compilation> Compilations)> LoadWorkspace(
+    private static async Task<List<Compilation>> LoadWorkspace(
         string root, List<string> projectArgs, TextWriter stdout)
     {
         var projectPaths = projectArgs
@@ -258,7 +342,7 @@ internal static class Program
         return await LoadMsBuildWorkspace(solutionPath, projectPaths, stdout);
     }
 
-    private static async Task<(Solution, List<Compilation>)> LoadMsBuildWorkspace(
+    private static async Task<List<Compilation>> LoadMsBuildWorkspace(
         string? solutionPath, List<string> projectPaths, TextWriter stdout)
     {
         // Load failures inside an otherwise-good run surface as warning records (arch §1.2);
@@ -294,14 +378,13 @@ internal static class Program
             WriteRecord(stdout, new { type = "warning", message });
         }
 
-        var solution = workspace.CurrentSolution;
         var compilations = new List<Compilation>();
-        foreach (var project in solution.Projects.Where(p => p.Language == LanguageNames.CSharp))
+        foreach (var project in workspace.CurrentSolution.Projects.Where(p => p.Language == LanguageNames.CSharp))
         {
             compilations.Add(await project.GetCompilationAsync()
                 ?? throw new InvalidOperationException($"project produced no compilation: {project.Name}"));
         }
-        return (solution, compilations);
+        return compilations;
     }
 
     private static List<string> EnumerateFiles(string root, string pattern)
@@ -312,17 +395,12 @@ internal static class Program
             AttributesToSkip = FileAttributes.Hidden | FileAttributes.System,
         };
         return Directory.EnumerateFiles(root, pattern, options)
-            .Where(p =>
-            {
-                var rel = RelativePath(root, p);
-                var parts = rel.Split('/');
-                return !parts.Any(d => d is "bin" or "obj" || d.StartsWith('.'));
-            })
+            .Where(p => !IsExcludedPath(RelativePath(root, p)))
             .OrderBy(p => p, StringComparer.Ordinal)
             .ToList();
     }
 
-    private static async Task<(Solution, List<Compilation>)> LoadAdhocWorkspace(string root, List<string> csFiles)
+    private static async Task<List<Compilation>> LoadAdhocWorkspace(string root, List<string> csFiles)
     {
         var workspace = new AdhocWorkspace();
         var projectId = ProjectId.CreateNewId();
@@ -352,7 +430,7 @@ internal static class Program
 
         var compilation = await solution.GetProject(projectId)!.GetCompilationAsync()
             ?? throw new InvalidOperationException("workspace produced no compilation");
-        return (solution, [compilation]);
+        return [compilation];
     }
 
     /// <summary>Reference the running runtime's assemblies so fixture code type-checks.</summary>
@@ -462,6 +540,38 @@ internal static class Program
     /// <summary>A repo-relative path that escapes the analysis root.</summary>
     private static bool IsOutsideRoot(string relativePath) =>
         relativePath == ".." || relativePath.StartsWith("../", StringComparison.Ordinal);
+
+    /// <summary>
+    /// Is this root-relative path one the index reports on? With --files, exactly
+    /// the caller's list; otherwise everything under root minus IsExcludedPath.
+    /// </summary>
+    private static bool IsIndexedFile(string relativePath, HashSet<string>? indexedFiles)
+    {
+        if (IsOutsideRoot(relativePath))
+        {
+            return false;
+        }
+        return indexedFiles?.Contains(relativePath) ?? !IsExcludedPath(relativePath);
+    }
+
+    /// <summary>
+    /// Heuristic used only without --files: build output and dot-directories —
+    /// generated code (e.g. MAUI XAML codegen under obj/) that indexing rarely wants.
+    /// </summary>
+    private static bool IsExcludedPath(string relativePath) =>
+        relativePath.Split('/').Any(part => part is "bin" or "obj" || part.StartsWith('.'));
+
+    /// <summary>One on-wire reference record; the single place that converts 0-based spans to 1-based columns.</summary>
+    private static void WriteReference(TextWriter stdout, string docid, string file, FileLinePositionSpan span, bool isDefinition) =>
+        WriteRecord(stdout, new
+        {
+            type = "reference",
+            docid,
+            file,
+            line = span.StartLinePosition.Line + 1,
+            col = span.StartLinePosition.Character + 1,
+            is_definition = isDefinition,
+        });
 
     private static void WriteRecord(TextWriter stdout, object record) =>
         stdout.WriteLine(JsonSerializer.Serialize(record, JsonOpts));

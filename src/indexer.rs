@@ -36,6 +36,48 @@ fn resolve_reference_candidates(
     candidates.iter().map(|(sym, _)| sym.id).collect()
 }
 
+/// The walker every helios pass uses: hidden files and gitignored paths skipped.
+fn walk(root: &Path) -> ignore::Walk {
+    WalkBuilder::new(root)
+        .hidden(true) // respect hidden files
+        .git_ignore(true) // respect .gitignore
+        .git_global(true)
+        .git_exclude(true)
+        .build()
+}
+
+/// Root-relative, '/'-separated path of a walked entry — the one path
+/// vocabulary shared by the database, the sidecar file list, and the
+/// helper's own RelativePath output.
+fn walk_rel_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Root-relative paths of the C# files a full index of `root` will cover.
+/// Passed to the Roslyn sidecar so it reports on exactly the indexed file set
+/// instead of guessing which paths the walk skips. Walk errors propagate —
+/// a silently shorter list would drop those files' references (the sidecar
+/// output replaces the entire `.cs` reference set).
+pub fn indexed_csharp_files(root: &Path) -> Result<Vec<String>> {
+    let mut files = Vec::new();
+    for entry in walk(root) {
+        let entry = entry.context("walking directory")?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let rel_path = walk_rel_path(root, path);
+        if !rel_path.starts_with(".helios") && parsers::detect_language(&rel_path) == Some("csharp")
+        {
+            files.push(rel_path);
+        }
+    }
+    Ok(files)
+}
+
 /// Index all supported files in a directory.
 ///
 /// `semantic_csharp` is true when the Roslyn sidecar ran for this walk: `.cs`
@@ -44,12 +86,7 @@ fn resolve_reference_candidates(
 pub fn index_full(db: &Database, root: &Path, semantic_csharp: bool) -> Result<IndexStats> {
     let mut stats = IndexStats::default();
 
-    let walker = WalkBuilder::new(root)
-        .hidden(true) // respect hidden files
-        .git_ignore(true) // respect .gitignore
-        .git_global(true)
-        .git_exclude(true)
-        .build();
+    let walker = walk(root);
 
     for entry in walker {
         let entry = entry.context("walking directory")?;
@@ -59,11 +96,7 @@ pub fn index_full(db: &Database, root: &Path, semantic_csharp: bool) -> Result<I
             continue;
         }
 
-        let rel_path = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string();
+        let rel_path = walk_rel_path(root, path);
 
         // Skip .helios directory
         if rel_path.starts_with(".helios") {

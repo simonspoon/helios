@@ -83,10 +83,29 @@ pub fn detect() -> Option<Sidecar> {
 impl Sidecar {
     /// One-shot `analyze` with a wall-clock timeout. `Err` => caller falls
     /// back to the tree-sitter path (one warning).
-    pub fn analyze(&self, root: &Path, timeout: Duration) -> Result<AnalyzeOutput> {
+    ///
+    /// `files` is the walk's indexed `.cs` set (root-relative paths). It is
+    /// handed to the helper via `--files` so both sides share one file
+    /// vocabulary — the helper otherwise guesses with a bin/obj heuristic that
+    /// can disagree with the gitignore-driven walk. An empty slice means no
+    /// `.cs` files are indexed; the flag is omitted (nothing would be ingested).
+    pub fn analyze(&self, root: &Path, files: &[String], timeout: Duration) -> Result<AnalyzeOutput> {
         let mut cmd = Command::new(&self.program);
         cmd.arg(&self.dll).arg("analyze").arg("--root").arg(root);
-        let out = match run_with_timeout(cmd, timeout) {
+        // Per-invocation IPC payload, not persistent state: removed after the run.
+        let mut list_path = None;
+        if !files.is_empty() {
+            let path = root.join(".helios").join("roslyn-files.txt");
+            std::fs::create_dir_all(root.join(".helios")).context("creating .helios directory")?;
+            std::fs::write(&path, files.join("\n")).context("writing sidecar file list")?;
+            cmd.arg("--files").arg(&path);
+            list_path = Some(path);
+        }
+        let run = run_with_timeout(cmd, timeout);
+        if let Some(path) = list_path {
+            let _ = std::fs::remove_file(path);
+        }
+        let out = match run {
             Ok(out) => out,
             Err(RunError::Spawn(e)) => anyhow::bail!("could not run dotnet: {e}"),
             Err(RunError::Wait(e)) => anyhow::bail!("waiting on helper: {e}"),
@@ -489,7 +508,7 @@ mod tests {
         let sidecar = script_sidecar(dir.path(), "sleep 30");
         let start = Instant::now();
         let err = sidecar
-            .analyze(dir.path(), Duration::from_millis(250))
+            .analyze(dir.path(), &[], Duration::from_millis(250))
             .expect_err("hung helper must degrade");
         assert!(
             start.elapsed() < Duration::from_secs(10),
@@ -509,7 +528,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sidecar = script_sidecar(dir.path(), "exit 0");
         sidecar
-            .analyze(dir.path(), Duration::from_secs(u64::MAX))
+            .analyze(dir.path(), &[], Duration::from_secs(u64::MAX))
             .expect("huge timeout must behave as 'no deadline', not panic");
     }
 
@@ -519,7 +538,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sidecar = script_sidecar(dir.path(), "echo 'load failure' >&2; exit 3");
         let err = sidecar
-            .analyze(dir.path(), Duration::from_secs(10))
+            .analyze(dir.path(), &[], Duration::from_secs(10))
             .expect_err("non-zero exit must degrade");
         assert!(
             err.to_string().contains("load failure"),
@@ -537,7 +556,7 @@ mod tests {
              echo '{\"type\":\"reference\",\"docid\":\"T:App.Person\",\"file\":\"Program.cs\",\"line\":4,\"col\":21,\"is_definition\":false}'",
         );
         let output = sidecar
-            .analyze(dir.path(), Duration::from_secs(10))
+            .analyze(dir.path(), &[], Duration::from_secs(10))
             .expect("analyze");
         assert_eq!(output.definitions.len(), 1);
         assert_eq!(output.references.len(), 1);
