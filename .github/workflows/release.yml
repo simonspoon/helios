@@ -127,3 +127,8 @@ jobs:
             -f "client_payload[tool]=helios" \
             -f "client_payload[version]=$VERSION" \
             -f "client_payload[repo]=simonspoon/helios"
+          gh api repos/simonspoon/homebrew-tap/dispatches \
+            -f event_type=update-formula \
+            -f "client_payload[tool]=helios-csharp" \
+            -f "client_payload[version]=$VERSION" \
+            -f "client_payload[repo]=simonspoon/helios"

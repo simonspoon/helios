@@ -57,7 +57,13 @@ uses the tree-sitter path. Nothing else changes.
 
 ### Install the helper
 
-Download `helios-roslyn.zip` from [Releases](https://github.com/simonspoon/helios/releases)
+With Homebrew (links the dll next to the brewed `helios` binary):
+
+```bash
+brew install simonspoon/tap/helios-csharp
+```
+
+Or download `helios-roslyn.zip` from [Releases](https://github.com/simonspoon/helios/releases)
 and extract it next to the `helios` binary:
 
 ```bash
