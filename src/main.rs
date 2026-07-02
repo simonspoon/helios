@@ -37,7 +37,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Full index of project -> .helios/index.db
-    Init,
+    Init {
+        /// Roslyn analyze timeout in seconds (for large C# repos)
+        #[arg(
+            long,
+            env = "HELIOS_ANALYZE_TIMEOUT",
+            value_parser = clap::value_parser!(u64).range(1..),
+            default_value_t = sidecar::ANALYZE_TIMEOUT.as_secs()
+        )]
+        timeout: u64,
+    },
     /// Incremental update (git diff-based)
     Update,
     /// List symbols in the index
@@ -107,7 +116,7 @@ fn main() {
     let compact = cli.compact;
 
     let result = match &cli.command {
-        Command::Init => commands::init::run(cli.json, compact, cli.quiet),
+        Command::Init { timeout } => commands::init::run(cli.json, compact, cli.quiet, *timeout),
         Command::Update => commands::update::run(cli.json, compact, cli.quiet),
         Command::Symbols {
             file,

@@ -19,9 +19,9 @@ use std::time::{Duration, Instant};
 /// (architect decision on spec A2: .NET 8.0 LTS).
 const DOTNET_MAJOR_FLOOR: u64 = 8;
 
-/// Wall-clock timeout for `analyze` (P3-S1); a hung helper degrades instead of
-/// blocking `init` indefinitely.
-const ANALYZE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default wall-clock timeout for `analyze` (P3-S1); a hung helper degrades
+/// instead of blocking `init` indefinitely. Overridable via `init --timeout`.
+pub const ANALYZE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Wall-clock timeout for `ping`; a hung probe counts as a failed ping.
 const PING_TIMEOUT: Duration = Duration::from_secs(15);
@@ -81,13 +81,9 @@ pub fn detect() -> Option<Sidecar> {
 }
 
 impl Sidecar {
-    /// One-shot `analyze` with a timeout. `Err` => caller falls back to the
-    /// tree-sitter path (one warning).
-    pub fn analyze(&self, root: &Path) -> Result<AnalyzeOutput> {
-        self.analyze_with_timeout(root, ANALYZE_TIMEOUT)
-    }
-
-    fn analyze_with_timeout(&self, root: &Path, timeout: Duration) -> Result<AnalyzeOutput> {
+    /// One-shot `analyze` with a wall-clock timeout. `Err` => caller falls
+    /// back to the tree-sitter path (one warning).
+    pub fn analyze(&self, root: &Path, timeout: Duration) -> Result<AnalyzeOutput> {
         let mut cmd = Command::new(&self.program);
         cmd.arg(&self.dll).arg("analyze").arg("--root").arg(root);
         let out = match run_with_timeout(cmd, timeout) {
@@ -334,12 +330,14 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<RunOutput, Ru
         String::from_utf8_lossy(&buf).into_owned()
     });
 
-    let deadline = Instant::now() + timeout;
+    // A user-supplied timeout can be arbitrarily large; `Instant + Duration`
+    // panics on overflow, so treat an unrepresentable deadline as "never".
+    let deadline = Instant::now().checked_add(timeout);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                if Instant::now() >= deadline {
+                if deadline.is_some_and(|d| Instant::now() >= d) {
                     let _ = child.kill();
                     let _ = child.wait();
                     let _ = stdout_thread.join();
@@ -491,7 +489,7 @@ mod tests {
         let sidecar = script_sidecar(dir.path(), "sleep 30");
         let start = Instant::now();
         let err = sidecar
-            .analyze_with_timeout(dir.path(), Duration::from_millis(250))
+            .analyze(dir.path(), Duration::from_millis(250))
             .expect_err("hung helper must degrade");
         assert!(
             start.elapsed() < Duration::from_secs(10),
@@ -505,11 +503,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn analyze_huge_timeout_does_not_panic() {
+        // A user-supplied --timeout near u64::MAX must not overflow the
+        // deadline arithmetic (Instant + Duration panics on overflow).
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = script_sidecar(dir.path(), "exit 0");
+        sidecar
+            .analyze(dir.path(), Duration::from_secs(u64::MAX))
+            .expect("huge timeout must behave as 'no deadline', not panic");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn analyze_nonzero_exit_is_error() {
         let dir = tempfile::tempdir().unwrap();
         let sidecar = script_sidecar(dir.path(), "echo 'load failure' >&2; exit 3");
         let err = sidecar
-            .analyze_with_timeout(dir.path(), Duration::from_secs(10))
+            .analyze(dir.path(), Duration::from_secs(10))
             .expect_err("non-zero exit must degrade");
         assert!(
             err.to_string().contains("load failure"),
@@ -527,7 +537,7 @@ mod tests {
              echo '{\"type\":\"reference\",\"docid\":\"T:App.Person\",\"file\":\"Program.cs\",\"line\":4,\"col\":21,\"is_definition\":false}'",
         );
         let output = sidecar
-            .analyze_with_timeout(dir.path(), Duration::from_secs(10))
+            .analyze(dir.path(), Duration::from_secs(10))
             .expect("analyze");
         assert_eq!(output.definitions.len(), 1);
         assert_eq!(output.references.len(), 1);

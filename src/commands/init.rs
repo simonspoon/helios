@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::db::Database;
 use crate::git;
 use crate::indexer;
 use crate::sidecar;
 
-pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
+pub fn run(json: bool, compact: bool, quiet: bool, timeout_secs: u64) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let helios_dir = cwd.join(".helios");
 
@@ -21,7 +21,7 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
     // analyze errors or times out) falls back to the tree-sitter path with a
     // single warning and init still succeeds (P3-M1, P3-M2, P3-S1).
     let semantic: Option<sidecar::AnalyzeOutput> =
-        sidecar::detect().and_then(|s| match s.analyze(&cwd) {
+        sidecar::detect().and_then(|s| match s.analyze(&cwd, Duration::from_secs(timeout_secs)) {
             Ok(output) => Some(output),
             Err(e) => {
                 eprintln!(

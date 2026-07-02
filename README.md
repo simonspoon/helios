@@ -105,6 +105,9 @@ helios init
 # Database: /path/to/.helios/index.db
 ```
 
+Options:
+- `--timeout <SECONDS>` — Roslyn analyze timeout (default: 120). Large C# repos can exceed the default because the helper compiles sources first; also settable via the `HELIOS_ANALYZE_TIMEOUT` env var.
+
 ### `helios update`
 
 Incrementally update the index. Uses `git diff` to detect changed files since the last indexed commit — only re-parses what changed.
