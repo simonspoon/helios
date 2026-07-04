@@ -133,8 +133,19 @@ internal static class Program
             EmitDefinitions(compilation, root, stdout, indexedFiles, emittedDefinitions, declarationSites);
         }
         var rootDocids = emittedDefinitions.Select(d => d.Docid).ToHashSet(StringComparer.Ordinal);
+        // When a later compilation is provably bind-identical to one already
+        // walked (same trees, same references), its pass-2 output would be a
+        // byte-for-byte repeat that emittedReferences swallows anyway — skip
+        // the semantic re-bind entirely.
+        var equivalenceMemo = new Dictionary<(Compilation, Compilation), bool>();
+        var bound = new List<Compilation>();
         foreach (var compilation in compilations)
         {
+            if (bound.Any(prior => AreBindEquivalent(prior, compilation, root, indexedFiles, equivalenceMemo)))
+            {
+                continue;
+            }
+            bound.Add(compilation);
             EmitReferences(compilation, root, stdout, indexedFiles, rootDocids, declarationSites, emittedReferences);
         }
 
@@ -263,6 +274,129 @@ internal static class Program
                 WriteReference(stdout, docid, file, span, isDefinition: false);
             }
         }
+    }
+
+    /// <summary>
+    /// True when two compilations provably bind identically, so pass 2 over
+    /// <paramref name="b"/> would re-emit exactly what <paramref name="a"/>
+    /// already produced: identical syntax trees (text and parse-relevant
+    /// options; path too for indexed trees, whose path lands in output records)
+    /// and identical references (same assembly files; project references
+    /// bind-equivalent in turn). Conservative — any mismatch, including
+    /// ordering, means "not equivalent" and the caller re-binds. Per-tree
+    /// checks (e.g. ContainsDirectives alone) are NOT safe: binding depends on
+    /// the whole compilation, so a directive-free tree can still resolve
+    /// differently under a different reference set.
+    /// </summary>
+    internal static bool AreBindEquivalent(
+        Compilation a, Compilation b, string root, HashSet<string>? indexedFiles,
+        Dictionary<(Compilation, Compilation), bool> memo)
+    {
+        if (ReferenceEquals(a, b))
+        {
+            return true;
+        }
+        if (memo.TryGetValue((a, b), out var known))
+        {
+            return known;
+        }
+        // Assembly name participates in binding via InternalsVisibleTo.
+        var result = string.Equals(a.AssemblyName, b.AssemblyName, StringComparison.Ordinal)
+            && TreesMatch(a, b, root, indexedFiles)
+            && ReferencesMatch(a, b, root, indexedFiles, memo);
+        memo[(a, b)] = result;
+        return result;
+    }
+
+    private static bool TreesMatch(Compilation a, Compilation b, string root, HashSet<string>? indexedFiles)
+    {
+        var treesA = a.SyntaxTrees.ToList();
+        var treesB = b.SyntaxTrees.ToList();
+        if (treesA.Count != treesB.Count)
+        {
+            return false;
+        }
+        for (var i = 0; i < treesA.Count; i++)
+        {
+            var (ta, tb) = (treesA[i], treesB[i]);
+            if (!ta.GetText().ContentEquals(tb.GetText()) || !ParseIdentical(ta, tb))
+            {
+                return false;
+            }
+            // Binding is path-blind, so generated trees (each context's own
+            // obj/…/AssemblyInfo.cs) may differ in path as long as their text
+            // matches. Indexed trees must also agree on path: it becomes the
+            // `file` field of every record they produce.
+            if (!string.Equals(ta.FilePath, tb.FilePath, StringComparison.Ordinal)
+                && (IsIndexedFile(RelativePath(root, ta.FilePath), indexedFiles)
+                    || IsIndexedFile(RelativePath(root, tb.FilePath), indexedFiles)))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Same text parses to the same tree only when the parse options agree — or
+    /// when the sole disagreement is preprocessor symbols (net8.0 defines NET8_0,
+    /// net9.0 NET9_0, …) and the tree carries no directives for them to toggle.
+    /// </summary>
+    private static bool ParseIdentical(SyntaxTree a, SyntaxTree b)
+    {
+        if (a.Options is not CSharpParseOptions oa || b.Options is not CSharpParseOptions ob)
+        {
+            return false;
+        }
+        if (oa.LanguageVersion != ob.LanguageVersion
+            || oa.DocumentationMode != ob.DocumentationMode
+            || oa.Kind != ob.Kind)
+        {
+            return false;
+        }
+        if (oa.PreprocessorSymbolNames.ToHashSet(StringComparer.Ordinal)
+                .SetEquals(ob.PreprocessorSymbolNames))
+        {
+            return true;
+        }
+        return !a.GetRoot().ContainsDirectives && !b.GetRoot().ContainsDirectives;
+    }
+
+    private static bool ReferencesMatch(
+        Compilation a, Compilation b, string root, HashSet<string>? indexedFiles,
+        Dictionary<(Compilation, Compilation), bool> memo)
+    {
+        var refsA = a.References.ToList();
+        var refsB = b.References.ToList();
+        if (refsA.Count != refsB.Count)
+        {
+            return false;
+        }
+        for (var i = 0; i < refsA.Count; i++)
+        {
+            var (ra, rb) = (refsA[i], refsB[i]);
+            if (ra.Properties.Kind != rb.Properties.Kind
+                || ra.Properties.EmbedInteropTypes != rb.Properties.EmbedInteropTypes
+                || !ra.Properties.Aliases.SequenceEqual(rb.Properties.Aliases, StringComparer.Ordinal))
+            {
+                return false;
+            }
+            switch (ra, rb)
+            {
+                case (PortableExecutableReference pa, PortableExecutableReference pb)
+                    when pa.FilePath is not null
+                         && string.Equals(pa.FilePath, pb.FilePath, StringComparison.Ordinal):
+                    continue;
+                // A ProjectReference surfaces as one CompilationReference per
+                // TFM context; bind-equivalent targets keep the pair equivalent.
+                case (CompilationReference ca, CompilationReference cb)
+                    when AreBindEquivalent(ca.Compilation, cb.Compilation, root, indexedFiles, memo):
+                    continue;
+                default:
+                    return false;
+            }
+        }
+        return true;
     }
 
     /// <summary>
