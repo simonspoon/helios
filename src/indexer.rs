@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::db::{Database, SymbolRecord};
@@ -80,11 +81,22 @@ pub fn indexed_csharp_files(root: &Path) -> Result<Vec<String>> {
 
 /// Index all supported files in a directory.
 ///
-/// `semantic_csharp` is true when the Roslyn sidecar ran for this walk: `.cs`
-/// reference resolution is then deferred to `ingest_semantic`, which runs
-/// after the walk (symbols and imports are still inserted here either way).
-pub fn index_full(db: &Database, root: &Path, semantic_csharp: bool) -> Result<IndexStats> {
+/// `cs_snapshot` is the file list the Roslyn sidecar analyzed, when it ran for
+/// this walk (`None` = tree-sitter mode): `.cs` reference resolution is then
+/// deferred to `ingest_semantic`, which runs after the walk (symbols and
+/// imports are still inserted here either way). `.cs` files the walk sees that
+/// are missing from the snapshot — created between the snapshot and the walk —
+/// are reported in `IndexStats::cs_missing_from_snapshot`; they carry no
+/// semantic references until the next init.
+pub fn index_full(
+    db: &Database,
+    root: &Path,
+    cs_snapshot: Option<&[String]>,
+) -> Result<IndexStats> {
     let mut stats = IndexStats::default();
+    let semantic_csharp = cs_snapshot.is_some();
+    let snapshot: Option<HashSet<&str>> =
+        cs_snapshot.map(|files| files.iter().map(String::as_str).collect());
 
     let walker = walk(root);
 
@@ -104,6 +116,12 @@ pub fn index_full(db: &Database, root: &Path, semantic_csharp: bool) -> Result<I
         }
 
         if let Some(language) = parsers::detect_language(&rel_path) {
+            if language == "csharp"
+                && let Some(snapshot) = &snapshot
+                && !snapshot.contains(rel_path.as_str())
+            {
+                stats.cs_missing_from_snapshot.push(rel_path.clone());
+            }
             match index_file(db, path, &rel_path, language, semantic_csharp) {
                 Ok(file_stats) => {
                     stats.files_indexed += 1;
@@ -307,6 +325,9 @@ pub struct IndexStats {
     pub files_deleted: usize,
     pub symbols_found: usize,
     pub imports_found: usize,
+    /// `.cs` files the walk indexed that the Roslyn sidecar snapshot missed
+    /// (created mid-run); they have no semantic references until the next init.
+    pub cs_missing_from_snapshot: Vec<String>,
 }
 
 pub(crate) struct FileStats {
@@ -549,5 +570,27 @@ mod tests {
             !all_refs(&db).is_empty(),
             "syntactic mode keeps tree-sitter references"
         );
+    }
+
+    #[test]
+    fn walk_reports_cs_files_missing_from_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Old.cs"), "class Old {}").unwrap();
+        std::fs::write(dir.path().join("New.cs"), "class New {}").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let snapshot = vec!["Old.cs".to_string()];
+        let stats = index_full(&db, dir.path(), Some(&snapshot)).unwrap();
+        assert_eq!(stats.cs_missing_from_snapshot, vec!["New.cs".to_string()]);
+
+        let db = Database::open_in_memory().unwrap();
+        let full: Vec<String> = vec!["Old.cs".into(), "New.cs".into()];
+        let stats = index_full(&db, dir.path(), Some(&full)).unwrap();
+        assert!(stats.cs_missing_from_snapshot.is_empty());
+
+        // Tree-sitter mode has no snapshot to diff against.
+        let db = Database::open_in_memory().unwrap();
+        let stats = index_full(&db, dir.path(), None).unwrap();
+        assert!(stats.cs_missing_from_snapshot.is_empty());
     }
 }

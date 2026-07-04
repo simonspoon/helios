@@ -89,7 +89,12 @@ impl Sidecar {
     /// vocabulary — the helper otherwise guesses with a bin/obj heuristic that
     /// can disagree with the gitignore-driven walk. An empty slice means no
     /// `.cs` files are indexed; the flag is omitted (nothing would be ingested).
-    pub fn analyze(&self, root: &Path, files: &[String], timeout: Duration) -> Result<AnalyzeOutput> {
+    pub fn analyze(
+        &self,
+        root: &Path,
+        files: &[String],
+        timeout: Duration,
+    ) -> Result<AnalyzeOutput> {
         let mut cmd = Command::new(&self.program);
         cmd.arg(&self.dll).arg("analyze").arg("--root").arg(root);
         // Per-invocation IPC payload, not persistent state: removed after the run.

@@ -23,7 +23,8 @@ pub fn run(json: bool, compact: bool, quiet: bool, timeout_secs: u64) -> Result<
     // The walk's indexed .cs set: the helper reports on exactly these files,
     // keeping its output aligned with what ingest_semantic can stamp. Snapshot
     // taken before the analyze/walk, so a .cs file created mid-run is indexed
-    // without semantic references until the next init. An empty set skips the
+    // without semantic references until the next init — the walk reports such
+    // files and a warning below surfaces them. An empty set skips the
     // sidecar entirely — no dotnet spawns, nothing the ingest could keep.
     let cs_files = match indexer::indexed_csharp_files(&cwd) {
         Ok(files) => files,
@@ -54,7 +55,15 @@ pub fn run(json: bool, compact: bool, quiet: bool, timeout_secs: u64) -> Result<
     // In semantic mode the walk skips `.cs` reference resolution; the ingest
     // below stamps DocIds and inserts the exact reference set instead, and
     // either way records the resolver provenance (P3-M3..M7).
-    let stats = indexer::index_full(&db, &cwd, semantic.is_some())?;
+    let cs_snapshot = semantic.is_some().then_some(cs_files.as_slice());
+    let stats = indexer::index_full(&db, &cwd, cs_snapshot)?;
+    if !stats.cs_missing_from_snapshot.is_empty() {
+        eprintln!(
+            "warning: {} C# file(s) appeared after the Roslyn snapshot and have no semantic references until the next init: {}",
+            stats.cs_missing_from_snapshot.len(),
+            stats.cs_missing_from_snapshot.join(", ")
+        );
+    }
     indexer::ingest_semantic(&db, semantic.as_ref())?;
     let elapsed = start.elapsed();
 

@@ -23,7 +23,7 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
         }
         let start = Instant::now();
         // `update` keeps the tree-sitter path for `.cs` (W1) — syntactic.
-        let stats = indexer::index_full(&db, &cwd, false)?;
+        let stats = indexer::index_full(&db, &cwd, None)?;
         let elapsed = start.elapsed();
 
         print_stats(&stats, elapsed, json, compact, quiet)?;
@@ -41,7 +41,7 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
             }
             let start = Instant::now();
             // `update` keeps the tree-sitter path for `.cs` (W1) — syntactic.
-            let stats = indexer::index_full(&db, &cwd, false)?;
+            let stats = indexer::index_full(&db, &cwd, None)?;
             let elapsed = start.elapsed();
 
             if let Some(commit) = git::head_commit()? {
