@@ -127,6 +127,9 @@ pub fn index_full(
                     stats.files_indexed += 1;
                     stats.symbols_found += file_stats.symbols;
                     stats.imports_found += file_stats.imports;
+                    if language == "csharp" && file_stats.reparsed {
+                        stats.cs_changed += 1;
+                    }
                 }
                 Err(e) => {
                     eprintln!("warning: failed to index {}: {}", rel_path, e);
@@ -164,6 +167,7 @@ pub fn index_file(
         return Ok(FileStats {
             symbols: 0,
             imports: 0,
+            reparsed: false,
         });
     }
 
@@ -180,6 +184,7 @@ pub fn index_file(
             return Ok(FileStats {
                 symbols: 0,
                 imports: 0,
+                reparsed: true,
             });
         }
     };
@@ -223,6 +228,7 @@ pub fn index_file(
     Ok(FileStats {
         symbols: symbol_count,
         imports: import_count,
+        reparsed: true,
     })
 }
 
@@ -239,6 +245,9 @@ pub fn index_incremental(
     for path in deleted {
         db.delete_file(path)?;
         stats.files_deleted += 1;
+        if parsers::detect_language(path) == Some("csharp") {
+            stats.cs_changed += 1;
+        }
     }
 
     // Re-index modified/added files
@@ -255,6 +264,9 @@ pub fn index_incremental(
                     stats.files_indexed += 1;
                     stats.symbols_found += file_stats.symbols;
                     stats.imports_found += file_stats.imports;
+                    if language == "csharp" && file_stats.reparsed {
+                        stats.cs_changed += 1;
+                    }
                 }
                 Err(e) => {
                     eprintln!("warning: failed to index {}: {}", rel_path, e);
@@ -328,11 +340,18 @@ pub struct IndexStats {
     /// `.cs` files the walk indexed that the Roslyn sidecar snapshot missed
     /// (created mid-run); they have no semantic references until the next init.
     pub cs_missing_from_snapshot: Vec<String>,
+    /// `.cs` files this pass rewrote (content changed) or deleted. Under a
+    /// semantic (roslyn) index these files' outbound references degrade to
+    /// tree-sitter and inbound semantic references onto their symbols cascade
+    /// away with the deleted symbol rows (W1) — `update` warns on this.
+    pub cs_changed: usize,
 }
 
 pub(crate) struct FileStats {
     symbols: usize,
     imports: usize,
+    /// False when the content hash matched and the file's rows were left as-is.
+    reparsed: bool,
 }
 
 #[cfg(test)]
@@ -570,6 +589,36 @@ mod tests {
             !all_refs(&db).is_empty(),
             "syntactic mode keeps tree-sitter references"
         );
+    }
+
+    /// `cs_changed` counts only `.cs` files whose rows were rewritten or
+    /// deleted — unchanged-hash files and other languages don't count.
+    #[test]
+    fn cs_changed_counts_rewritten_and_deleted_cs_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let cs = dir.path().join("A.cs");
+        std::fs::write(&cs, "class A {}").unwrap();
+        std::fs::write(dir.path().join("b.py"), "def b():\n    pass\n").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let stats = index_full(&db, dir.path(), None).unwrap();
+        assert_eq!(stats.cs_changed, 1);
+
+        // Second pass over identical content: nothing rewritten.
+        let stats = index_full(&db, dir.path(), None).unwrap();
+        assert_eq!(stats.cs_changed, 0);
+
+        // Incremental: rewritten A.cs and deleted Gone.cs count; the
+        // unchanged b.py in the modified list does not.
+        std::fs::write(&cs, "class A { void M() { } }").unwrap();
+        let stats = index_incremental(
+            &db,
+            dir.path(),
+            &["A.cs".to_string(), "b.py".to_string()],
+            &["Gone.cs".to_string()],
+        )
+        .unwrap();
+        assert_eq!(stats.cs_changed, 2);
     }
 
     #[test]

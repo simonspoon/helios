@@ -3214,3 +3214,121 @@ fn test_e2e_mixed_language_non_cs_rows_invariant_across_legs() {
         "non-C# rows must be byte-identical with and without the sidecar (P3-M8)"
     );
 }
+
+// --- update staleness warning under a semantic index (task 184) ---
+//
+// `update` never runs the Roslyn sidecar (measured: even a project-scoped
+// analyze costs seconds of MSBuild load vs a sub-second tree-sitter update).
+// Instead it must surface the fidelity trade: changed `.cs` files under a
+// roslyn-provenance index warn that references degrade until the next init.
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("running git");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_repo_with_commit(dir: &std::path::Path) {
+    std::fs::write(dir.join(".gitignore"), ".helios/\n").unwrap();
+    git(dir, &["init", "-q"]);
+    git(dir, &["config", "user.email", "test@test"]);
+    git(dir, &["config", "user.name", "Test"]);
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-qm", "initial"]);
+}
+
+/// Run `helios update` in `dir`; assert exit 0 and return stderr.
+fn update_stderr(dir: &std::path::Path) -> String {
+    let output = Command::new(helios_bin())
+        .arg("update")
+        .current_dir(dir)
+        .output()
+        .expect("helios update");
+    assert!(
+        output.status.success(),
+        "update must exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+const STALE_HINT: &str = "run 'helios init' to refresh";
+
+/// Leg A (gated on dotnet + helper DLL): a `.cs` change under a roslyn index
+/// warns once on update, and provenance stays "roslyn" (it reflects the last
+/// init, per spec Q1).
+#[test]
+fn test_update_warns_on_cs_change_under_semantic_index() {
+    let Some(dll) = built_roslyn_dll() else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    write_csharp_files(dir.path());
+    git_repo_with_commit(dir.path());
+    init_with_sidecar(dir.path(), &dll, "roslyn");
+
+    std::fs::write(
+        dir.path().join("Person.cs"),
+        "namespace App { public class Person { public void Greet() { } public void Wave() { } } }\n",
+    )
+    .unwrap();
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-qm", "change"]);
+
+    let stderr = update_stderr(dir.path());
+    assert!(
+        stderr.contains(STALE_HINT),
+        "update must warn about stale semantic references, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 C# file(s) changed"),
+        "warning must count the changed .cs files, stderr: {stderr}"
+    );
+    assert_eq!(
+        metadata_value(dir.path(), "csharp_resolver").as_deref(),
+        Some("roslyn")
+    );
+
+    // A no-op update (nothing changed since) must not repeat the warning.
+    let stderr = update_stderr(dir.path());
+    assert!(
+        !stderr.contains(STALE_HINT),
+        "up-to-date update must not warn, stderr: {stderr}"
+    );
+}
+
+/// Under a tree-sitter index the same `.cs` change warns nothing — the
+/// warning is about semantic fidelity, not about C# changes per se.
+#[test]
+fn test_update_does_not_warn_under_treesitter_index() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    write_csharp_files(dir.path());
+    git_repo_with_commit(dir.path());
+    init_with_sidecar(
+        dir.path(),
+        std::path::Path::new("/nonexistent/helios-roslyn.dll"),
+        "treesitter",
+    );
+
+    std::fs::write(
+        dir.path().join("Person.cs"),
+        "namespace App { public class Person { public void Greet() { } public void Wave() { } } }\n",
+    )
+    .unwrap();
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-qm", "change"]);
+
+    let stderr = update_stderr(dir.path());
+    assert!(
+        !stderr.contains(STALE_HINT),
+        "tree-sitter index must not warn about semantic staleness, stderr: {stderr}"
+    );
+}
