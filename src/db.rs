@@ -6,6 +6,11 @@ pub struct Database {
     pub conn: Connection,
 }
 
+/// `?,?,?` for an `IN` clause of `n` bound values.
+fn placeholders(n: usize) -> String {
+    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FileRecord {
     pub id: i64,
@@ -54,6 +59,15 @@ pub struct ReferenceRecord {
     pub file_id: i64,
     pub line: i64,
     pub column: i64,
+}
+
+/// One definition a `deps` target resolved to.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SymbolDefinition {
+    pub id: i64,
+    pub path: String,
+    pub line: i64,
+    pub scope: Option<String>,
 }
 
 /// Per-file metadata with aggregated symbol/import counts.
@@ -569,17 +583,63 @@ impl Database {
     }
 
     /// What does a symbol depend on (via its file's imports)?
-    pub fn symbol_dependencies(&self, symbol_name: &str) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
+    pub fn symbol_dependencies(&self, symbol_ids: &[i64]) -> Result<Vec<String>> {
+        if symbol_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT DISTINCT i.import_path
              FROM symbols s
              JOIN imports i ON i.source_file_id = s.file_id
-             WHERE s.name = ?1
+             WHERE s.id IN ({})
              ORDER BY i.import_path",
-        )?;
-        let rows = stmt.query_map(params![symbol_name], |row| row.get::<_, String>(0))?;
+            placeholders(symbol_ids.len())
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(symbol_ids), |row| {
+            row.get::<_, String>(0)
+        })?;
         rows.collect::<Result<Vec<_>, _>>()
             .context("querying symbol dependencies")
+    }
+
+    /// Definitions named `name`, optionally narrowed to one scope (exact match,
+    /// as `symbols --scope`) and/or one defining file (substring, as `symbols
+    /// --file`). This is how a `deps` target picks between same-named
+    /// definitions.
+    pub fn find_definitions(
+        &self,
+        name: &str,
+        scope: Option<&str>,
+        file: Option<&str>,
+    ) -> Result<Vec<SymbolDefinition>> {
+        let mut sql = String::from(
+            "SELECT s.id, f.path, s.line, s.scope
+             FROM symbols s JOIN files f ON s.file_id = f.id
+             WHERE s.name = ?1",
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(name.to_string())];
+
+        if let Some(s) = scope {
+            params_vec.push(Box::new(s.to_string()));
+            sql.push_str(&format!(" AND s.scope = ?{}", params_vec.len()));
+        }
+        if let Some(f) = file {
+            params_vec.push(Box::new(format!("%{f}%")));
+            sql.push_str(&format!(" AND f.path LIKE ?{}", params_vec.len()));
+        }
+        sql.push_str(" ORDER BY f.path, s.line");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
+            Ok(SymbolDefinition {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                line: row.get(2)?,
+                scope: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("finding symbol definitions")
     }
 
     /// What references point to this symbol (reverse deps)?
@@ -588,16 +648,19 @@ impl Database {
     /// `insert_references`), so a usage site would otherwise be emitted once
     /// per candidate. Callers want the usage sites, not the candidate fan-out,
     /// so collapse them with DISTINCT.
-    pub fn symbol_references(&self, symbol_name: &str) -> Result<Vec<(String, i64, i64)>> {
-        let mut stmt = self.conn.prepare(
+    pub fn symbol_references(&self, symbol_ids: &[i64]) -> Result<Vec<(String, i64, i64)>> {
+        if symbol_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT DISTINCT f.path, r.line, r.column
              FROM references_ r
-             JOIN symbols s ON r.symbol_id = s.id
              JOIN files f ON r.file_id = f.id
-             WHERE s.name = ?1
+             WHERE r.symbol_id IN ({})
              ORDER BY f.path, r.line, r.column",
-        )?;
-        let rows = stmt.query_map(params![symbol_name], |row| {
+            placeholders(symbol_ids.len())
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(symbol_ids), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,

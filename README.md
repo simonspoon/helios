@@ -154,9 +154,11 @@ src/main.rs:42:0 fn pub main
 src/lib.rs:10:4 struct pub Parser
 ```
 
-### `helios deps <TARGET> [--depth <N>]`
+### `helios deps <TARGET> [--scope <S>] [--file <P>] [--depth <N>]`
 
-Show dependencies and dependents for a symbol or file. Auto-detects the target type: paths containing `/` or `.` are treated as files, otherwise as symbols.
+Show dependencies and dependents for a symbol or file. Auto-detects the target
+type: a target with a `/` or a source-file extension is a file, anything else is
+a symbol.
 
 ```bash
 # File dependencies and dependents, both keyed by the file's own path
@@ -172,9 +174,25 @@ helios deps "src/parser.rs" --depth 3
 
 # Symbol references
 helios deps "parse_token"
+
+# One definition of an ambiguous name, three ways to say it
+helios deps "formatMoney" --file src/util
+helios deps "Compute" --scope PromoPricing
+helios deps "PromoPricing.Compute"
+helios deps "src/util/money.ts:formatMoney"
 ```
 
+- `--scope <S>` — Restrict a symbol target to definitions in this scope (class or impl block), matched exactly
+- `--file <P>` — Restrict a symbol target to definitions in files matching this path (substring)
 - `--depth <N>` — Transitive traversal depth (default: 1, file targets only)
+
+A symbol name declared in more than one place is ambiguous, and an unnarrowed
+target covers every definition of it. `--scope` and `--file` — or the equivalent
+qualified spellings `Class.Method` and `path/to/file.ts:name` — select the
+definitions you meant, and the query runs against only those. Symbol-mode JSON
+carries a `definitions` array (path, line, scope) so the selection is visible.
+A dotted target that names no definition is retried as a file, so a module path
+such as `pkg.util.money` still works.
 
 Import specifiers are resolved to indexed files at index time, so both
 directions answer from the real file path however each importer spelled the

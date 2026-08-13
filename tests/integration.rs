@@ -3464,3 +3464,183 @@ fn test_deps_symbol_references_are_deduplicated() {
         "JSON dependents must be unique: {stdout}"
     );
 }
+
+/// A project with two `formatMoney` definitions whose defining files import
+/// different things, so a deps target that selects one is visibly different
+/// from one that selects the other.
+fn setup_decoy_project() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    std::fs::create_dir_all(dir.path().join("src/util")).unwrap();
+    std::fs::create_dir_all(dir.path().join("src/legacy")).unwrap();
+
+    std::fs::write(
+        dir.path().join("src/util/round.ts"),
+        "export function round(n: number): number { return Math.round(n); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/legacy/pad.ts"),
+        "export function pad(s: string): string { return ' ' + s; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/util/money.ts"),
+        "import { round } from './round';\nexport function formatMoney(n: number): string { return `$${round(n)}`; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/legacy/money.ts"),
+        "import { pad } from './pad';\nexport function formatMoney(n: number): string { return pad(n + ' USD'); }\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed during setup");
+    (dir, bin)
+}
+
+fn deps_json(bin: &PathBuf, dir: &std::path::Path, args: &[&str]) -> serde_json::Value {
+    let mut full = vec!["--json", "deps"];
+    full.extend_from_slice(args);
+    let output = Command::new(bin)
+        .args(&full)
+        .current_dir(dir)
+        .output()
+        .expect("deps --json");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("parsing deps JSON ({e}): {stdout}"))
+}
+
+fn definition_paths(value: &serde_json::Value) -> Vec<String> {
+    value["definitions"]
+        .as_array()
+        .expect("definitions array")
+        .iter()
+        .map(|d| d["path"].as_str().expect("definition path").to_string())
+        .collect()
+}
+
+#[test]
+fn test_deps_file_flag_selects_one_definition() {
+    let (dir, bin) = setup_decoy_project();
+
+    let both = deps_json(&bin, dir.path(), &["formatMoney"]);
+    assert_eq!(
+        definition_paths(&both),
+        vec!["src/legacy/money.ts", "src/util/money.ts"],
+        "an unnarrowed target still covers every definition"
+    );
+
+    let util = deps_json(&bin, dir.path(), &["formatMoney", "--file", "src/util"]);
+    assert_eq!(definition_paths(&util), vec!["src/util/money.ts"]);
+    assert_eq!(
+        util["dependencies"],
+        serde_json::json!(["./round"]),
+        "only the selected definition's file imports count: {util}"
+    );
+
+    let legacy = deps_json(&bin, dir.path(), &["formatMoney", "--file", "src/legacy"]);
+    assert_eq!(definition_paths(&legacy), vec!["src/legacy/money.ts"]);
+    assert_eq!(
+        legacy["dependencies"],
+        serde_json::json!(["./pad"]),
+        "the decoy definition's deps must not leak in: {legacy}"
+    );
+}
+
+#[test]
+fn test_deps_file_qualified_target_selects_one_definition() {
+    let (dir, bin) = setup_decoy_project();
+
+    let value = deps_json(&bin, dir.path(), &["src/util/money.ts:formatMoney"]);
+    assert_eq!(definition_paths(&value), vec!["src/util/money.ts"]);
+    assert_eq!(value["dependencies"], serde_json::json!(["./round"]));
+}
+
+#[test]
+fn test_deps_scope_flag_and_qualified_name_select_one_definition() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    std::fs::write(
+        dir.path().join("Promo.cs"),
+        "namespace App {\n  class PromoPricing { public int Compute(int x) { return x * 2; } }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("Legacy.cs"),
+        "namespace App {\n  class LegacyPricing { public int Compute(int x) { return x; } }\n}\n",
+    )
+    .unwrap();
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    // The bug this replaces: a qualified name was read as a file path, so it
+    // matched nothing at all.
+    let qualified = deps_json(&bin, dir.path(), &["PromoPricing.Compute"]);
+    let defs = qualified["definitions"].as_array().expect("definitions");
+    assert_eq!(defs.len(), 1, "expected one definition: {qualified}");
+    assert_eq!(defs[0]["path"], "Promo.cs");
+    assert_eq!(defs[0]["scope"], "PromoPricing");
+
+    let scoped = deps_json(&bin, dir.path(), &["Compute", "--scope", "LegacyPricing"]);
+    let defs = scoped["definitions"].as_array().expect("definitions");
+    assert_eq!(defs.len(), 1, "expected one definition: {scoped}");
+    assert_eq!(defs[0]["path"], "Legacy.cs");
+
+    // Unnarrowed, the name is still ambiguous.
+    let bare = deps_json(&bin, dir.path(), &["Compute"]);
+    assert_eq!(
+        bare["definitions"].as_array().expect("definitions").len(),
+        2
+    );
+}
+
+/// A dotted target that names no definition is still a module path.
+#[test]
+fn test_deps_dotted_target_falls_back_to_file_mode() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    std::fs::create_dir_all(dir.path().join("pkg")).unwrap();
+    std::fs::write(dir.path().join("pkg/__init__.py"), "").unwrap();
+    std::fs::write(
+        dir.path().join("pkg/money.py"),
+        "def fmt(n):\n    return n\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("app.py"),
+        "import pkg.money\n\ndef go():\n    return pkg.money.fmt(1)\n",
+    )
+    .unwrap();
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    let value = deps_json(&bin, dir.path(), &["pkg.money"]);
+    assert!(
+        value.get("definitions").is_none(),
+        "expected file-mode output for a module path: {value}"
+    );
+    let dependents: Vec<&str> = value["dependents"]
+        .as_array()
+        .expect("dependents array")
+        .iter()
+        .map(|d| d["path"].as_str().expect("path"))
+        .collect();
+    assert!(
+        dependents.contains(&"app.py"),
+        "expected app.py to import pkg.money: {value}"
+    );
+}

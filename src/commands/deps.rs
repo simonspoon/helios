@@ -2,8 +2,77 @@ use std::collections::{HashSet, VecDeque};
 
 use anyhow::{Context, Result};
 
-use crate::db::Database;
+use crate::db::{Database, SymbolDefinition};
 use crate::errors::NoIndexError;
+use crate::parsers::detect_language;
+
+/// A symbol target: the name to look up plus the narrowing the user asked for.
+struct SymbolTarget {
+    name: String,
+    scope: Option<String>,
+    file: Option<String>,
+    /// Whether an empty result should be retried as a file target. Only a bare
+    /// dotted target sets this — it may be a module path rather than a
+    /// qualified name.
+    may_be_file: bool,
+}
+
+/// Which definition(s) a target names, and how it was spelled.
+///
+/// `deps` answers two different questions depending on its target, and a bare
+/// string has to be sorted into one of them. A target is a *file* when it names
+/// one — it has a path separator or a source extension — and a *symbol*
+/// otherwise. `--scope` / `--file` force symbol mode, since they only narrow a
+/// definition.
+fn parse_target(target: &str, scope: Option<&str>, file: Option<&str>) -> Option<SymbolTarget> {
+    // `path/to/file.ts:name` — a file and a name, so unambiguously a symbol.
+    if let Some((path, name)) = target.rsplit_once(':')
+        && !name.is_empty()
+        && !path.is_empty()
+    {
+        return Some(SymbolTarget {
+            name: name.to_string(),
+            scope: scope.map(str::to_string),
+            file: Some(path.to_string()),
+            may_be_file: false,
+        });
+    }
+
+    if scope.is_some() || file.is_some() {
+        return Some(SymbolTarget {
+            name: target.to_string(),
+            scope: scope.map(str::to_string),
+            file: file.map(str::to_string),
+            may_be_file: false,
+        });
+    }
+
+    if target.contains('/') || detect_language(target).is_some() {
+        return None;
+    }
+
+    // `Class.Method`: the last segment is the name, everything before it the
+    // scope. A dotted target that matches no definition is retried as a file
+    // (`pkg.util.money` is how Python and C# name a module or namespace).
+    match target.rsplit_once('.') {
+        Some((qualifier, name)) if !qualifier.is_empty() && !name.is_empty() => {
+            Some(SymbolTarget {
+                name: name.to_string(),
+                scope: Some(qualifier.to_string()),
+                file: None,
+                may_be_file: true,
+            })
+        }
+        // Any other dotted spelling (`.`, `..money`) is not a qualified name,
+        // but it is still how a module can be written, so keep the retry.
+        _ => Some(SymbolTarget {
+            name: target.to_string(),
+            scope: None,
+            file: None,
+            may_be_file: target.contains('.'),
+        }),
+    }
+}
 
 /// BFS traversal result: (path, depth_level)
 struct BfsResult {
@@ -44,7 +113,14 @@ fn bfs_file_deps(
     Ok(BfsResult { entries })
 }
 
-pub fn run(target: &str, json: bool, compact: bool, depth: u32) -> Result<()> {
+pub fn run(
+    target: &str,
+    json: bool,
+    compact: bool,
+    depth: u32,
+    scope: Option<&str>,
+    file: Option<&str>,
+) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let db_path = cwd.join(".helios/index.db");
 
@@ -54,8 +130,19 @@ pub fn run(target: &str, json: bool, compact: bool, depth: u32) -> Result<()> {
 
     let db = Database::open(&db_path).context("opening database")?;
 
-    // Determine if target is a file path or symbol name
-    let is_file = target.contains('/') || target.contains('.');
+    // Resolve a symbol target to the definitions it selects. Only those
+    // definitions' ids are queried, so `--scope`/`--file`/`Class.Method`
+    // exclude the same-named definitions the user did not mean.
+    let symbol = parse_target(target, scope, file);
+    let defs: Vec<SymbolDefinition> = match &symbol {
+        Some(t) => db.find_definitions(&t.name, t.scope.as_deref(), t.file.as_deref())?,
+        None => Vec::new(),
+    };
+    let is_file = match &symbol {
+        None => true,
+        Some(t) => t.may_be_file && defs.is_empty(),
+    };
+    let symbol_ids: Vec<i64> = defs.iter().map(|d| d.id).collect();
 
     if json {
         if is_file {
@@ -101,11 +188,12 @@ pub fn run(target: &str, json: bool, compact: bool, depth: u32) -> Result<()> {
             println!("{}", formatted);
         } else {
             // Symbol mode: ignore depth, keep depth=1 behavior
-            let deps = db.symbol_dependencies(target)?;
-            let refs = db.symbol_references(target)?;
+            let deps = db.symbol_dependencies(&symbol_ids)?;
+            let refs = db.symbol_references(&symbol_ids)?;
 
             let output = serde_json::json!({
                 "target": target,
+                "definitions": defs,
                 "dependencies": deps,
                 "dependents": refs.iter()
                     .map(|(path, line, col)| {
@@ -149,8 +237,18 @@ pub fn run(target: &str, json: bool, compact: bool, depth: u32) -> Result<()> {
             }
         } else {
             // Symbol mode: ignore depth, keep depth=1 behavior
-            let deps = db.symbol_dependencies(target)?;
-            let refs = db.symbol_references(target)?;
+            let deps = db.symbol_dependencies(&symbol_ids)?;
+            let refs = db.symbol_references(&symbol_ids)?;
+
+            if !defs.is_empty() {
+                println!("Definitions of {}:", target);
+                for def in &defs {
+                    match &def.scope {
+                        Some(s) => println!("  {}:{} (scope {})", def.path, def.line, s),
+                        None => println!("  {}:{}", def.path, def.line),
+                    }
+                }
+            }
 
             if !deps.is_empty() {
                 println!("Dependencies (imports in files defining {}):", target);
