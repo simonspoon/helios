@@ -4,6 +4,7 @@ pub mod errors;
 mod git;
 mod indexer;
 mod parsers;
+mod resolver;
 mod sidecar;
 
 use clap::{Parser, Subcommand};
@@ -78,8 +79,14 @@ enum Command {
     },
     /// Show dependencies for a symbol or file
     Deps {
-        /// Symbol name or file path to query
+        /// File path, symbol name, or one definition of it (Class.Method, path/to/file.ts:name)
         target: String,
+        /// Restrict a symbol target to definitions in this scope (class or impl block)
+        #[arg(long)]
+        scope: Option<String>,
+        /// Restrict a symbol target to definitions in files matching this path
+        #[arg(long)]
+        file: Option<String>,
         /// Transitive traversal depth (default: 1, file targets only)
         #[arg(long, default_value = "1")]
         depth: u32,
@@ -141,7 +148,19 @@ fn main() {
         ),
         Command::Files { language } => commands::files::run(language.as_deref(), cli.json, compact),
         Command::Diff => commands::diff::run(cli.json, compact),
-        Command::Deps { target, depth } => commands::deps::run(target, cli.json, compact, *depth),
+        Command::Deps {
+            target,
+            scope,
+            file,
+            depth,
+        } => commands::deps::run(
+            target,
+            cli.json,
+            compact,
+            *depth,
+            scope.as_deref(),
+            file.as_deref(),
+        ),
         Command::Summary { path } => commands::summary::run(path.as_deref(), cli.json, compact),
         Command::Status => commands::status::run(cli.json, compact),
         Command::Export { limit, offset } => {

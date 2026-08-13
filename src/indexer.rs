@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::db::{Database, SymbolRecord};
 use crate::parsers;
+use crate::resolver;
 use crate::sidecar::AnalyzeOutput;
 
 /// Choose which candidate definitions a reference resolves to.
@@ -381,6 +382,44 @@ pub fn ingest_semantic(db: &Database, semantic: Option<&AnalyzeOutput>) -> Resul
     db.set_metadata("csharp_resolver", "roslyn")
 }
 
+/// Post-index pass: point every import row at the indexed file it names.
+///
+/// Runs after the walk, not during it, because resolution needs the whole
+/// indexed file set — a file's importers are usually walked before it. Every
+/// row is re-resolved on each pass so specifiers that newly resolve (or stop
+/// resolving) after files are added or deleted stay correct. Returns the number
+/// of imports that resolved to a file.
+pub fn resolve_imports(db: &Database) -> Result<usize> {
+    let files = db.all_files()?;
+    let ids: HashMap<String, i64> = files.iter().map(|f| (f.path.clone(), f.id)).collect();
+    let paths: HashSet<String> = ids.keys().cloned().collect();
+
+    let mut resolved_count = 0;
+    let mut updates = Vec::new();
+    for import in db.all_imports_with_source()? {
+        let resolved = resolver::resolve_import(
+            &import.source_path,
+            &import.language,
+            &import.import_path,
+            &paths,
+        )
+        // An import of the file it sits in is not an edge worth recording.
+        .filter(|target| target != &import.source_path)
+        .and_then(|target| ids.get(&target).copied());
+        if resolved.is_some() {
+            resolved_count += 1;
+        }
+        // On an incremental run almost every row resolves to what it already
+        // held; only the differences are worth writing.
+        if resolved != import.resolved_file_id {
+            updates.push((import.id, resolved));
+        }
+    }
+    db.apply_import_resolutions(&updates)?;
+
+    Ok(resolved_count)
+}
+
 #[derive(Debug, Default)]
 pub struct IndexStats {
     pub files_indexed: usize,
@@ -670,6 +709,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stats.cs_changed, 2);
+    }
+
+    /// The pass runs after the walk, so importers walked before their target
+    /// still resolve; a deleted target un-resolves the edge on the next pass.
+    #[test]
+    fn resolve_imports_keys_dependents_by_file_after_the_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/util")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/domain")).unwrap();
+        std::fs::write(
+            dir.path().join("src/util/money.ts"),
+            "export function money() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/domain/cart.ts"),
+            "import { money } from '../util/money';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app.ts"),
+            "import { money } from './util/money';\nimport React from 'react';\n",
+        )
+        .unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        index_full(&db, dir.path(), None).unwrap();
+        // Before resolution the file's own path answers nothing.
+        assert!(db.file_dependents("src/util/money.ts").unwrap().is_empty());
+
+        assert_eq!(resolve_imports(&db).unwrap(), 2, "'react' has no file");
+        assert_eq!(
+            db.file_dependents("src/util/money.ts").unwrap(),
+            vec!["src/app.ts".to_string(), "src/domain/cart.ts".to_string()]
+        );
+
+        // Target deleted: the edge goes away rather than pointing at a stale id.
+        index_incremental(&db, dir.path(), &[], &["src/util/money.ts".to_string()]).unwrap();
+        resolve_imports(&db).unwrap();
+        assert!(db.file_dependents("src/util/money.ts").unwrap().is_empty());
+        assert_eq!(
+            db.file_dependencies("src/domain/cart.ts").unwrap(),
+            vec!["../util/money".to_string()]
+        );
     }
 
     #[test]

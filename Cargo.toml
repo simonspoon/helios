@@ -1,6 +1,6 @@
 [package]
 name = "helios"
-version = "0.21.0"
+version = "0.25.0"
 edition = "2024"
 
 [dependencies]
@@ -23,4 +23,5 @@ regex = "1"
 walkdir = "2"
 
 [dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"

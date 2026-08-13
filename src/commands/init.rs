@@ -65,6 +65,8 @@ pub fn run(json: bool, compact: bool, quiet: bool, timeout_secs: u64) -> Result<
         );
     }
     indexer::ingest_semantic(&db, semantic.as_ref())?;
+    // Needs the complete file set, so it runs after the walk.
+    indexer::resolve_imports(&db)?;
     let elapsed = start.elapsed();
 
     // Store current git commit if in a git repo
@@ -77,10 +79,19 @@ pub fn run(json: bool, compact: bool, quiet: bool, timeout_secs: u64) -> Result<
     // Report totals from DB (not just newly indexed counts, which are 0 on cache hits)
     let total_files = db.file_count()?;
     let total_symbols = db.symbol_count()?;
+    // Which resolver produced the C# references (P3-M7). Surfaced here, not
+    // only in `status`, so a fallback is visible in the summary rather than in
+    // a warning line that scrolls past.
+    // Only meaningful when the repo actually has C# in it.
+    let csharp_resolver = if cs_files.is_empty() {
+        None
+    } else {
+        db.get_metadata("csharp_resolver")?
+    };
 
     if !quiet {
         if json {
-            let output = serde_json::json!({
+            let mut output = serde_json::json!({
                 "files_indexed": stats.files_indexed,
                 "files_unchanged": total_files as usize - stats.files_indexed,
                 "files_errored": stats.files_errored,
@@ -88,6 +99,9 @@ pub fn run(json: bool, compact: bool, quiet: bool, timeout_secs: u64) -> Result<
                 "total_symbols": total_symbols,
                 "elapsed_ms": elapsed.as_millis(),
             });
+            if let Some(ref resolver) = csharp_resolver {
+                output["csharp_resolver"] = serde_json::json!(resolver);
+            }
             let formatted = if compact {
                 serde_json::to_string(&output)?
             } else {
@@ -115,6 +129,9 @@ pub fn run(json: bool, compact: bool, quiet: bool, timeout_secs: u64) -> Result<
                     "{} files had errors (see warnings above)",
                     stats.files_errored
                 );
+            }
+            if let Some(ref resolver) = csharp_resolver {
+                println!("C# resolver: {}", resolver);
             }
             println!("Database: {}", db_path.display());
 

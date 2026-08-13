@@ -29,6 +29,23 @@ fn helios_bin() -> PathBuf {
     path
 }
 
+/// Number of raw reference rows linked to symbols named `name`.
+///
+/// The indexer writes one row per candidate definition, so this counts the
+/// candidate links — which `deps` deliberately collapses to unique usage sites
+/// (task 837). Tests about resolution must read the rows, not the deps output.
+fn reference_rows(project: &std::path::Path, name: &str) -> i64 {
+    let conn = rusqlite::Connection::open(project.join(".helios").join("index.db"))
+        .expect("opening index.db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM references_ r JOIN symbols s ON r.symbol_id = s.id
+         WHERE s.name = ?1",
+        [name],
+        |row| row.get(0),
+    )
+    .expect("counting reference rows")
+}
+
 fn create_test_project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("creating temp dir");
 
@@ -334,6 +351,97 @@ fn test_deps_command() {
     assert!(output.status.success());
 }
 
+/// `deps <file path>` answers "who imports this file" from the file's own path,
+/// collecting importers that spelled the specifier differently, and traverses
+/// transitively because the graph edge is now file -> file.
+#[test]
+fn test_deps_file_dependents_by_path() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    std::fs::create_dir_all(dir.path().join("src/util")).unwrap();
+    std::fs::create_dir_all(dir.path().join("src/domain")).unwrap();
+    std::fs::write(
+        dir.path().join("src/util/money.ts"),
+        "export function money() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/domain/cart.ts"),
+        "import { money } from '../util/money';\nexport function cart() { money(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/app.ts"),
+        "import { money } from './util/money';\nimport { cart } from './domain/cart';\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("init");
+    assert!(output.status.success());
+
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "src/util/money.ts"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps");
+    assert!(output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("parsing deps JSON");
+    let dependents: Vec<&str> = json["dependents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        dependents,
+        vec!["src/app.ts", "src/domain/cart.ts"],
+        "both spellings of the specifier resolve to the same file"
+    );
+
+    // Transitive: app -> cart -> money, reachable only via resolved edges.
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "src/util/money.ts", "--depth", "2"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps depth");
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("parsing deps JSON");
+    let deep: Vec<(&str, u64)> = json["dependents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| (d["path"].as_str().unwrap(), d["depth"].as_u64().unwrap()))
+        .collect();
+    assert!(
+        deep.contains(&("src/app.ts", 1)) && deep.contains(&("src/domain/cart.ts", 1)),
+        "direct importers at depth 1, got {deep:?}"
+    );
+
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "src/app.ts"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps app");
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("parsing deps JSON");
+    let deps: Vec<&str> = json["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        deps,
+        vec!["src/domain/cart.ts", "src/util/money.ts"],
+        "outgoing edges report the resolved file path"
+    );
+}
+
 #[test]
 fn test_summary_command() {
     let dir = create_test_project();
@@ -625,43 +733,20 @@ namespace App {
         .expect("init");
     assert!(init.status.success(), "helios init failed");
 
-    let dependents = |target: &str| -> Vec<serde_json::Value> {
-        let output = Command::new(&bin)
-            .args(["--json", "deps", target])
-            .current_dir(dir.path())
-            .output()
-            .unwrap_or_else(|_| panic!("deps {target}"));
-        assert!(
-            output.status.success(),
-            "deps {target} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
-        value["dependents"]
-            .as_array()
-            .cloned()
-            .expect("dependents array")
-    };
-
     // "Compute" is declared in both Alpha and Beta. The single call site must be
     // linked to BOTH candidate definitions (2 reference rows), not one arbitrary
     // pick (which would yield 1) and not dropped (which would yield 0).
-    let compute_refs = dependents("Compute");
     assert_eq!(
-        compute_refs.len(),
+        reference_rows(dir.path(), "Compute"),
         2,
-        "ambiguous 'Compute' usage should link to both definitions, got: {:?}",
-        compute_refs
+        "ambiguous 'Compute' usage should link to both definitions"
     );
 
     // "OnlyHere" is declared once — no regression: exactly one linked usage.
-    let only_here_refs = dependents("OnlyHere");
     assert_eq!(
-        only_here_refs.len(),
+        reference_rows(dir.path(), "OnlyHere"),
         1,
-        "unambiguous 'OnlyHere' usage should link to its single definition, got: {:?}",
-        only_here_refs
+        "unambiguous 'OnlyHere' usage should link to its single definition"
     );
 }
 
@@ -718,45 +803,22 @@ namespace App {
         .expect("init");
     assert!(init.status.success(), "helios init failed");
 
-    let dependents = |target: &str| -> Vec<serde_json::Value> {
-        let output = Command::new(&bin)
-            .args(["--json", "deps", target])
-            .current_dir(dir.path())
-            .output()
-            .unwrap_or_else(|_| panic!("deps {target}"));
-        assert!(
-            output.status.success(),
-            "deps {target} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
-        value["dependents"]
-            .as_array()
-            .cloned()
-            .expect("dependents array")
-    };
-
     // "Compute" is declared in Alpha and Beta. The single call site lives inside
     // Alpha, so scope-aware resolution narrows it to Alpha.Compute alone — exactly
     // ONE linked usage. Under the pre-scope (story 174) behavior this would have
     // linked to both definitions, yielding 2.
-    let compute_refs = dependents("Compute");
     assert_eq!(
-        compute_refs.len(),
+        reference_rows(dir.path(), "Compute"),
         1,
-        "in-scope 'Compute' call should resolve to its own class only, got: {:?}",
-        compute_refs
+        "in-scope 'Compute' call should resolve to its own class only"
     );
 
     // "Shared" is declared in Gamma and Delta; the call site (Runner) matches
     // neither scope, so it stays ambiguous and links to BOTH definitions.
-    let shared_refs = dependents("Shared");
     assert_eq!(
-        shared_refs.len(),
+        reference_rows(dir.path(), "Shared"),
         2,
-        "unresolvable-by-scope 'Shared' call should link to all candidates, got: {:?}",
-        shared_refs
+        "unresolvable-by-scope 'Shared' call should link to all candidates"
     );
 }
 
@@ -2868,6 +2930,14 @@ fn assert_sidecar_degrades(dir: &tempfile::TempDir, helios_roslyn: &str) {
         lines[0]
     );
 
+    // The fallback is visible in the init summary itself, not only in the
+    // warning line above (which scrolls past) or in a later `status` call.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("C# resolver: treesitter"),
+        "init summary must name the resolver, got stdout: {stdout:?}"
+    );
+
     // Index usable: symbols present.
     let symbols = Command::new(&bin)
         .args(["--json", "symbols", "--file", "Person.cs"])
@@ -3398,5 +3468,255 @@ fn test_stale_count_excludes_unindexable_and_clears_after_update() {
     assert_eq!(
         json["files_indexed"], 0,
         "already-indexed content must not be re-indexed: {json}"
+    );
+}
+
+/// An ambiguous symbol name is stored with one reference row per candidate
+/// definition; `deps` must still report each usage site once (task 837).
+#[test]
+fn test_deps_symbol_references_are_deduplicated() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    std::fs::write(
+        dir.path().join("money.ts"),
+        "export function formatMoney(n: number): string { return `$${n}`; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("legacy.ts"),
+        "export function formatMoney(n: number): string { return n + ' USD'; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("cart.ts"),
+        "import { formatMoney } from './money';\nexport function total(a: number, b: number): string {\n    return formatMoney(a) + formatMoney(b);\n}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    let output = Command::new(&bin)
+        .args(["deps", "formatMoney"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps formatMoney");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let refs: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.contains("(reference)"))
+        .collect();
+    let mut unique = refs.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert!(!refs.is_empty(), "expected references, got: {stdout}");
+    assert_eq!(
+        refs.len(),
+        unique.len(),
+        "deps must not repeat a usage site, got: {stdout}"
+    );
+
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "formatMoney"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps --json formatMoney");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+    let dependents = value["dependents"].as_array().expect("dependents array");
+    let mut seen: Vec<String> = dependents.iter().map(|d| d.to_string()).collect();
+    let total = seen.len();
+    seen.sort();
+    seen.dedup();
+    assert!(total > 0, "expected dependents, got: {stdout}");
+    assert_eq!(
+        total,
+        seen.len(),
+        "JSON dependents must be unique: {stdout}"
+    );
+}
+
+/// A project with two `formatMoney` definitions whose defining files import
+/// different things, so a deps target that selects one is visibly different
+/// from one that selects the other.
+fn setup_decoy_project() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    std::fs::create_dir_all(dir.path().join("src/util")).unwrap();
+    std::fs::create_dir_all(dir.path().join("src/legacy")).unwrap();
+
+    std::fs::write(
+        dir.path().join("src/util/round.ts"),
+        "export function round(n: number): number { return Math.round(n); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/legacy/pad.ts"),
+        "export function pad(s: string): string { return ' ' + s; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/util/money.ts"),
+        "import { round } from './round';\nexport function formatMoney(n: number): string { return `$${round(n)}`; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/legacy/money.ts"),
+        "import { pad } from './pad';\nexport function formatMoney(n: number): string { return pad(n + ' USD'); }\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed during setup");
+    (dir, bin)
+}
+
+fn deps_json(bin: &PathBuf, dir: &std::path::Path, args: &[&str]) -> serde_json::Value {
+    let mut full = vec!["--json", "deps"];
+    full.extend_from_slice(args);
+    let output = Command::new(bin)
+        .args(&full)
+        .current_dir(dir)
+        .output()
+        .expect("deps --json");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("parsing deps JSON ({e}): {stdout}"))
+}
+
+fn definition_paths(value: &serde_json::Value) -> Vec<String> {
+    value["definitions"]
+        .as_array()
+        .expect("definitions array")
+        .iter()
+        .map(|d| d["path"].as_str().expect("definition path").to_string())
+        .collect()
+}
+
+#[test]
+fn test_deps_file_flag_selects_one_definition() {
+    let (dir, bin) = setup_decoy_project();
+
+    let both = deps_json(&bin, dir.path(), &["formatMoney"]);
+    assert_eq!(
+        definition_paths(&both),
+        vec!["src/legacy/money.ts", "src/util/money.ts"],
+        "an unnarrowed target still covers every definition"
+    );
+
+    let util = deps_json(&bin, dir.path(), &["formatMoney", "--file", "src/util"]);
+    assert_eq!(definition_paths(&util), vec!["src/util/money.ts"]);
+    assert_eq!(
+        util["dependencies"],
+        serde_json::json!(["./round"]),
+        "only the selected definition's file imports count: {util}"
+    );
+
+    let legacy = deps_json(&bin, dir.path(), &["formatMoney", "--file", "src/legacy"]);
+    assert_eq!(definition_paths(&legacy), vec!["src/legacy/money.ts"]);
+    assert_eq!(
+        legacy["dependencies"],
+        serde_json::json!(["./pad"]),
+        "the decoy definition's deps must not leak in: {legacy}"
+    );
+}
+
+#[test]
+fn test_deps_file_qualified_target_selects_one_definition() {
+    let (dir, bin) = setup_decoy_project();
+
+    let value = deps_json(&bin, dir.path(), &["src/util/money.ts:formatMoney"]);
+    assert_eq!(definition_paths(&value), vec!["src/util/money.ts"]);
+    assert_eq!(value["dependencies"], serde_json::json!(["./round"]));
+}
+
+#[test]
+fn test_deps_scope_flag_and_qualified_name_select_one_definition() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    std::fs::write(
+        dir.path().join("Promo.cs"),
+        "namespace App {\n  class PromoPricing { public int Compute(int x) { return x * 2; } }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("Legacy.cs"),
+        "namespace App {\n  class LegacyPricing { public int Compute(int x) { return x; } }\n}\n",
+    )
+    .unwrap();
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    // The bug this replaces: a qualified name was read as a file path, so it
+    // matched nothing at all.
+    let qualified = deps_json(&bin, dir.path(), &["PromoPricing.Compute"]);
+    let defs = qualified["definitions"].as_array().expect("definitions");
+    assert_eq!(defs.len(), 1, "expected one definition: {qualified}");
+    assert_eq!(defs[0]["path"], "Promo.cs");
+    assert_eq!(defs[0]["scope"], "PromoPricing");
+
+    let scoped = deps_json(&bin, dir.path(), &["Compute", "--scope", "LegacyPricing"]);
+    let defs = scoped["definitions"].as_array().expect("definitions");
+    assert_eq!(defs.len(), 1, "expected one definition: {scoped}");
+    assert_eq!(defs[0]["path"], "Legacy.cs");
+
+    // Unnarrowed, the name is still ambiguous.
+    let bare = deps_json(&bin, dir.path(), &["Compute"]);
+    assert_eq!(
+        bare["definitions"].as_array().expect("definitions").len(),
+        2
+    );
+}
+
+/// A dotted target that names no definition is still a module path.
+#[test]
+fn test_deps_dotted_target_falls_back_to_file_mode() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    std::fs::create_dir_all(dir.path().join("pkg")).unwrap();
+    std::fs::write(dir.path().join("pkg/__init__.py"), "").unwrap();
+    std::fs::write(
+        dir.path().join("pkg/money.py"),
+        "def fmt(n):\n    return n\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("app.py"),
+        "import pkg.money\n\ndef go():\n    return pkg.money.fmt(1)\n",
+    )
+    .unwrap();
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    let value = deps_json(&bin, dir.path(), &["pkg.money"]);
+    assert!(
+        value.get("definitions").is_none(),
+        "expected file-mode output for a module path: {value}"
+    );
+    let dependents: Vec<&str> = value["dependents"]
+        .as_array()
+        .expect("dependents array")
+        .iter()
+        .map(|d| d["path"].as_str().expect("path"))
+        .collect();
+    assert!(
+        dependents.contains(&"app.py"),
+        "expected app.py to import pkg.money: {value}"
     );
 }
