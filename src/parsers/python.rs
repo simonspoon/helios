@@ -35,6 +35,26 @@ fn text_from(source: &[u8], node: tree_sitter::Node) -> String {
         .to_string()
 }
 
+/// The local names a `from x import ...` statement binds: `from .money import
+/// format_money, tax as vat` binds `format_money` and `vat`.
+///
+/// The *local* name is what the file's own references spell, so that is what is
+/// recorded. An aliased import therefore no longer matches the definition's
+/// name, and attribution falls back to the ambiguous-name behaviour instead of
+/// pointing the usage at the wrong definition. `from x import *` binds no name
+/// the parser can see.
+fn import_from_names(source: &[u8], statement: tree_sitter::Node) -> Vec<String> {
+    let mut cursor = statement.walk();
+    statement
+        .children_by_field_name("name", &mut cursor)
+        .filter_map(|node| match node.kind() {
+            "aliased_import" => node.child_by_field_name("alias"),
+            _ => Some(node),
+        })
+        .map(|node| text_from(source, node))
+        .collect()
+}
+
 fn find_class_scope(source: &[u8], node: tree_sitter::Node) -> Option<String> {
     let mut current = node.parent();
     while let Some(parent) = current {
@@ -157,9 +177,19 @@ impl LanguageParser for PythonParser {
             for c in m.captures {
                 let text = text_from(src, c.node);
                 if !text.is_empty() {
+                    // `from x import a, b` binds a and b; plain `import x.y`
+                    // binds the module, which usages spell as a prefix
+                    // (`x.y.f()`), not as the name a reference records.
+                    let names = match c.node.parent() {
+                        Some(parent) if parent.kind() == "import_from_statement" => {
+                            import_from_names(src, parent)
+                        }
+                        _ => Vec::new(),
+                    };
                     result.imports.push(ParsedImport {
                         import_path: text,
                         alias: None,
+                        names,
                     });
                 }
             }
@@ -186,6 +216,9 @@ impl LanguageParser for PythonParser {
                     line: c.node.start_position().row as i64 + 1,
                     column: c.node.start_position().column as i64,
                     from_scope: None,
+                    // `money.format_money()` names an attribute of some
+                    // receiver, not the bare name an import binds.
+                    qualified: ref_query.capture_names()[c.index as usize] == "method_call",
                 });
             }
         }
@@ -259,6 +292,31 @@ from collections import defaultdict
         assert!(!result.imports.is_empty());
         let paths: Vec<_> = result.imports.iter().map(|i| &i.import_path).collect();
         assert!(paths.contains(&&"os".to_string()));
+    }
+
+    /// `from x import a, b as c` binds a and c; plain `import x` binds a module
+    /// name that no reference spells on its own.
+    #[test]
+    fn import_names_are_the_local_bindings() {
+        let parser = PythonParser::new();
+        let source = r#"
+from .money import format_money, tax as vat
+from ..util import helpers
+import os
+"#;
+        let result = parser.parse(source).unwrap();
+        let names = |path: &str| -> Vec<String> {
+            result
+                .imports
+                .iter()
+                .find(|i| i.import_path == path)
+                .unwrap()
+                .names
+                .clone()
+        };
+        assert_eq!(names(".money"), vec!["format_money", "vat"]);
+        assert_eq!(names("..util"), vec!["helpers"]);
+        assert!(names("os").is_empty());
     }
 
     #[test]

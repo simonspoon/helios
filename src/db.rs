@@ -97,6 +97,13 @@ pub struct ParsedSymbol {
 pub struct ParsedImport {
     pub import_path: String,
     pub alias: Option<String>,
+    /// Local names this import binds (`import { formatMoney }` binds
+    /// `formatMoney`, `import Money from` binds `Money`). Read by
+    /// `symbol_references` to attribute a file's usages to the definition it
+    /// imported rather than to every same-named definition. Empty for
+    /// languages whose parsers do not extract names, or for imports that bind
+    /// nothing usable.
+    pub names: Vec<String>,
 }
 
 /// Parsed reference data before insertion
@@ -109,6 +116,11 @@ pub struct ParsedReference {
     /// Used at index time to prefer a same-scope definition over same-named
     /// definitions elsewhere. `None` when the parser cannot supply scope.
     pub from_scope: Option<String>,
+    /// True when the usage is reached through a receiver (`wallet.format()`,
+    /// `money.formatMoney()`) rather than spelled bare (`format()`). An
+    /// import binds a bare name only, so qualified usages are exempt from
+    /// import-based attribution in `symbol_references`.
+    pub qualified: bool,
 }
 
 impl Database {
@@ -161,12 +173,19 @@ impl Database {
                 resolved_file_id INTEGER REFERENCES files(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS import_names (
+                id INTEGER PRIMARY KEY,
+                import_id INTEGER NOT NULL REFERENCES imports(id) ON DELETE CASCADE,
+                name TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS references_ (
                 id INTEGER PRIMARY KEY,
                 symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
                 file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
                 line INTEGER NOT NULL,
-                column INTEGER NOT NULL
+                column INTEGER NOT NULL,
+                qualified INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS metadata (
@@ -178,6 +197,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
             CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
             CREATE INDEX IF NOT EXISTS idx_imports_source ON imports(source_file_id);
+            CREATE INDEX IF NOT EXISTS idx_import_names_import ON import_names(import_id);
+            CREATE INDEX IF NOT EXISTS idx_import_names_name ON import_names(name);
             CREATE INDEX IF NOT EXISTS idx_refs_symbol ON references_(symbol_id);
             CREATE INDEX IF NOT EXISTS idx_refs_file ON references_(file_id);
             CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);",
@@ -208,6 +229,18 @@ impl Database {
         if !has_docid {
             self.conn
                 .execute_batch("ALTER TABLE symbols ADD COLUMN docid TEXT")?;
+        }
+
+        // Check if qualified column exists in references_ table
+        let has_qualified: bool = self
+            .conn
+            .prepare("SELECT qualified FROM references_ LIMIT 0")
+            .is_ok();
+
+        if !has_qualified {
+            self.conn.execute_batch(
+                "ALTER TABLE references_ ADD COLUMN qualified INTEGER NOT NULL DEFAULT 0",
+            )?;
         }
 
         // Check if resolved_file_id column exists in imports table
@@ -472,10 +505,25 @@ impl Database {
             "INSERT INTO imports (source_file_id, import_path, alias) VALUES (?1, ?2, ?3)",
             params![file_id, imp.import_path, imp.alias],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let import_id = self.conn.last_insert_rowid();
+        for name in &imp.names {
+            self.conn.execute(
+                "INSERT INTO import_names (import_id, name) VALUES (?1, ?2)",
+                params![import_id, name],
+            )?;
+        }
+        Ok(import_id)
     }
 
     pub fn delete_imports_for_file(&self, file_id: i64) -> Result<()> {
+        // Deleted explicitly rather than by cascade: a re-indexed file whose
+        // import names survived would attribute its references to whatever it
+        // used to import.
+        self.conn.execute(
+            "DELETE FROM import_names WHERE import_id IN
+             (SELECT id FROM imports WHERE source_file_id = ?1)",
+            params![file_id],
+        )?;
         self.conn.execute(
             "DELETE FROM imports WHERE source_file_id = ?1",
             params![file_id],
@@ -648,6 +696,30 @@ impl Database {
     /// `insert_references`), so a usage site would otherwise be emitted once
     /// per candidate. Callers want the usage sites, not the candidate fan-out,
     /// so collapse them with DISTINCT.
+    ///
+    /// Import-aware: a usage of a name the referencing file *imports* belongs
+    /// to the definition in the file it imported, so rows pointing at any other
+    /// definition of that name are dropped here — that is what makes
+    /// `deps formatMoney --file src/legacy/money.ts` list the legacy callers
+    /// rather than every caller of the name.
+    ///
+    /// Deliberately narrow, because an import binding is evidence about one
+    /// spelling only. It applies to a bare-identifier usage (`formatMoney()`),
+    /// never to a qualified one (`money.formatMoney()`, `wallet.format()`) —
+    /// those name a member reached through some other value, which the import
+    /// says nothing about. It applies only when the imported file really
+    /// defines the name, so a re-export barrel or an aliased import keeps the
+    /// all-candidates answer, and never hides a definition in the referencing
+    /// file itself, nor one in a file the referencing file also imports the
+    /// name from — a `try: from .fast import dumps / except ImportError: from
+    /// .slow import dumps` pair binds one name to two files, and both are real
+    /// answers. Languages whose specifiers name a package (Go, Swift, C#) bind
+    /// no import names and are unaffected.
+    ///
+    /// Filtered at read time rather than deleted at index time: the import
+    /// graph moves when *either* side of it changes, and an incremental update
+    /// only re-indexes the files that changed. A pruned row could not be
+    /// brought back when the file it pointed at was the one that moved.
     pub fn symbol_references(&self, symbol_ids: &[i64]) -> Result<Vec<(String, i64, i64)>> {
         if symbol_ids.is_empty() {
             return Ok(Vec::new());
@@ -656,7 +728,31 @@ impl Database {
             "SELECT DISTINCT f.path, r.line, r.column
              FROM references_ r
              JOIN files f ON r.file_id = f.id
+             JOIN symbols s ON s.id = r.symbol_id
              WHERE r.symbol_id IN ({})
+               AND (
+                 r.qualified = 1
+                 OR s.file_id = r.file_id
+                 OR EXISTS (
+                     SELECT 1 FROM imports i2
+                     JOIN import_names n2 ON n2.import_id = i2.id
+                     WHERE i2.source_file_id = r.file_id
+                       AND n2.name = s.name
+                       AND i2.resolved_file_id = s.file_id
+                 )
+                 OR NOT EXISTS (
+                     SELECT 1 FROM imports i
+                     JOIN import_names n ON n.import_id = i.id
+                     WHERE i.source_file_id = r.file_id
+                       AND n.name = s.name
+                       AND i.resolved_file_id IS NOT NULL
+                       AND i.resolved_file_id <> s.file_id
+                       AND EXISTS (
+                           SELECT 1 FROM symbols d
+                           WHERE d.file_id = i.resolved_file_id AND d.name = s.name
+                       )
+                 )
+               )
              ORDER BY f.path, r.line, r.column",
             placeholders(symbol_ids.len())
         ))?;
@@ -679,10 +775,12 @@ impl Database {
         file_id: i64,
         line: i64,
         column: i64,
+        qualified: bool,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO references_ (symbol_id, file_id, line, column) VALUES (?1, ?2, ?3, ?4)",
-            params![symbol_id, file_id, line, column],
+            "INSERT INTO references_ (symbol_id, file_id, line, column, qualified)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![symbol_id, file_id, line, column, qualified],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -699,9 +797,10 @@ impl Database {
         file_id: i64,
         line: i64,
         column: i64,
+        qualified: bool,
     ) -> Result<usize> {
         for &symbol_id in symbol_ids {
-            self.insert_reference(symbol_id, file_id, line, column)?;
+            self.insert_reference(symbol_id, file_id, line, column, qualified)?;
         }
         Ok(symbol_ids.len())
     }
@@ -1019,6 +1118,7 @@ mod tests {
         let imp = ParsedImport {
             import_path: "std::collections::HashMap".to_string(),
             alias: None,
+            names: Vec::new(),
         };
         db.insert_import(file_id, &imp).unwrap();
 
@@ -1048,6 +1148,7 @@ mod tests {
                     &ParsedImport {
                         import_path: path.to_string(),
                         alias: None,
+                        names: Vec::new(),
                     },
                 )
                 .unwrap();

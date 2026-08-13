@@ -148,6 +148,7 @@ impl LanguageParser for GoParser {
                     result.imports.push(ParsedImport {
                         import_path: path,
                         alias: None,
+                        names: Vec::new(),
                     });
                 }
             }
@@ -174,6 +175,7 @@ impl LanguageParser for GoParser {
                     line: c.node.start_position().row as i64 + 1,
                     column: c.node.start_position().column as i64,
                     from_scope: None,
+                    qualified: ref_query.capture_names()[c.index as usize] == "method_call",
                 });
             }
         }

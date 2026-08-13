@@ -273,7 +273,13 @@ pub fn index_file(
             let candidates = db.find_symbol_by_name(&reference.symbol_name)?;
             let symbol_ids =
                 resolve_reference_candidates(reference.from_scope.as_deref(), &candidates);
-            db.insert_references(&symbol_ids, file_id, reference.line, reference.column)?;
+            db.insert_references(
+                &symbol_ids,
+                file_id,
+                reference.line,
+                reference.column,
+                reference.qualified,
+            )?;
         }
     }
 
@@ -376,7 +382,15 @@ pub fn ingest_semantic(db: &Database, semantic: Option<&AnalyzeOutput>) -> Resul
         let Some(file) = db.get_file_by_path(&reference.file)? else {
             continue;
         };
-        db.insert_references(symbol_ids, file.id, reference.line, reference.col - 1)?;
+        // Semantic rows resolve exactly by DocId, so the bare/qualified
+        // distinction the import filter needs does not apply to them.
+        db.insert_references(
+            symbol_ids,
+            file.id,
+            reference.line,
+            reference.col - 1,
+            false,
+        )?;
     }
 
     db.set_metadata("csharp_resolver", "roslyn")
@@ -598,8 +612,8 @@ mod tests {
         let helper = add_symbol(&db, py_file, "helper", 2, "util");
 
         // Stale tree-sitter rows: one sourced from a .cs file, one from .py
-        db.insert_reference(save, cs_file, 20, 3).unwrap();
-        db.insert_reference(helper, py_file, 9, 0).unwrap();
+        db.insert_reference(save, cs_file, 20, 3, false).unwrap();
+        db.insert_reference(helper, py_file, 9, 0, false).unwrap();
 
         let output = AnalyzeOutput {
             definitions: vec![def("M:App.A.Save", "Save", "A.cs", 5)],
@@ -752,6 +766,319 @@ mod tests {
         assert_eq!(
             db.file_dependencies("src/domain/cart.ts").unwrap(),
             vec!["../util/money".to_string()]
+        );
+    }
+
+    /// Files referencing `formatMoney`, keyed by the definition they are
+    /// attributed to.
+    fn callers_of(db: &Database, name: &str, defined_in: &str) -> Vec<String> {
+        let ids: Vec<i64> = db
+            .find_symbol_by_name(name)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, path)| path == defined_in)
+            .map(|(sym, _)| sym.id)
+            .collect();
+        let mut paths: Vec<String> = db
+            .symbol_references(&ids)
+            .unwrap()
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// Two definitions of one name: each importer's usages belong to the
+    /// definition it imported, and a file that imports neither still lists
+    /// against both (nothing says which it means).
+    #[test]
+    fn references_attribute_to_the_imported_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["src/util", "src/legacy", "src/domain", "src/reports"] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        std::fs::write(
+            dir.path().join("src/util/money.ts"),
+            "export function formatMoney() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/legacy/money.ts"),
+            "export function formatMoney() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/domain/cart.ts"),
+            "import { formatMoney } from '../util/money';\nexport const t = () => formatMoney();\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/reports/audit.ts"),
+            "import { formatMoney } from '../legacy/money';\nexport const a = () => formatMoney();\n",
+        )
+        .unwrap();
+        // No import of the name at all — ambiguous, so both keep the caller.
+        std::fs::write(
+            dir.path().join("src/reports/globals.ts"),
+            "export const g = () => formatMoney();\n",
+        )
+        .unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        index_full(&db, dir.path(), None).unwrap();
+        // Before resolution every caller counts against both definitions.
+        assert_eq!(
+            callers_of(&db, "formatMoney", "src/util/money.ts").len(),
+            3,
+            "all callers attributed to both definitions at index time"
+        );
+
+        resolve_imports(&db).unwrap();
+
+        assert_eq!(
+            callers_of(&db, "formatMoney", "src/util/money.ts"),
+            vec![
+                "src/domain/cart.ts".to_string(),
+                "src/reports/globals.ts".to_string()
+            ]
+        );
+        assert_eq!(
+            callers_of(&db, "formatMoney", "src/legacy/money.ts"),
+            vec![
+                "src/reports/audit.ts".to_string(),
+                "src/reports/globals.ts".to_string()
+            ]
+        );
+    }
+
+    /// An importer that switches specifiers moves with it: the re-index must
+    /// drop the old import's names, or its usages stay attributed to the file
+    /// it no longer imports.
+    #[test]
+    fn attribution_follows_a_changed_import() {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["src/util", "src/legacy"] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        std::fs::write(
+            dir.path().join("src/util/money.ts"),
+            "export function formatMoney() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/legacy/money.ts"),
+            "export function formatMoney() {}\n",
+        )
+        .unwrap();
+        let cart = dir.path().join("src/cart.ts");
+        std::fs::write(
+            &cart,
+            "import { formatMoney } from './util/money';\nexport const t = () => formatMoney();\n",
+        )
+        .unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        index_full(&db, dir.path(), None).unwrap();
+        resolve_imports(&db).unwrap();
+        assert_eq!(
+            callers_of(&db, "formatMoney", "src/legacy/money.ts"),
+            Vec::<String>::new()
+        );
+
+        std::fs::write(
+            &cart,
+            "import { formatMoney } from './legacy/money';\nexport const t = () => formatMoney();\n",
+        )
+        .unwrap();
+        index_incremental(&db, dir.path(), &["src/cart.ts".to_string()], &[]).unwrap();
+        resolve_imports(&db).unwrap();
+
+        assert_eq!(
+            callers_of(&db, "formatMoney", "src/legacy/money.ts"),
+            vec!["src/cart.ts".to_string()]
+        );
+        assert_eq!(
+            callers_of(&db, "formatMoney", "src/util/money.ts"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// An import binds a bare name, so it says nothing about usages reached
+    /// through a receiver: a method call and a namespace-qualified call keep
+    /// their attribution even when the same name is imported in that file.
+    #[test]
+    fn qualified_usages_are_exempt_from_import_attribution() {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["src/util", "src/legacy"] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        std::fs::write(
+            dir.path().join("src/util/money.ts"),
+            "export function formatMoney() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/legacy/money.ts"),
+            "export function formatMoney() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/widget.ts"),
+            "export class Widget {\n  formatMoney() { return 1; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/cart.ts"),
+            "import { formatMoney } from './util/money';\n\
+             import { Widget } from './widget';\n\
+             import * as legacy from './legacy/money';\n\
+             const w = new Widget();\n\
+             export const t = () => formatMoney() + w.formatMoney() + legacy.formatMoney();\n",
+        )
+        .unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        index_full(&db, dir.path(), None).unwrap();
+        resolve_imports(&db).unwrap();
+
+        // `w.formatMoney()` is the widget's method, not the imported function.
+        assert_eq!(
+            callers_of(&db, "formatMoney", "src/widget.ts"),
+            vec!["src/cart.ts".to_string()]
+        );
+        // `legacy.formatMoney()` goes through the namespace binding, so the
+        // legacy definition keeps the caller too.
+        assert_eq!(
+            callers_of(&db, "formatMoney", "src/legacy/money.ts"),
+            vec!["src/cart.ts".to_string()]
+        );
+    }
+
+    /// One local name bound to two files — the `try: import fast / except
+    /// ImportError: import slow` idiom — has two real answers, so both keep the
+    /// usage rather than each cancelling the other out.
+    #[test]
+    fn a_name_imported_from_two_files_keeps_both_definitions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("pkg")).unwrap();
+        std::fs::write(dir.path().join("pkg/__init__.py"), "").unwrap();
+        std::fs::write(dir.path().join("pkg/fast.py"), "def dumps():\n    pass\n").unwrap();
+        std::fs::write(dir.path().join("pkg/slow.py"), "def dumps():\n    pass\n").unwrap();
+        std::fs::write(
+            dir.path().join("pkg/app.py"),
+            "try:\n    from .fast import dumps\nexcept ImportError:\n    from .slow import dumps\n\
+             \n\ndef go():\n    return dumps()\n",
+        )
+        .unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        index_full(&db, dir.path(), None).unwrap();
+        // `app.py` is walked before its targets, so its references land on the
+        // re-index; both passes then see the whole file set.
+        index_incremental(&db, dir.path(), &["pkg/app.py".to_string()], &[]).unwrap();
+        resolve_imports(&db).unwrap();
+
+        for target in ["pkg/fast.py", "pkg/slow.py"] {
+            assert_eq!(
+                callers_of(&db, "dumps", target),
+                vec!["pkg/app.py".to_string()],
+                "{target} lost the usage"
+            );
+        }
+    }
+
+    /// Attribution is a read-time view of the import graph, not a deletion: a
+    /// change on the *defining* side, which never re-indexes the referencing
+    /// file, must not leave the usage attributed to nothing at all.
+    #[test]
+    fn a_changed_definition_does_not_strand_the_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["src/util", "src/legacy"] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        let util = dir.path().join("src/util/money.ts");
+        std::fs::write(&util, "export function formatMoney() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/legacy/money.ts"),
+            "export function formatMoney() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/cart.ts"),
+            "import { formatMoney } from './util/money';\nexport const t = () => formatMoney();\n",
+        )
+        .unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        index_full(&db, dir.path(), None).unwrap();
+        resolve_imports(&db).unwrap();
+        assert_eq!(
+            callers_of(&db, "formatMoney", "src/util/money.ts"),
+            vec!["src/cart.ts".to_string()]
+        );
+
+        // The imported definition is renamed; `cart.ts` itself does not change,
+        // so an incremental update never revisits its reference rows.
+        std::fs::write(&util, "export function formatMoneyV2() {}\n").unwrap();
+        index_incremental(&db, dir.path(), &["src/util/money.ts".to_string()], &[]).unwrap();
+        resolve_imports(&db).unwrap();
+
+        // The import no longer names a definition in that file, so the usage
+        // falls back to the remaining candidate instead of vanishing.
+        assert_eq!(
+            callers_of(&db, "formatMoney", "src/legacy/money.ts"),
+            vec!["src/cart.ts".to_string()]
+        );
+    }
+
+    /// Python `from .money import format_money` disambiguates the same way,
+    /// while an aliased import — whose local name no definition carries —
+    /// keeps the ambiguous-name behaviour rather than guessing.
+    #[test]
+    fn python_from_imports_attribute_and_aliases_fall_back() {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["pkg/util", "pkg/legacy", "pkg/domain"] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        for init in ["pkg", "pkg/util", "pkg/legacy", "pkg/domain"] {
+            std::fs::write(dir.path().join(init).join("__init__.py"), "").unwrap();
+        }
+        std::fs::write(
+            dir.path().join("pkg/util/money.py"),
+            "def format_money():\n    pass\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("pkg/legacy/money.py"),
+            "def format_money():\n    pass\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("pkg/domain/cart.py"),
+            "from ..util.money import format_money\n\ndef total():\n    return format_money()\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("pkg/domain/audit.py"),
+            "from ..legacy.money import format_money as fm\n\ndef audit():\n    return fm()\n",
+        )
+        .unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        index_full(&db, dir.path(), None).unwrap();
+        resolve_imports(&db).unwrap();
+
+        assert_eq!(
+            callers_of(&db, "format_money", "pkg/util/money.py"),
+            vec!["pkg/domain/cart.py".to_string()]
+        );
+        // `fm()` is a reference to `fm`, a name no definition carries — the
+        // alias is not resolved, so nothing is attributed and nothing is lost.
+        assert_eq!(
+            callers_of(&db, "format_money", "pkg/legacy/money.py"),
+            Vec::<String>::new()
         );
     }
 

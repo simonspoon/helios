@@ -208,6 +208,17 @@ carries a `definitions` array (path, line, scope) so the selection is visible.
 A dotted target that names no definition is retried as a file, so a module path
 such as `pkg.util.money` still works.
 
+The resolved imports also decide which definition a *usage* belongs to: when a
+file imports `formatMoney` from a specifier that resolves to
+`src/legacy/money.ts`, its bare `formatMoney()` calls are listed against that
+definition only, so `--file src/legacy/money.ts` prints the legacy callers
+rather than every caller of the name. The narrowing is deliberately
+conservative — a qualified usage (`wallet.formatMoney()`, `legacy.formatMoney()`),
+a file that does not import the name, an aliased or unresolved import, and an
+import of a file that does not define the name all keep the all-definitions
+answer instead of guessing. C# under the Roslyn helper resolves each usage
+exactly and is unaffected.
+
 Import specifiers are resolved to indexed files at index time, so both
 directions answer from the real file path however each importer spelled the
 specifier (`./money`, `../util/money`, `crate::util::money`), and `--depth`
@@ -312,7 +323,9 @@ helios-roslyn/       Optional .NET helper: Roslyn-based C# reference resolution
 - **files** — Path, content hash (SHA256), language, last indexed timestamp
 - **symbols** — Name, kind, visibility, scope, file reference, line/column
 - **imports** — Source file, import path, alias, optional resolved file
-- **references_** — Symbol reference locations across files
+- **import_names** — Local names each import binds (used to attribute usages)
+- **references_** — Symbol reference locations across files, and whether the
+  usage was `qualified` (reached through a receiver)
 - **metadata** — Key-value store (e.g., `last_indexed_commit`)
 
 Content hashing ensures unchanged files are skipped even without git.

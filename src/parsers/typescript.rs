@@ -53,6 +53,61 @@ fn find_class_scope(source: &[u8], node: tree_sitter::Node) -> Option<String> {
     None
 }
 
+/// The local names an import statement binds: `import Money, { formatMoney,
+/// tax as vat } from './money'` binds `Money`, `formatMoney` and `vat`.
+///
+/// The *local* name is what the file's own references spell, so that is what is
+/// recorded. An aliased import therefore no longer matches the definition's
+/// name, and attribution falls back to the ambiguous-name behaviour instead of
+/// pointing the usage at the wrong definition. A bare side-effect import
+/// (`import './polyfill'`) binds nothing.
+fn import_names(source: &[u8], import: tree_sitter::Node) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut cursor = import.walk();
+    let clause = import
+        .children(&mut cursor)
+        .find(|n| n.kind() == "import_clause");
+    let Some(clause) = clause else {
+        return names;
+    };
+
+    let mut clause_cursor = clause.walk();
+    for child in clause.named_children(&mut clause_cursor) {
+        match child.kind() {
+            // `import Money from './money'`
+            "identifier" => names.push(text_from(source, child)),
+            // `import * as money from './money'` — the namespace binding, not
+            // the members reached through it.
+            "namespace_import" => {
+                let mut ns_cursor = child.walk();
+                names.extend(
+                    child
+                        .named_children(&mut ns_cursor)
+                        .filter(|n| n.kind() == "identifier")
+                        .map(|n| text_from(source, n)),
+                );
+            }
+            // `import { formatMoney, tax as vat } from './money'`
+            "named_imports" => {
+                let mut specs = child.walk();
+                for spec in child.named_children(&mut specs) {
+                    if spec.kind() != "import_specifier" {
+                        continue;
+                    }
+                    if let Some(local) = spec
+                        .child_by_field_name("alias")
+                        .or_else(|| spec.child_by_field_name("name"))
+                    {
+                        names.push(text_from(source, local));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
 fn is_exported(node: tree_sitter::Node) -> bool {
     if let Some(parent) = node.parent() {
         parent.kind() == "export_statement"
@@ -168,7 +223,7 @@ impl LanguageParser for TypeScriptParser {
         let import_query = Query::new(
             &self.language,
             r#"
-            (import_statement source: (string) @import_path)
+            (import_statement) @import
             "#,
         )
         .context("compiling TS/JS import query")?;
@@ -178,14 +233,17 @@ impl LanguageParser for TypeScriptParser {
 
         while let Some(m) = matches.next() {
             for c in m.captures {
-                let text = text_from(src, c.node);
-                let path = text
+                let Some(source_node) = c.node.child_by_field_name("source") else {
+                    continue;
+                };
+                let path = text_from(src, source_node)
                     .trim_matches(|c: char| c == '\'' || c == '"')
                     .to_string();
                 if !path.is_empty() {
                     result.imports.push(ParsedImport {
                         import_path: path,
                         alias: None,
+                        names: import_names(src, c.node),
                     });
                 }
             }
@@ -213,6 +271,9 @@ impl LanguageParser for TypeScriptParser {
                     line: c.node.start_position().row as i64 + 1,
                     column: c.node.start_position().column as i64,
                     from_scope: None,
+                    // `money.formatMoney()` names a member of some receiver,
+                    // not the bare name an import binds.
+                    qualified: ref_query.capture_names()[c.index as usize] == "method_call",
                 });
             }
         }
@@ -324,6 +385,32 @@ import * as path from 'path';
         assert!(paths.contains(&&"react".to_string()));
         assert!(paths.contains(&&"axios".to_string()));
         assert!(paths.contains(&&"path".to_string()));
+    }
+
+    /// The local names an import binds — what the file's own references spell.
+    #[test]
+    fn import_names_are_the_local_bindings() {
+        let parser = TypeScriptParser::new("typescript");
+        let source = r#"
+import { formatMoney, tax as vat } from './money';
+import Money from './money-class';
+import * as fmt from './fmt';
+import './polyfill';
+"#;
+        let result = parser.parse(source).unwrap();
+        let names = |path: &str| -> Vec<String> {
+            result
+                .imports
+                .iter()
+                .find(|i| i.import_path == path)
+                .unwrap()
+                .names
+                .clone()
+        };
+        assert_eq!(names("./money"), vec!["formatMoney", "vat"]);
+        assert_eq!(names("./money-class"), vec!["Money"]);
+        assert_eq!(names("./fmt"), vec!["fmt"]);
+        assert!(names("./polyfill").is_empty());
     }
 
     #[test]

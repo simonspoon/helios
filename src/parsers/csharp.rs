@@ -242,6 +242,7 @@ impl LanguageParser for CSharpParser {
                                 result.imports.push(ParsedImport {
                                     import_path: path,
                                     alias: Some(alias_text.clone()),
+                                    names: Vec::new(),
                                 });
                             }
                             break;
@@ -260,6 +261,7 @@ impl LanguageParser for CSharpParser {
                         result.imports.push(ParsedImport {
                             import_path: text,
                             alias: None,
+                            names: Vec::new(),
                         });
                     }
                 }
@@ -312,6 +314,7 @@ impl LanguageParser for CSharpParser {
                         line: c.node.start_position().row as i64 + 1,
                         column: c.node.start_position().column as i64,
                         from_scope: find_scope(src, c.node),
+                        qualified: cap_name == "member_call",
                     });
                 }
             }

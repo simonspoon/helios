@@ -175,6 +175,7 @@ impl LanguageParser for SwiftParser {
                     result.imports.push(ParsedImport {
                         import_path: text,
                         alias: None,
+                        names: Vec::new(),
                     });
                 }
             }
@@ -200,6 +201,8 @@ impl LanguageParser for SwiftParser {
                     line: c.node.start_position().row as i64 + 1,
                     column: c.node.start_position().column as i64,
                     from_scope: None,
+                    // Only bare calls are captured.
+                    qualified: false,
                 });
             }
         }
