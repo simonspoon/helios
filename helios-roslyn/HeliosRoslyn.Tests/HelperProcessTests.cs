@@ -25,6 +25,9 @@ public class HelperProcessTests
         var record = doc.RootElement;
         Assert.Equal("ping", record.GetProperty("type").GetString());
         Assert.True(record.GetProperty("available").GetBoolean());
+        // helios gates semantic mode on this: a helper that cannot report a
+        // contract version is refused before analyze.
+        Assert.True(record.GetProperty("protocol_version").GetInt32() >= 1);
         Assert.False(string.IsNullOrEmpty(record.GetProperty("dotnet_version").GetString()));
         Assert.False(string.IsNullOrEmpty(record.GetProperty("roslyn_version").GetString()));
     }

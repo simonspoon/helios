@@ -19,6 +19,13 @@ use std::time::{Duration, Instant};
 /// (architect decision on spec A2: .NET 8.0 LTS).
 const DOTNET_MAJOR_FLOOR: u64 = 8;
 
+/// Version floor for the helper's own wire contract, reported by `ping` as
+/// `protocol_version`. A helper below the floor (or old enough not to report
+/// one at all) is refused *before* analyze: it would otherwise pass the probe
+/// and then fail on a call it does not understand, leaving the run on the
+/// tree-sitter path while the user believes semantic mode is installed.
+const PROTOCOL_FLOOR: u64 = 1;
+
 /// Default wall-clock timeout for `analyze` (P3-S1); a hung helper degrades
 /// instead of blocking `init` indefinitely. Overridable via `init --timeout`.
 pub const ANALYZE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -162,6 +169,10 @@ struct PingRecord {
     #[serde(rename = "type")]
     record_type: String,
     available: bool,
+    /// Absent on helpers released before the field existed; those are stale by
+    /// definition, so a missing value reads as protocol 0.
+    #[serde(default)]
+    protocol_version: u64,
     dotnet_version: String,
 }
 
@@ -190,8 +201,9 @@ enum Decision {
 }
 
 /// Pure decision function (P3-M1): semantic mode iff the DLL was found, `ping`
-/// exited 0 with a parseable record, `available == true`, and the dotnet major
-/// version is at/above the floor. Anything else → syntactic mode.
+/// exited 0 with a parseable record, `available == true`, the helper's protocol
+/// version and the dotnet major version are both at/above their floors.
+/// Anything else → syntactic mode.
 fn decide(probe: ProbeResult) -> Decision {
     match probe {
         ProbeResult::DllNotFound => Decision::Syntactic(None),
@@ -209,6 +221,14 @@ fn decide(probe: ProbeResult) -> Decision {
                 return Decision::Syntactic(Some(
                     "helios-roslyn reports available=false; resolving C# references with tree-sitter".into(),
                 ));
+            }
+            if record.protocol_version < PROTOCOL_FLOOR {
+                return Decision::Syntactic(Some(format!(
+                    "helios-roslyn is too old for helios {} (helper protocol {}, need {}); run `brew upgrade helios-csharp`; resolving C# references with tree-sitter",
+                    env!("CARGO_PKG_VERSION"),
+                    record.protocol_version,
+                    PROTOCOL_FLOOR
+                )));
             }
             match dotnet_major(&record.dotnet_version) {
                 Some(major) if major >= DOTNET_MAJOR_FLOOR => Decision::Semantic,
@@ -392,9 +412,14 @@ mod tests {
     use super::*;
 
     fn ping(available: bool, dotnet_version: &str) -> ProbeResult {
+        ping_with_protocol(available, dotnet_version, PROTOCOL_FLOOR)
+    }
+
+    fn ping_with_protocol(available: bool, dotnet_version: &str, protocol: u64) -> ProbeResult {
         ProbeResult::Ping(PingRecord {
             record_type: "ping".into(),
             available,
+            protocol_version: protocol,
             dotnet_version: dotnet_version.into(),
         })
     }
@@ -436,6 +461,29 @@ mod tests {
     }
 
     #[test]
+    fn decide_stale_helper_warns_with_upgrade_remedy() {
+        // A helper too old to report a protocol version passes every other
+        // check and then fails at analyze time — refuse it up front.
+        let Decision::Syntactic(Some(reason)) =
+            decide(ping_with_protocol(true, "8.0.11", PROTOCOL_FLOOR - 1))
+        else {
+            panic!("stale helper must not reach semantic mode");
+        };
+        assert!(
+            reason.contains("brew upgrade helios-csharp"),
+            "warning must name the remedy: {reason}"
+        );
+    }
+
+    #[test]
+    fn decide_newer_helper_protocol_is_semantic() {
+        assert_eq!(
+            decide(ping_with_protocol(true, "8.0.11", PROTOCOL_FLOOR + 1)),
+            Decision::Semantic
+        );
+    }
+
+    #[test]
     fn decide_runtime_below_floor_warns() {
         assert_warns(decide(ping(true, "7.0.20")));
     }
@@ -456,11 +504,20 @@ mod tests {
     #[test]
     fn parse_ping_reads_capability_record() {
         let record = parse_ping(
-            "{\"type\":\"ping\",\"available\":true,\"dotnet_version\":\"8.0.11\",\"roslyn_version\":\"4.11.0\"}\n",
+            "{\"type\":\"ping\",\"available\":true,\"protocol_version\":1,\"dotnet_version\":\"8.0.11\",\"roslyn_version\":\"4.11.0\"}\n",
         )
         .expect("ping record");
         assert!(record.available);
+        assert_eq!(record.protocol_version, 1);
         assert_eq!(record.dotnet_version, "8.0.11");
+    }
+
+    #[test]
+    fn parse_ping_treats_missing_protocol_as_stale() {
+        let record =
+            parse_ping("{\"type\":\"ping\",\"available\":true,\"dotnet_version\":\"8.0.11\"}\n")
+                .expect("ping record");
+        assert_eq!(record.protocol_version, 0);
     }
 
     #[test]

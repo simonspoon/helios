@@ -2930,6 +2930,14 @@ fn assert_sidecar_degrades(dir: &tempfile::TempDir, helios_roslyn: &str) {
         lines[0]
     );
 
+    // The fallback is visible in the init summary itself, not only in the
+    // warning line above (which scrolls past) or in a later `status` call.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("C# resolver: treesitter"),
+        "init summary must name the resolver, got stdout: {stdout:?}"
+    );
+
     // Index usable: symbols present.
     let symbols = Command::new(&bin)
         .args(["--json", "symbols", "--file", "Person.cs"])

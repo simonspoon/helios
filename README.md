@@ -81,17 +81,27 @@ then set `HELIOS_ROSLYN=<dir>/helios-roslyn.dll`.
 
 ### Verify
 
-Run `helios init` in a C# project, then:
+Run `helios init` in a C# project; the summary names the resolver, and so does
+`helios status` afterwards:
 
 ```bash
-helios status
+helios init
 # ...
 # C# resolver: roslyn
 ```
 
 `C# resolver: treesitter` means the helper wasn't used — a `warning:` line during
-`init` says why (dotnet missing, runtime below .NET 8, helper failed). A missing
-helper with no `HELIOS_ROSLYN` set falls back silently by design.
+`init` says why (dotnet missing, runtime below .NET 8, helper too old, helper
+failed). A missing helper with no `HELIOS_ROSLYN` set falls back silently by
+design.
+
+The helper ships with helios and reports a contract version to `helios init`; a
+helper older than the helios binary expects is refused up front rather than
+failing mid-analyze. Upgrade both together:
+
+```bash
+brew upgrade helios helios-csharp
+```
 
 ## Usage
 

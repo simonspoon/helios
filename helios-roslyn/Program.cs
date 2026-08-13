@@ -54,12 +54,21 @@ internal static class Program
         }
     }
 
+    /// <summary>
+    /// Wire-contract version of this helper, reported by `ping` so helios can
+    /// refuse semantic mode against a helper too old for its own calls instead
+    /// of discovering the mismatch at analyze time. Bump whenever the contract
+    /// gains something helios may rely on (1: `analyze --files`).
+    /// </summary>
+    private const int ProtocolVersion = 1;
+
     private static void Ping(TextWriter stdout)
     {
         WriteRecord(stdout, new
         {
             type = "ping",
             available = true,
+            protocol_version = ProtocolVersion,
             dotnet_version = Environment.Version.ToString(),
             roslyn_version = typeof(Compilation).Assembly.GetName().Version?.ToString() ?? "unknown",
         });
