@@ -351,6 +351,97 @@ fn test_deps_command() {
     assert!(output.status.success());
 }
 
+/// `deps <file path>` answers "who imports this file" from the file's own path,
+/// collecting importers that spelled the specifier differently, and traverses
+/// transitively because the graph edge is now file -> file.
+#[test]
+fn test_deps_file_dependents_by_path() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    std::fs::create_dir_all(dir.path().join("src/util")).unwrap();
+    std::fs::create_dir_all(dir.path().join("src/domain")).unwrap();
+    std::fs::write(
+        dir.path().join("src/util/money.ts"),
+        "export function money() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/domain/cart.ts"),
+        "import { money } from '../util/money';\nexport function cart() { money(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/app.ts"),
+        "import { money } from './util/money';\nimport { cart } from './domain/cart';\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("init");
+    assert!(output.status.success());
+
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "src/util/money.ts"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps");
+    assert!(output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("parsing deps JSON");
+    let dependents: Vec<&str> = json["dependents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        dependents,
+        vec!["src/app.ts", "src/domain/cart.ts"],
+        "both spellings of the specifier resolve to the same file"
+    );
+
+    // Transitive: app -> cart -> money, reachable only via resolved edges.
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "src/util/money.ts", "--depth", "2"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps depth");
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("parsing deps JSON");
+    let deep: Vec<(&str, u64)> = json["dependents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| (d["path"].as_str().unwrap(), d["depth"].as_u64().unwrap()))
+        .collect();
+    assert!(
+        deep.contains(&("src/app.ts", 1)) && deep.contains(&("src/domain/cart.ts", 1)),
+        "direct importers at depth 1, got {deep:?}"
+    );
+
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "src/app.ts"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps app");
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("parsing deps JSON");
+    let deps: Vec<&str> = json["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        deps,
+        vec!["src/domain/cart.ts", "src/util/money.ts"],
+        "outgoing edges report the resolved file path"
+    );
+}
+
 #[test]
 fn test_summary_command() {
     let dir = create_test_project();

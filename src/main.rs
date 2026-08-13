@@ -4,6 +4,7 @@ pub mod errors;
 mod git;
 mod indexer;
 mod parsers;
+mod resolver;
 mod sidecar;
 
 use clap::{Parser, Subcommand};

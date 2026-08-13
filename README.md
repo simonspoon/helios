@@ -159,12 +159,13 @@ src/lib.rs:10:4 struct pub Parser
 Show dependencies and dependents for a symbol or file. Auto-detects the target type: paths containing `/` or `.` are treated as files, otherwise as symbols.
 
 ```bash
-# File dependencies
-helios deps "src/parser.rs"
-# Dependencies (what src/parser.rs imports):
-#   src/parser.rs -> std::collections (import)
-# Dependents (what imports src/parser.rs):
-#   src/main.rs -> src/parser.rs (import)
+# File dependencies and dependents, both keyed by the file's own path
+helios deps "src/util/money.ts"
+# Dependencies (what src/util/money.ts imports):
+#   -> std::collections (depth 1)
+# Dependents (what imports src/util/money.ts):
+#   -> src/domain/cart.ts (depth 1)
+#   -> src/app.ts (depth 1)
 
 # Transitive file dependencies (depth 3)
 helios deps "src/parser.rs" --depth 3
@@ -174,6 +175,15 @@ helios deps "parse_token"
 ```
 
 - `--depth <N>` — Transitive traversal depth (default: 1, file targets only)
+
+Import specifiers are resolved to indexed files at index time, so both
+directions answer from the real file path however each importer spelled the
+specifier (`./money`, `../util/money`, `crate::util::money`), and `--depth`
+traverses file to file. Resolution covers TypeScript/JavaScript (relative
+specifiers), Python (relative and dotted-absolute modules) and Rust
+(`crate::` / `self::` / `super::` paths). Go, Swift and C# specifiers name a
+package or namespace rather than a file: they are reported as raw specifier
+text, and a raw specifier still works as a `deps` target.
 
 ### `helios summary [PATH]`
 
@@ -248,6 +258,7 @@ commands/
   files.rs           File-level metadata listing
   export.rs          Full index export
 indexer.rs           Coordinates parsing and DB insertion
+resolver.rs          Resolves import specifiers to indexed files
 parsers/
   mod.rs             Language detection & parser factory
   rust_parser.rs     Functions, structs, traits, enums, mods

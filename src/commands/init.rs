@@ -65,6 +65,8 @@ pub fn run(json: bool, compact: bool, quiet: bool, timeout_secs: u64) -> Result<
         );
     }
     indexer::ingest_semantic(&db, semantic.as_ref())?;
+    // Needs the complete file set, so it runs after the walk.
+    indexer::resolve_imports(&db)?;
     let elapsed = start.elapsed();
 
     // Store current git commit if in a git repo
