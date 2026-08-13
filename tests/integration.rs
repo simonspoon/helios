@@ -29,6 +29,23 @@ fn helios_bin() -> PathBuf {
     path
 }
 
+/// Number of raw reference rows linked to symbols named `name`.
+///
+/// The indexer writes one row per candidate definition, so this counts the
+/// candidate links — which `deps` deliberately collapses to unique usage sites
+/// (task 837). Tests about resolution must read the rows, not the deps output.
+fn reference_rows(project: &std::path::Path, name: &str) -> i64 {
+    let conn = rusqlite::Connection::open(project.join(".helios").join("index.db"))
+        .expect("opening index.db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM references_ r JOIN symbols s ON r.symbol_id = s.id
+         WHERE s.name = ?1",
+        [name],
+        |row| row.get(0),
+    )
+    .expect("counting reference rows")
+}
+
 fn create_test_project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("creating temp dir");
 
@@ -625,43 +642,20 @@ namespace App {
         .expect("init");
     assert!(init.status.success(), "helios init failed");
 
-    let dependents = |target: &str| -> Vec<serde_json::Value> {
-        let output = Command::new(&bin)
-            .args(["--json", "deps", target])
-            .current_dir(dir.path())
-            .output()
-            .unwrap_or_else(|_| panic!("deps {target}"));
-        assert!(
-            output.status.success(),
-            "deps {target} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
-        value["dependents"]
-            .as_array()
-            .cloned()
-            .expect("dependents array")
-    };
-
     // "Compute" is declared in both Alpha and Beta. The single call site must be
     // linked to BOTH candidate definitions (2 reference rows), not one arbitrary
     // pick (which would yield 1) and not dropped (which would yield 0).
-    let compute_refs = dependents("Compute");
     assert_eq!(
-        compute_refs.len(),
+        reference_rows(dir.path(), "Compute"),
         2,
-        "ambiguous 'Compute' usage should link to both definitions, got: {:?}",
-        compute_refs
+        "ambiguous 'Compute' usage should link to both definitions"
     );
 
     // "OnlyHere" is declared once — no regression: exactly one linked usage.
-    let only_here_refs = dependents("OnlyHere");
     assert_eq!(
-        only_here_refs.len(),
+        reference_rows(dir.path(), "OnlyHere"),
         1,
-        "unambiguous 'OnlyHere' usage should link to its single definition, got: {:?}",
-        only_here_refs
+        "unambiguous 'OnlyHere' usage should link to its single definition"
     );
 }
 
@@ -718,45 +712,22 @@ namespace App {
         .expect("init");
     assert!(init.status.success(), "helios init failed");
 
-    let dependents = |target: &str| -> Vec<serde_json::Value> {
-        let output = Command::new(&bin)
-            .args(["--json", "deps", target])
-            .current_dir(dir.path())
-            .output()
-            .unwrap_or_else(|_| panic!("deps {target}"));
-        assert!(
-            output.status.success(),
-            "deps {target} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
-        value["dependents"]
-            .as_array()
-            .cloned()
-            .expect("dependents array")
-    };
-
     // "Compute" is declared in Alpha and Beta. The single call site lives inside
     // Alpha, so scope-aware resolution narrows it to Alpha.Compute alone — exactly
     // ONE linked usage. Under the pre-scope (story 174) behavior this would have
     // linked to both definitions, yielding 2.
-    let compute_refs = dependents("Compute");
     assert_eq!(
-        compute_refs.len(),
+        reference_rows(dir.path(), "Compute"),
         1,
-        "in-scope 'Compute' call should resolve to its own class only, got: {:?}",
-        compute_refs
+        "in-scope 'Compute' call should resolve to its own class only"
     );
 
     // "Shared" is declared in Gamma and Delta; the call site (Runner) matches
     // neither scope, so it stays ambiguous and links to BOTH definitions.
-    let shared_refs = dependents("Shared");
     assert_eq!(
-        shared_refs.len(),
+        reference_rows(dir.path(), "Shared"),
         2,
-        "unresolvable-by-scope 'Shared' call should link to all candidates, got: {:?}",
-        shared_refs
+        "unresolvable-by-scope 'Shared' call should link to all candidates"
     );
 }
 
@@ -3330,5 +3301,75 @@ fn test_update_does_not_warn_under_treesitter_index() {
     assert!(
         !stderr.contains(STALE_HINT),
         "tree-sitter index must not warn about semantic staleness, stderr: {stderr}"
+    );
+}
+
+/// An ambiguous symbol name is stored with one reference row per candidate
+/// definition; `deps` must still report each usage site once (task 837).
+#[test]
+fn test_deps_symbol_references_are_deduplicated() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    std::fs::write(
+        dir.path().join("money.ts"),
+        "export function formatMoney(n: number): string { return `$${n}`; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("legacy.ts"),
+        "export function formatMoney(n: number): string { return n + ' USD'; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("cart.ts"),
+        "import { formatMoney } from './money';\nexport function total(a: number, b: number): string {\n    return formatMoney(a) + formatMoney(b);\n}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    let output = Command::new(&bin)
+        .args(["deps", "formatMoney"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps formatMoney");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let refs: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.contains("(reference)"))
+        .collect();
+    let mut unique = refs.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert!(!refs.is_empty(), "expected references, got: {stdout}");
+    assert_eq!(
+        refs.len(),
+        unique.len(),
+        "deps must not repeat a usage site, got: {stdout}"
+    );
+
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "formatMoney"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps --json formatMoney");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+    let dependents = value["dependents"].as_array().expect("dependents array");
+    let mut seen: Vec<String> = dependents.iter().map(|d| d.to_string()).collect();
+    let total = seen.len();
+    seen.sort();
+    seen.dedup();
+    assert!(total > 0, "expected dependents, got: {stdout}");
+    assert_eq!(
+        total,
+        seen.len(),
+        "JSON dependents must be unique: {stdout}"
     );
 }

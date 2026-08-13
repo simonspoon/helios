@@ -501,14 +501,19 @@ impl Database {
     }
 
     /// What references point to this symbol (reverse deps)?
+    ///
+    /// An ambiguous name gets one reference row per candidate definition (see
+    /// `insert_references`), so a usage site would otherwise be emitted once
+    /// per candidate. Callers want the usage sites, not the candidate fan-out,
+    /// so collapse them with DISTINCT.
     pub fn symbol_references(&self, symbol_name: &str) -> Result<Vec<(String, i64, i64)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT f.path, r.line, r.column
+            "SELECT DISTINCT f.path, r.line, r.column
              FROM references_ r
              JOIN symbols s ON r.symbol_id = s.id
              JOIN files f ON r.file_id = f.id
              WHERE s.name = ?1
-             ORDER BY f.path, r.line",
+             ORDER BY f.path, r.line, r.column",
         )?;
         let rows = stmt.query_map(params![symbol_name], |row| {
             Ok((
