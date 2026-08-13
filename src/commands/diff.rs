@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use crate::db::Database;
 use crate::errors::NoIndexError;
 use crate::git;
+use crate::indexer;
 use crate::parsers;
 
 #[derive(Debug, serde::Serialize)]
@@ -75,7 +76,10 @@ pub fn run(json: bool, compact: bool) -> Result<()> {
         }
     };
 
-    let (modified_files, deleted_files) = git::changed_files(&last_commit)?;
+    // The same staleness `status` and `update` report, so the three never
+    // disagree about what changed: paths relative to the index root, filtered
+    // to what the index would actually re-read.
+    let (modified_files, deleted_files) = indexer::stale_files(&db, &cwd, &last_commit)?;
 
     if modified_files.is_empty() && deleted_files.is_empty() {
         if json {

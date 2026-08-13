@@ -165,7 +165,7 @@ pub fn stale_files(
     root: &Path,
     since_commit: &str,
 ) -> Result<(Vec<String>, Vec<String>)> {
-    let (modified, deleted) = crate::git::changed_files(since_commit)?;
+    let (modified, deleted) = crate::git::changed_files(since_commit, root)?;
 
     let mut stale_modified = Vec::new();
     for rel_path in modified {

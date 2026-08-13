@@ -3545,6 +3545,65 @@ fn test_update_follows_renames() {
     assert_eq!(stale_count(dir.path()), 0, "the rename is fully absorbed");
 }
 
+/// An index rooted below the repo root stores paths relative to itself, while
+/// git reports them relative to the repo root (task 849). Without rebasing,
+/// `status`/`update`/`diff` look up `sub/sub/main.rs`, find nothing, and call a
+/// genuinely stale index up to date. Changes outside the index root stay out.
+#[test]
+fn test_staleness_for_index_rooted_below_repo_root() {
+    let repo = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    let sub = repo.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("main.rs"), "pub fn main() {}\n").unwrap();
+    std::fs::write(repo.path().join("outside.rs"), "pub fn outside() {}\n").unwrap();
+    git_repo_with_commit(repo.path());
+
+    Command::new(&bin)
+        .arg("init")
+        .current_dir(&sub)
+        .output()
+        .expect("init");
+    assert_eq!(stale_count(&sub), 0, "a fresh index is not stale");
+
+    // Only the file inside the index root counts.
+    std::fs::write(repo.path().join("outside.rs"), "pub fn moved() {}\n").unwrap();
+    assert_eq!(stale_count(&sub), 0, "a change above the index root is not");
+
+    std::fs::write(sub.join("main.rs"), "pub fn main() {}\npub fn added() {}\n").unwrap();
+    assert_eq!(stale_count(&sub), 1, "the edited sub/main.rs is stale");
+
+    // `diff` reads the same change, spelled as the index spells it.
+    let output = Command::new(&bin)
+        .args(["--json", "diff"])
+        .current_dir(&sub)
+        .output()
+        .expect("diff");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("diff JSON");
+    assert_eq!(
+        json["added"][0]["name"], "added",
+        "diff must see the new symbol: {json}"
+    );
+    assert_eq!(
+        json["added"][0]["file"], "main.rs",
+        "diff paths are index-relative: {json}"
+    );
+
+    // A user's `diff.relative = true` must not change the answer: it makes git
+    // pre-strip the prefix helios then expects to strip itself.
+    git(repo.path(), &["config", "diff.relative", "true"]);
+    assert_eq!(stale_count(&sub), 1, "diff.relative must not hide the edit");
+
+    let output = Command::new(&bin)
+        .args(["--json", "update"])
+        .current_dir(&sub)
+        .output()
+        .expect("update");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("update JSON");
+    assert_eq!(json["files_indexed"], 1, "update must re-index it: {json}");
+    assert_eq!(stale_count(&sub), 0, "and the index is then current");
+}
+
 /// An ambiguous symbol name is stored with one reference row per candidate
 /// definition; `deps` must still report each usage site once (task 837).
 #[test]

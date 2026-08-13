@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::path::{Component, Path};
 use std::process::Command;
 
 /// Get the current HEAD commit hash
@@ -20,11 +21,59 @@ pub fn head_commit() -> Result<Option<String>> {
     }
 }
 
-/// Get files changed between a commit and the current working tree
+/// The index root's location inside the repo, as a `/`-terminated prefix that
+/// git's paths carry and the index's do not (empty when the index is rooted at
+/// the repo root). An index root outside the repo, or a repo root git won't
+/// report, yields no prefix — the paths are then left as git spelled them.
+fn index_prefix(root: &Path) -> String {
+    let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(root)
+        .output()
+    else {
+        return String::new();
+    };
+    if !output.status.success() {
+        return String::new();
+    }
+
+    let top = Path::new(String::from_utf8_lossy(&output.stdout).trim()).to_path_buf();
+    let top = top.canonicalize().unwrap_or(top);
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
+    let Ok(rel) = root.strip_prefix(&top) else {
+        return String::new();
+    };
+    let segments: Vec<String> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if segments.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", segments.join("/"))
+    }
+}
+
+/// Get files changed between a commit and the current working tree, as paths
+/// relative to `root`.
+///
+/// git reports every path relative to the repo root, but an index built in a
+/// subdirectory stores paths relative to that subdirectory. Rebasing here is
+/// what lets a caller find the path in the index at all; a path outside `root`
+/// belongs to no index entry and is dropped.
+///
 /// Returns (added/modified, deleted) file paths
-pub fn changed_files(since_commit: &str) -> Result<(Vec<String>, Vec<String>)> {
+pub fn changed_files(since_commit: &str, root: &Path) -> Result<(Vec<String>, Vec<String>)> {
+    // `--no-relative` because a user's `diff.relative = true` would otherwise
+    // scope the diff to the cwd and pre-strip the prefix, leaving the rebase
+    // below to drop every path.
     let output = Command::new("git")
-        .args(["diff", "--name-status", since_commit])
+        .args(["diff", "--no-relative", "--name-status", since_commit])
+        .current_dir(root)
         .output()
         .context("running git diff")?;
 
@@ -60,6 +109,18 @@ pub fn changed_files(since_commit: &str) -> Result<(Vec<String>, Vec<String>)> {
             }
             _ => modified.push(first), // A, M, T, etc.
         }
+    }
+
+    let prefix = index_prefix(root);
+    if !prefix.is_empty() {
+        let rebase = |paths: Vec<String>| -> Vec<String> {
+            paths
+                .into_iter()
+                .filter_map(|p| p.strip_prefix(&prefix).map(str::to_string))
+                .collect()
+        };
+        modified = rebase(modified);
+        deleted = rebase(deleted);
     }
 
     Ok((modified, deleted))
