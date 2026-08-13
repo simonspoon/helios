@@ -142,6 +142,61 @@ pub fn index_full(
     Ok(stats)
 }
 
+/// The digest stored in `files.content_hash` — the index's record of what it
+/// last parsed for a path.
+fn content_hash(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// The changed files that would actually change the index.
+///
+/// `git diff` answers a different question than helios needs: it reports every
+/// changed path in the repo, most of which have no parser, and it reports an
+/// uncommitted edit against HEAD forever — including one `update` has already
+/// indexed. Both inflate staleness and cost a redundant re-index. So filter to
+/// paths helios indexes, then drop any whose on-disk content already matches
+/// the hash recorded at index time; a deletion only counts if the path is in
+/// the index to begin with.
+pub fn stale_files(
+    db: &Database,
+    root: &Path,
+    since_commit: &str,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let (modified, deleted) = crate::git::changed_files(since_commit)?;
+
+    let mut stale_modified = Vec::new();
+    for rel_path in modified {
+        if parsers::detect_language(&rel_path).is_none() {
+            continue;
+        }
+        let abs_path = root.join(&rel_path);
+        if !abs_path.is_file() {
+            continue;
+        }
+        // Unreadable (binary, permissions) — leave it to `index_file`, which
+        // reports the error rather than silently dropping the file.
+        let indexed_hash = db.get_file_by_path(&rel_path)?.map(|f| f.content_hash);
+        let current_hash = std::fs::read_to_string(&abs_path)
+            .ok()
+            .map(|c| content_hash(&c));
+        if current_hash.is_some() && current_hash == indexed_hash {
+            continue;
+        }
+        stale_modified.push(rel_path);
+    }
+
+    let mut stale_deleted = Vec::new();
+    for rel_path in deleted {
+        if db.get_file_by_path(&rel_path)?.is_some() {
+            stale_deleted.push(rel_path);
+        }
+    }
+
+    Ok((stale_modified, stale_deleted))
+}
+
 /// Index a single file
 pub fn index_file(
     db: &Database,
@@ -153,11 +208,7 @@ pub fn index_file(
     let content =
         std::fs::read_to_string(abs_path).with_context(|| format!("reading {}", rel_path))?;
 
-    let content_hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(content.as_bytes());
-        format!("{:x}", hasher.finalize())
-    };
+    let content_hash = content_hash(&content);
 
     // Check if file has changed
     if let Some(existing) = db.get_file_by_path(rel_path)?

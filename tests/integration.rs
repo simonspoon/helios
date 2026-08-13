@@ -3332,3 +3332,71 @@ fn test_update_does_not_warn_under_treesitter_index() {
         "tree-sitter index must not warn about semantic staleness, stderr: {stderr}"
     );
 }
+
+/// `helios status --json` stale_files for the project in `dir`.
+fn stale_count(dir: &std::path::Path) -> i64 {
+    let output = Command::new(helios_bin())
+        .args(["--json", "status"])
+        .current_dir(dir)
+        .output()
+        .expect("helios status");
+    assert!(output.status.success(), "status must exit 0");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("status JSON");
+    json["stale_files"].as_i64().expect("stale_files present")
+}
+
+/// Staleness is what the index would have to re-read, not what git diffed
+/// (task 840): a changed file helios has no parser for never counts, and an
+/// uncommitted edit stops counting once `update` has indexed it.
+#[test]
+fn test_stale_count_excludes_unindexable_and_clears_after_update() {
+    let dir = create_test_project();
+    let bin = helios_bin();
+    git_repo_with_commit(dir.path());
+
+    Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("init");
+    assert_eq!(stale_count(dir.path()), 0, "a fresh index is not stale");
+
+    // A file with no parser is not stale however git reports it.
+    std::fs::write(dir.path().join("README.md"), "# hello\n").unwrap();
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-qm", "readme"]);
+    std::fs::write(dir.path().join("README.md"), "# hello again\n").unwrap();
+    assert_eq!(stale_count(dir.path()), 0, "README.md is never indexed");
+
+    // An uncommitted source edit is stale until indexed, then clears — it is
+    // in the diff against HEAD either way.
+    std::fs::write(
+        dir.path().join("main.rs"),
+        "pub fn main() {}\npub fn added() {}\n",
+    )
+    .unwrap();
+    assert_eq!(stale_count(dir.path()), 1, "the edited main.rs is stale");
+
+    Command::new(&bin)
+        .arg("update")
+        .current_dir(dir.path())
+        .output()
+        .expect("update");
+    assert_eq!(
+        stale_count(dir.path()),
+        0,
+        "an indexed edit is no longer stale"
+    );
+
+    // ...and the next update has no work left to redo.
+    let output = Command::new(&bin)
+        .args(["--json", "update"])
+        .current_dir(dir.path())
+        .output()
+        .expect("update");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("update JSON");
+    assert_eq!(
+        json["files_indexed"], 0,
+        "already-indexed content must not be re-indexed: {json}"
+    );
+}

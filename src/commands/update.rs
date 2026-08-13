@@ -34,7 +34,7 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
     let last_commit = db.get_metadata("last_indexed_commit")?;
 
     let (modified, deleted) = match &last_commit {
-        Some(commit) => git::changed_files(commit)?,
+        Some(commit) => indexer::stale_files(&db, &cwd, commit)?,
         None => {
             // No previous commit stored — full re-index
             if !quiet && !json {
@@ -57,6 +57,11 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
 
     let total_changes = modified.len() + deleted.len();
     if total_changes == 0 {
+        // Nothing indexable changed, so the index already describes HEAD —
+        // record it, or every later `update` re-diffs from the older commit.
+        if let Some(commit) = git::head_commit()? {
+            db.set_metadata("last_indexed_commit", &commit)?;
+        }
         if !quiet {
             if json {
                 let output = serde_json::json!({

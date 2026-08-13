@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 
 use crate::db::Database;
 use crate::git;
+use crate::indexer;
 
 pub fn run(json: bool, compact: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
@@ -37,7 +38,7 @@ pub fn run(json: bool, compact: bool) -> Result<()> {
 
     let stale_count = match (&last_commit, in_git) {
         (Some(commit), true) => {
-            let (modified, deleted) = git::changed_files(commit)?;
+            let (modified, deleted) = indexer::stale_files(&db, &cwd, commit)?;
             modified.len() + deleted.len()
         }
         _ => 0,
