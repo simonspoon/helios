@@ -3471,6 +3471,52 @@ fn test_stale_count_excludes_unindexable_and_clears_after_update() {
     );
 }
 
+/// A rename is a delete plus an add to the index, not one edit to a path
+/// spelled "old<TAB>new" — otherwise `update` keeps the old file's symbols
+/// forever and never learns the new path, while `status` reports 0 stale.
+#[test]
+fn test_update_follows_renames() {
+    let dir = create_test_project();
+    let bin = helios_bin();
+    git_repo_with_commit(dir.path());
+
+    Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("init");
+
+    git(dir.path(), &["mv", "main.rs", "entry.rs"]);
+    git(dir.path(), &["commit", "-qm", "rename"]);
+    assert_eq!(
+        stale_count(dir.path()),
+        2,
+        "the rename is a delete and an add"
+    );
+
+    Command::new(&bin)
+        .arg("update")
+        .current_dir(dir.path())
+        .output()
+        .expect("update");
+
+    let output = Command::new(&bin)
+        .args(["--json", "files"])
+        .current_dir(dir.path())
+        .output()
+        .expect("files");
+    let listing = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        listing.contains("entry.rs"),
+        "the new path must be indexed: {listing}"
+    );
+    assert!(
+        !listing.contains("main.rs"),
+        "the old path must be dropped: {listing}"
+    );
+    assert_eq!(stale_count(dir.path()), 0, "the rename is fully absorbed");
+}
+
 /// An ambiguous symbol name is stored with one reference row per candidate
 /// definition; `deps` must still report each usage site once (task 837).
 #[test]

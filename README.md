@@ -234,7 +234,8 @@ helios diff
 
 ### `helios status`
 
-Report index health: last indexed commit, file/symbol counts, and staleness vs. the working tree.
+Report index health: last indexed commit, file/symbol counts, and staleness — the number of
+indexable files whose contents on disk differ from what the index last parsed.
 
 ```bash
 helios status

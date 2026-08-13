@@ -38,16 +38,27 @@ pub fn changed_files(since_commit: &str) -> Result<(Vec<String>, Vec<String>)> {
     let mut deleted = Vec::new();
 
     for line in stdout.lines() {
-        let parts: Vec<&str> = line.splitn(2, '\t').collect();
-        if parts.len() != 2 {
+        let mut fields = line.split('\t');
+        let Some(status) = fields.next().map(str::trim) else {
             continue;
-        }
-        let status = parts[0].trim();
-        let file = parts[1].trim().to_string();
+        };
+        let paths: Vec<String> = fields.map(|f| f.trim().to_string()).collect();
+        let Some(first) = paths.first().cloned() else {
+            continue;
+        };
 
-        match status {
-            "D" => deleted.push(file),
-            _ => modified.push(file), // A, M, R, C, etc.
+        match status.chars().next() {
+            Some('D') => deleted.push(first),
+            // A rename or copy is reported as `R100<TAB>old<TAB>new`: the index
+            // has to read the new path, and for a rename forget the old one —
+            // treating the pair as one modified path leaves both wrong.
+            Some(c @ ('R' | 'C')) if paths.len() == 2 => {
+                if c == 'R' {
+                    deleted.push(first);
+                }
+                modified.push(paths[1].clone());
+            }
+            _ => modified.push(first), // A, M, T, etc.
         }
     }
 
