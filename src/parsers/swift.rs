@@ -1,8 +1,19 @@
 use anyhow::{Context, Result};
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
-use super::{LanguageParser, ParseResult};
+use super::{LanguageParser, ParseResult, is_function_local};
 use crate::db::{ParsedImport, ParsedReference, ParsedSymbol};
+
+/// Node kinds whose body holds function-local declarations.
+const CALLABLE_KINDS: &[&str] = &[
+    "function_declaration",
+    "init_declaration",
+    "deinit_declaration",
+    "subscript_declaration",
+    "computed_property",
+    "willset_didset_block",
+    "lambda_literal",
+];
 
 pub struct SwiftParser {
     language: Language,
@@ -125,6 +136,10 @@ impl LanguageParser for SwiftParser {
                     .find(|(n, _)| n.ends_with("_def"))
                     .map(|(_, n)| *n)
                     .unwrap_or(node);
+
+                if is_function_local(def_node, CALLABLE_KINDS) {
+                    continue;
+                }
 
                 let visibility = detect_visibility(src, def_node);
                 let scope = find_scope(src, node);
@@ -252,5 +267,39 @@ protocol Fetchable {
             "Should find NetworkManager class, got: {:?}",
             kinds
         );
+    }
+
+    #[test]
+    fn test_function_locals_are_not_symbols() {
+        let parser = SwiftParser::new();
+        let source = r#"
+func outer() {
+    func inner() {}
+    inner()
+}
+
+class Service {
+    func method() {}
+
+    init() {
+        func inInit() {}
+    }
+
+    var computed: Int {
+        func inGetter() -> Int { return 1 }
+        return inGetter()
+    }
+}
+"#;
+        let result = parser.parse(source).unwrap();
+        let names: Vec<_> = result.symbols.iter().map(|s| s.name.as_str()).collect();
+
+        assert!(names.contains(&"outer"));
+        assert!(names.contains(&"Service"));
+        assert!(names.contains(&"method"));
+
+        for local in ["inner", "inInit", "inGetter"] {
+            assert!(!names.contains(&local), "{local} is a function local");
+        }
     }
 }

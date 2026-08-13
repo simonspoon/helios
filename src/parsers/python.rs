@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
-use super::{LanguageParser, ParseResult};
+use super::{LanguageParser, ParseResult, is_function_local};
 use crate::db::{ParsedImport, ParsedReference, ParsedSymbol};
+
+/// Node kinds whose body holds function-local definitions.
+const CALLABLE_KINDS: &[&str] = &["function_definition", "lambda"];
 
 pub struct PythonParser {
     language: Language,
@@ -84,11 +87,15 @@ impl LanguageParser for PythonParser {
                     _ => continue,
                 };
 
+                // Use the parent definition node for end_line
+                let def_node = c.node.parent().unwrap_or(c.node);
+                if is_function_local(def_node, CALLABLE_KINDS) {
+                    continue;
+                }
+
                 let visibility = Self::visibility_from_name(&sym_text);
                 let scope = find_class_scope(src, c.node);
 
-                // Use the parent definition node for end_line
-                let def_node = c.node.parent().unwrap_or(c.node);
                 result.symbols.push(ParsedSymbol {
                     name: sym_text,
                     kind: kind.to_string(),
@@ -271,5 +278,33 @@ my_variable = "not a constant"
         assert!(consts.iter().any(|s| s.name == "MAX_SIZE"));
         assert!(consts.iter().any(|s| s.name == "DEFAULT_NAME"));
         assert!(!consts.iter().any(|s| s.name == "my_variable"));
+    }
+
+    #[test]
+    fn test_function_locals_are_not_symbols() {
+        let parser = PythonParser::new();
+        let source = r#"
+def outer():
+    def inner():
+        return 1
+
+    class Local:
+        pass
+
+    return inner()
+
+
+class Service:
+    def method(self):
+        return 1
+"#;
+        let result = parser.parse(source).unwrap();
+        let names: Vec<_> = result.symbols.iter().map(|s| s.name.as_str()).collect();
+
+        assert!(names.contains(&"outer"));
+        assert!(names.contains(&"Service"));
+        assert!(names.contains(&"method"));
+        assert!(!names.contains(&"inner"));
+        assert!(!names.contains(&"Local"));
     }
 }

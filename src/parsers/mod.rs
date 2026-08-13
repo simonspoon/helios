@@ -21,6 +21,24 @@ pub trait LanguageParser {
     fn parse(&self, source: &str) -> Result<ParseResult>;
 }
 
+/// True when the declaration `node` sits inside the body of a function, method
+/// or closure, as named by `callable_kinds`. Such definitions are function
+/// locals: they have no cross-file meaning, so parsers skip them instead of
+/// listing them alongside module- and class-level symbols.
+///
+/// Pass the declaration node itself (not its name node), so a top-level
+/// definition is not mistaken for a local by matching its own kind.
+pub fn is_function_local(node: tree_sitter::Node, callable_kinds: &[&str]) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if callable_kinds.contains(&parent.kind()) {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
 /// Detect language from file extension
 pub fn detect_language(path: &str) -> Option<&'static str> {
     let ext = path.rsplit('.').next()?;

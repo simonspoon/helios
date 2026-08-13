@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
-use super::{LanguageParser, ParseResult};
+use super::{LanguageParser, ParseResult, is_function_local};
 use crate::db::{ParsedImport, ParsedReference, ParsedSymbol};
+
+/// Node kinds whose body holds function-local declarations.
+const CALLABLE_KINDS: &[&str] = &["function_item", "closure_expression"];
 
 pub struct RustParser {
     language: Language,
@@ -135,6 +138,10 @@ impl LanguageParser for RustParser {
                     .find(|(n, _)| n.ends_with("_def"))
                     .map(|(_, n)| *n)
                     .unwrap_or(node);
+
+                if is_function_local(def_node, CALLABLE_KINDS) {
+                    continue;
+                }
 
                 let visibility = Self::extract_visibility(src, def_node);
                 let scope = Self::find_scope(src, node);
@@ -323,5 +330,39 @@ pub type Result<T> = std::result::Result<T, Error>;
         let names: Vec<_> = result.symbols.iter().map(|s| (&s.name, &s.kind)).collect();
         assert!(names.contains(&(&"MAX_SIZE".to_string(), &"const".to_string())));
         assert!(names.contains(&(&"Result".to_string(), &"type".to_string())));
+    }
+
+    #[test]
+    fn test_function_locals_are_not_symbols() {
+        let parser = RustParser::new();
+        let source = r#"
+pub const TOP: u32 = 1;
+
+pub fn run() -> u32 {
+    const INNER: u32 = 2;
+    static LOCAL_STATIC: u32 = 3;
+    fn helper() -> u32 { 4 }
+    TOP + INNER + LOCAL_STATIC + helper()
+}
+
+pub struct S;
+
+impl S {
+    pub fn method(&self) -> u32 {
+        1
+    }
+}
+"#;
+        let result = parser.parse(source).unwrap();
+        let names: Vec<_> = result.symbols.iter().map(|s| s.name.as_str()).collect();
+
+        assert!(names.contains(&"TOP"));
+        assert!(names.contains(&"run"));
+        assert!(names.contains(&"S"));
+        assert!(names.contains(&"method"));
+
+        for local in ["INNER", "LOCAL_STATIC", "helper"] {
+            assert!(!names.contains(&local), "{local} is a function local");
+        }
     }
 }

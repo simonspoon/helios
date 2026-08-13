@@ -1,8 +1,20 @@
 use anyhow::{Context, Result};
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
-use super::{LanguageParser, ParseResult};
+use super::{LanguageParser, ParseResult, is_function_local};
 use crate::db::{ParsedImport, ParsedReference, ParsedSymbol};
+
+/// Node kinds whose body holds function-local declarations.
+const CALLABLE_KINDS: &[&str] = &[
+    "function_declaration",
+    "generator_function_declaration",
+    "generator_function",
+    "function_expression",
+    "function",
+    "arrow_function",
+    "method_definition",
+    "class_static_block",
+];
 
 pub struct TypeScriptParser {
     language: Language,
@@ -125,6 +137,12 @@ impl LanguageParser for TypeScriptParser {
                     .find(|(n, _)| n.ends_with("_def"))
                     .map(|(_, n)| *n);
 
+                // Use def_node for end_line, falling back to parent node for methods
+                let end_node = def_node.or_else(|| node.parent()).unwrap_or(node);
+                if is_function_local(end_node, CALLABLE_KINDS) {
+                    continue;
+                }
+
                 let exported = def_node.is_some_and(is_exported);
                 let visibility = if exported { "pub" } else { "private" };
 
@@ -134,8 +152,6 @@ impl LanguageParser for TypeScriptParser {
                     None
                 };
 
-                // Use def_node for end_line, falling back to parent node for methods
-                let end_node = def_node.or_else(|| node.parent()).unwrap_or(node);
                 result.symbols.push(ParsedSymbol {
                     name: sym_text,
                     kind: kind.to_string(),
@@ -308,5 +324,57 @@ import * as path from 'path';
         assert!(paths.contains(&&"react".to_string()));
         assert!(paths.contains(&&"axios".to_string()));
         assert!(paths.contains(&&"path".to_string()));
+    }
+
+    #[test]
+    fn test_function_locals_are_not_symbols() {
+        let parser = TypeScriptParser::new("typescript");
+        let source = r#"
+export const CURRENCY = "USD";
+
+export function formatMoney(cents: number): string {
+    const major = Math.floor(cents / 100);
+    function helper() { return 1; }
+    return `${major}${helper()}`;
+}
+
+export class Wallet {
+    add(cents: number): void {
+        const next = cents;
+        console.log(next);
+    }
+}
+
+export const render = (x: number) => {
+    const out = x * 2;
+    return out;
+};
+
+export const gen = function* () {
+    const yielded = 1;
+    yield yielded;
+};
+
+export class Registry {
+    static {
+        const staticLocal = 1;
+        console.log(staticLocal);
+    }
+}
+"#;
+        let result = parser.parse(source).unwrap();
+        let names: Vec<_> = result.symbols.iter().map(|s| s.name.as_str()).collect();
+
+        assert!(names.contains(&"CURRENCY"));
+        assert!(names.contains(&"formatMoney"));
+        assert!(names.contains(&"Wallet"));
+        assert!(names.contains(&"add"));
+        assert!(names.contains(&"render"));
+        assert!(names.contains(&"gen"));
+        assert!(names.contains(&"Registry"));
+
+        for local in ["major", "helper", "next", "out", "yielded", "staticLocal"] {
+            assert!(!names.contains(&local), "{local} is a function local");
+        }
     }
 }

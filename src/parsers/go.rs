@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
-use super::{LanguageParser, ParseResult};
+use super::{LanguageParser, ParseResult, is_function_local};
 use crate::db::{ParsedImport, ParsedReference, ParsedSymbol};
+
+/// Node kinds whose body holds function-local declarations.
+const CALLABLE_KINDS: &[&str] = &["function_declaration", "method_declaration", "func_literal"];
 
 pub struct GoParser {
     language: Language,
@@ -99,6 +102,12 @@ impl LanguageParser for GoParser {
                     _ => continue,
                 };
 
+                // Use the parent declaration node for end_line
+                let def_node = c.node.parent().unwrap_or(c.node);
+                if is_function_local(def_node, CALLABLE_KINDS) {
+                    continue;
+                }
+
                 let visibility = Self::visibility_from_name(&sym_text);
                 let scope = if cname == "method_name" {
                     find_receiver_type(src, c.node)
@@ -106,8 +115,6 @@ impl LanguageParser for GoParser {
                     None
                 };
 
-                // Use the parent declaration node for end_line
-                let def_node = c.node.parent().unwrap_or(c.node);
                 result.symbols.push(ParsedSymbol {
                     name: sym_text,
                     kind: kind.to_string(),
@@ -273,5 +280,28 @@ const defaultTimeout = 30
 
         let max = consts.iter().find(|s| s.name == "MaxRetries").unwrap();
         assert_eq!(max.visibility, "pub");
+    }
+
+    #[test]
+    fn test_function_locals_are_not_symbols() {
+        let parser = GoParser::new();
+        let source = r#"
+package main
+
+var Global = 1
+
+func Run() int {
+	var local = 2
+	const localConst = 3
+	return local + localConst
+}
+"#;
+        let result = parser.parse(source).unwrap();
+        let names: Vec<_> = result.symbols.iter().map(|s| s.name.as_str()).collect();
+
+        assert!(names.contains(&"Global"));
+        assert!(names.contains(&"Run"));
+        assert!(!names.contains(&"local"));
+        assert!(!names.contains(&"localConst"));
     }
 }
