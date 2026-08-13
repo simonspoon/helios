@@ -24,6 +24,7 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
         let start = Instant::now();
         // `update` keeps the tree-sitter path for `.cs` (W1) — syntactic.
         let stats = indexer::index_full(&db, &cwd, None)?;
+        indexer::resolve_imports(&db)?;
         let elapsed = start.elapsed();
 
         warn_semantic_stale(&db, &stats)?;
@@ -43,6 +44,7 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
             let start = Instant::now();
             // `update` keeps the tree-sitter path for `.cs` (W1) — syntactic.
             let stats = indexer::index_full(&db, &cwd, None)?;
+            indexer::resolve_imports(&db)?;
             let elapsed = start.elapsed();
 
             if let Some(commit) = git::head_commit()? {
@@ -79,6 +81,9 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
 
     let start = Instant::now();
     let stats = indexer::index_incremental(&db, &cwd, &modified, &deleted)?;
+    // Re-resolved over the whole index: an added or deleted file changes which
+    // specifiers in untouched files resolve.
+    indexer::resolve_imports(&db)?;
     let elapsed = start.elapsed();
 
     // Update stored commit

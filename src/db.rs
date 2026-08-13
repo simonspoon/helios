@@ -37,6 +37,15 @@ pub struct ImportRecord {
     pub resolved_file_id: Option<i64>,
 }
 
+/// An import row as the resolution pass sees it.
+pub struct ImportToResolve {
+    pub id: i64,
+    pub source_path: String,
+    pub language: String,
+    pub import_path: String,
+    pub resolved_file_id: Option<i64>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[allow(dead_code)]
 pub struct ReferenceRecord {
@@ -186,6 +195,22 @@ impl Database {
             self.conn
                 .execute_batch("ALTER TABLE symbols ADD COLUMN docid TEXT")?;
         }
+
+        // Check if resolved_file_id column exists in imports table
+        let has_resolved: bool = self
+            .conn
+            .prepare("SELECT resolved_file_id FROM imports LIMIT 0")
+            .is_ok();
+
+        if !has_resolved {
+            self.conn.execute_batch(
+                "ALTER TABLE imports ADD COLUMN resolved_file_id INTEGER REFERENCES files(id) ON DELETE SET NULL",
+            )?;
+        }
+
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_imports_resolved ON imports(resolved_file_id)",
+        )?;
 
         // Index must be created here (after the column is ensured), not in
         // create_tables: on a pre-existing DB the CREATE TABLE IF NOT EXISTS
@@ -462,12 +487,17 @@ impl Database {
             .context("getting imports for file")
     }
 
-    /// What does this file import (outgoing deps)?
+    /// What does this file import (outgoing deps)? Imports resolved to an
+    /// indexed file report that file's path — which is what makes transitive
+    /// traversal possible; the rest report their raw specifier (packages,
+    /// namespaces, unindexed files).
     pub fn file_dependencies(&self, path: &str) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT i.import_path
-             FROM imports i JOIN files f ON i.source_file_id = f.id
-             WHERE f.path = ?1 ORDER BY i.import_path",
+            "SELECT DISTINCT COALESCE(t.path, i.import_path) AS dep
+             FROM imports i
+             JOIN files f ON i.source_file_id = f.id
+             LEFT JOIN files t ON i.resolved_file_id = t.id
+             WHERE f.path = ?1 ORDER BY dep",
         )?;
         let rows = stmt.query_map(params![path], |row| row.get::<_, String>(0))?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -475,7 +505,25 @@ impl Database {
     }
 
     /// What files import this file/module (incoming deps)?
+    ///
+    /// For an indexed file this is the resolved file -> file edge, so the
+    /// natural query (the file's own path) returns every importer regardless of
+    /// how each one spelled the specifier. A target that is not an indexed file
+    /// — a raw specifier such as `../util/money` or a package name — falls back
+    /// to substring-matching the specifier text.
     pub fn file_dependents(&self, path: &str) -> Result<Vec<String>> {
+        if let Some(file) = self.get_file_by_path(path)? {
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT f.path
+                 FROM imports i JOIN files f ON i.source_file_id = f.id
+                 WHERE i.resolved_file_id = ?1 ORDER BY f.path",
+            )?;
+            let rows = stmt.query_map(params![file.id], |row| row.get::<_, String>(0))?;
+            return rows
+                .collect::<Result<Vec<_>, _>>()
+                .context("querying file dependents");
+        }
+
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT f.path
              FROM imports i JOIN files f ON i.source_file_id = f.id
@@ -484,6 +532,40 @@ impl Database {
         let rows = stmt.query_map(params![format!("%{path}%")], |row| row.get::<_, String>(0))?;
         rows.collect::<Result<Vec<_>, _>>()
             .context("querying file dependents")
+    }
+
+    /// Every import row with its source file's path and language and its
+    /// current resolution — the input to the post-index resolution pass.
+    pub fn all_imports_with_source(&self) -> Result<Vec<ImportToResolve>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT i.id, f.path, f.language, i.import_path, i.resolved_file_id
+             FROM imports i JOIN files f ON i.source_file_id = f.id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ImportToResolve {
+                id: row.get(0)?,
+                source_path: row.get(1)?,
+                language: row.get(2)?,
+                import_path: row.get(3)?,
+                resolved_file_id: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("listing imports")
+    }
+
+    /// Write `(import id, resolved file id)` pairs in one transaction. The
+    /// resolution pass touches every import row on every run, so a per-row
+    /// autocommit here costs seconds of fsync on a large repo.
+    pub fn apply_import_resolutions(&self, updates: &[(i64, Option<i64>)]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE imports SET resolved_file_id = ?1 WHERE id = ?2")?;
+            for (import_id, resolved_file_id) in updates {
+                stmt.execute(params![resolved_file_id, import_id])?;
+            }
+        }
+        tx.commit().context("writing import resolutions")
     }
 
     /// What does a symbol depend on (via its file's imports)?
@@ -875,6 +957,54 @@ mod tests {
         let imports = db.get_imports_for_file(file_id).unwrap();
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].import_path, "std::collections::HashMap");
+    }
+
+    /// Resolved imports make both directions answerable from the file's own
+    /// path: dependencies report the target file (not the specifier) and
+    /// dependents find every importer whatever each one spelled.
+    #[test]
+    fn resolved_imports_key_the_graph_by_file() {
+        let db = Database::open_in_memory().unwrap();
+        let money = db
+            .upsert_file("src/util/money.ts", "h", "typescript")
+            .unwrap();
+        let cart = db
+            .upsert_file("src/domain/cart.ts", "h", "typescript")
+            .unwrap();
+        let app = db.upsert_file("src/app.ts", "h", "typescript").unwrap();
+
+        let add = |file_id: i64, path: &str, resolved: Option<i64>| {
+            let id = db
+                .insert_import(
+                    file_id,
+                    &ParsedImport {
+                        import_path: path.to_string(),
+                        alias: None,
+                    },
+                )
+                .unwrap();
+            db.apply_import_resolutions(&[(id, resolved)]).unwrap();
+        };
+        // Same target, two spellings — plus one package import that resolves to
+        // no file.
+        add(cart, "../util/money", Some(money));
+        add(app, "./util/money", Some(money));
+        add(app, "react", None);
+
+        assert_eq!(
+            db.file_dependents("src/util/money.ts").unwrap(),
+            vec!["src/app.ts".to_string(), "src/domain/cart.ts".to_string()]
+        );
+        // Unresolved imports keep reporting their raw specifier.
+        assert_eq!(
+            db.file_dependencies("src/app.ts").unwrap(),
+            vec!["react".to_string(), "src/util/money.ts".to_string()]
+        );
+        // A target that is not an indexed file still matches specifier text.
+        assert_eq!(
+            db.file_dependents("../util/money").unwrap(),
+            vec!["src/domain/cart.ts".to_string()]
+        );
     }
 
     #[test]
