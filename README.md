@@ -162,7 +162,11 @@ Output format:
 ```
 src/main.rs:42:0 fn pub main
 src/lib.rs:10:4 struct pub Parser
+src/Reporting.cs:6:18 fn pub Reporting.Compute
 ```
+
+Names are qualified with their scope (class, impl block, or namespace) when the
+symbol has one, so same-named symbols stay distinguishable.
 
 ### `helios deps <TARGET> [--scope <S>] [--file <P>] [--depth <N>]`
 

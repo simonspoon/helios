@@ -50,8 +50,30 @@ fn detect_visibility(source: &[u8], node: tree_sitter::Node) -> String {
             }
         }
     }
-    // Default: private for members, internal (mapped to private) for types
-    "private".to_string()
+    // No explicit modifier. Interface members are implicitly public; everything
+    // else defaults to private for members, internal (mapped to private) for types.
+    if in_interface_body(node) {
+        "pub".to_string()
+    } else {
+        "private".to_string()
+    }
+}
+
+/// True when `node` is a declaration whose nearest enclosing type is an interface.
+fn in_interface_body(node: tree_sitter::Node) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "interface_declaration" => return true,
+            "class_declaration"
+            | "struct_declaration"
+            | "record_declaration"
+            | "enum_declaration" => return false,
+            _ => {}
+        }
+        current = parent.parent();
+    }
+    false
 }
 
 /// Walk up to find enclosing class/struct/namespace name for scope
@@ -497,6 +519,15 @@ namespace MyApp.Models {
                 && k.as_str() == "class"
                 && v.as_str() == "private"),
             "Should find internal Helper class mapped to private, got: {:?}",
+            sym_names
+        );
+
+        // Interface members are implicitly public
+        assert!(
+            sym_names.iter().any(|(n, k, v)| n.as_str() == "GetById"
+                && k.as_str() == "fn"
+                && v.as_str() == "pub"),
+            "Interface member GetById should be public, got: {:?}",
             sym_names
         );
 

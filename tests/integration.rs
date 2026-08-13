@@ -692,6 +692,34 @@ fn test_csharp_indexing() {
     );
 }
 
+/// The default (non-JSON) symbols output must qualify names with their scope,
+/// so same-named symbols in different classes are distinguishable.
+#[test]
+fn test_symbols_text_output_includes_scope() {
+    let dir = create_test_project();
+    let bin = helios_bin();
+
+    Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("init");
+
+    let output = Command::new(&bin)
+        .args(["symbols", "--file", "Models.cs", "--grep", "Greet"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --grep Greet");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("fn pub Person.Greet"),
+        "Text output should qualify Greet with its Person scope, got: {}",
+        stdout
+    );
+}
+
 /// An ambiguous C# method name (declared in 2+ classes) must link a usage to
 /// ALL candidate definitions rather than silently picking one. Unambiguous
 /// names must still resolve to their single definition (no regression).

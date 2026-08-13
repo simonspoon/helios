@@ -193,9 +193,15 @@ pub fn run(
                 }
                 println!();
             } else {
+                // Qualify the name with its scope so same-named symbols in
+                // different classes/namespaces are distinguishable.
+                let name = match &sym.scope {
+                    Some(scope) if !scope.is_empty() => format!("{}.{}", scope, sym.name),
+                    _ => sym.name.clone(),
+                };
                 println!(
                     "{}:{}:{} {} {} {}",
-                    path, sym.line, sym.column, sym.kind, sym.visibility, sym.name
+                    path, sym.line, sym.column, sym.kind, sym.visibility, name
                 );
             }
         }
