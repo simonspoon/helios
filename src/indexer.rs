@@ -82,6 +82,15 @@ pub fn indexed_csharp_files(root: &Path) -> Result<Vec<String>> {
 
 /// Index all supported files in a directory.
 ///
+/// Two passes over the file set. The first inserts each file's symbols and
+/// imports; the second resolves its references. They are separate because a
+/// reference resolves against the definitions already in the database, so a
+/// one-pass walk records nothing for a file it reaches before the file that
+/// defines the name it uses — and the walk order is the filesystem's, so which
+/// usages survived varied by machine. The second pass runs once every
+/// definition is in, and re-parses rather than holding every file's references
+/// in memory for the length of the walk.
+///
 /// `cs_snapshot` is the file list the Roslyn sidecar analyzed, when it ran for
 /// this walk (`None` = tree-sitter mode): `.cs` reference resolution is then
 /// deferred to `ingest_semantic`, which runs after the walk (symbols and
@@ -98,6 +107,11 @@ pub fn index_full(
     let semantic_csharp = cs_snapshot.is_some();
     let snapshot: Option<HashSet<&str>> =
         cs_snapshot.map(|files| files.iter().map(String::as_str).collect());
+
+    // Files this walk parsed, for the reference pass below. Only those: a file
+    // whose content hash was unchanged keeps the reference rows it already has,
+    // and re-inserting them would duplicate every one.
+    let mut parsed: Vec<(std::path::PathBuf, String, &'static str)> = Vec::new();
 
     let walker = walk(root);
 
@@ -123,7 +137,7 @@ pub fn index_full(
             {
                 stats.cs_missing_from_snapshot.push(rel_path.clone());
             }
-            match index_file(db, path, &rel_path, language, semantic_csharp) {
+            match index_file_definitions(db, path, &rel_path, language) {
                 Ok(file_stats) => {
                     stats.files_indexed += 1;
                     stats.symbols_found += file_stats.symbols;
@@ -131,12 +145,21 @@ pub fn index_full(
                     if language == "csharp" && file_stats.reparsed {
                         stats.cs_changed += 1;
                     }
+                    if file_stats.reparsed && !(semantic_csharp && language == "csharp") {
+                        parsed.push((path.to_path_buf(), rel_path.clone(), language));
+                    }
                 }
                 Err(e) => {
                     eprintln!("warning: failed to index {}: {}", rel_path, e);
                     stats.files_errored += 1;
                 }
             }
+        }
+    }
+
+    for (abs_path, rel_path, language) in &parsed {
+        if let Err(e) = index_file_references(db, abs_path, rel_path, language) {
+            eprintln!("warning: failed to index references in {}: {}", rel_path, e);
         }
     }
 
@@ -198,13 +221,35 @@ pub fn stale_files(
     Ok((stale_modified, stale_deleted))
 }
 
-/// Index a single file
+/// Index a single file: its definitions, then its references.
+///
+/// The incremental path only — every definition in the rest of the repo is
+/// already indexed, so one pass resolves correctly. A full index resolves
+/// references in a separate pass (see `index_full`).
 pub fn index_file(
     db: &Database,
     abs_path: &Path,
     rel_path: &str,
     language: &str,
     semantic_csharp: bool,
+) -> Result<FileStats> {
+    let stats = index_file_definitions(db, abs_path, rel_path, language)?;
+    // In semantic mode `.cs` references come from the Roslyn sidecar, ingested
+    // after the walk with exact DocId resolution (P3-M4).
+    if stats.reparsed && !(semantic_csharp && language == "csharp") {
+        index_file_references(db, abs_path, rel_path, language)?;
+    }
+    Ok(stats)
+}
+
+/// Parse a file and insert its symbols and imports, replacing whatever the
+/// index held for that path. A file whose content hash is unchanged is left
+/// alone (`reparsed: false`).
+fn index_file_definitions(
+    db: &Database,
+    abs_path: &Path,
+    rel_path: &str,
+    language: &str,
 ) -> Result<FileStats> {
     let content =
         std::fs::read_to_string(abs_path).with_context(|| format!("reading {}", rel_path))?;
@@ -259,35 +304,52 @@ pub fn index_file(
         import_count += 1;
     }
 
-    // Insert references — resolve to known symbols. Scope-aware: when the
-    // reference site's enclosing scope is known and one or more candidates share
-    // it, we link only those in-scope definitions (same class/namespace wins over
-    // same-named definitions elsewhere). When no scope context is available or no
-    // candidate matches, we fall back to linking ALL candidates — preserving the
-    // ambiguous-name behavior so `helios deps` never silently drops a usage.
-    //
-    // In semantic mode `.cs` references are skipped here: the Roslyn sidecar
-    // output is ingested after the walk with exact DocId resolution (P3-M4).
-    if !(semantic_csharp && language == "csharp") {
-        for reference in &parse_result.references {
-            let candidates = db.find_symbol_by_name(&reference.symbol_name)?;
-            let symbol_ids =
-                resolve_reference_candidates(reference.from_scope.as_deref(), &candidates);
-            db.insert_references(
-                &symbol_ids,
-                file_id,
-                reference.line,
-                reference.column,
-                reference.qualified,
-            )?;
-        }
-    }
-
     Ok(FileStats {
         symbols: symbol_count,
         imports: import_count,
         reparsed: true,
     })
+}
+
+/// Re-parse a file the index already holds and record its references against
+/// the definitions currently in the database.
+///
+/// Resolution is scope-aware: when the reference site's enclosing scope is known
+/// and one or more candidates share it, only those in-scope definitions are
+/// linked (same class/namespace wins over same-named definitions elsewhere).
+/// When no scope context is available or no candidate matches, ALL candidates
+/// are linked — preserving the ambiguous-name behavior so `helios deps` never
+/// silently drops a usage.
+fn index_file_references(
+    db: &Database,
+    abs_path: &Path,
+    rel_path: &str,
+    language: &str,
+) -> Result<()> {
+    let Some(parser) = parsers::get_parser(language) else {
+        return Ok(());
+    };
+    let Some(file) = db.get_file_by_path(rel_path)? else {
+        return Ok(());
+    };
+    let content =
+        std::fs::read_to_string(abs_path).with_context(|| format!("reading {}", rel_path))?;
+    let parse_result = parser
+        .parse(&content)
+        .with_context(|| format!("parsing {}", rel_path))?;
+
+    for reference in &parse_result.references {
+        let candidates = db.find_symbol_by_name(&reference.symbol_name)?;
+        let symbol_ids = resolve_reference_candidates(reference.from_scope.as_deref(), &candidates);
+        db.insert_references(
+            &symbol_ids,
+            file.id,
+            reference.line,
+            reference.column,
+            reference.qualified,
+        )?;
+    }
+    Ok(())
 }
 
 /// Re-index only changed files (incremental)
@@ -769,23 +831,6 @@ mod tests {
         );
     }
 
-    /// Re-parse the referencing files after a full index.
-    ///
-    /// `index_file` resolves a reference against the symbols already in the
-    /// database, so a file the walk reaches before its import targets records
-    /// no reference rows at all. The walk order is the filesystem's — stable on
-    /// one machine, different on another — so a test that asserts on references
-    /// must re-parse the referencing files once every definition is in, or it
-    /// passes or fails by directory-listing order. `delete_file` first because
-    /// `index_file` skips a path whose content hash is unchanged.
-    fn reindex(db: &Database, root: &Path, paths: &[&str]) {
-        for path in paths {
-            db.delete_file(path).unwrap();
-        }
-        let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
-        index_incremental(db, root, &paths, &[]).unwrap();
-    }
-
     /// Files referencing `formatMoney`, keyed by the definition they are
     /// attributed to.
     fn callers_of(db: &Database, name: &str, defined_in: &str) -> Vec<String> {
@@ -845,15 +890,6 @@ mod tests {
 
         let db = Database::open_in_memory().unwrap();
         index_full(&db, dir.path(), None).unwrap();
-        reindex(
-            &db,
-            dir.path(),
-            &[
-                "src/domain/cart.ts",
-                "src/reports/audit.ts",
-                "src/reports/globals.ts",
-            ],
-        );
         // Before resolution every caller counts against both definitions.
         assert_eq!(
             callers_of(&db, "formatMoney", "src/util/money.ts").len(),
@@ -907,7 +943,6 @@ mod tests {
 
         let db = Database::open_in_memory().unwrap();
         index_full(&db, dir.path(), None).unwrap();
-        reindex(&db, dir.path(), &["src/cart.ts"]);
         resolve_imports(&db).unwrap();
         assert_eq!(
             callers_of(&db, "formatMoney", "src/legacy/money.ts"),
@@ -968,7 +1003,6 @@ mod tests {
 
         let db = Database::open_in_memory().unwrap();
         index_full(&db, dir.path(), None).unwrap();
-        reindex(&db, dir.path(), &["src/cart.ts"]);
         resolve_imports(&db).unwrap();
 
         // `w.formatMoney()` is the widget's method, not the imported function.
@@ -1003,7 +1037,6 @@ mod tests {
 
         let db = Database::open_in_memory().unwrap();
         index_full(&db, dir.path(), None).unwrap();
-        reindex(&db, dir.path(), &["pkg/app.py"]);
         resolve_imports(&db).unwrap();
 
         for target in ["pkg/fast.py", "pkg/slow.py"] {
@@ -1039,7 +1072,6 @@ mod tests {
 
         let db = Database::open_in_memory().unwrap();
         index_full(&db, dir.path(), None).unwrap();
-        reindex(&db, dir.path(), &["src/cart.ts"]);
         resolve_imports(&db).unwrap();
         assert_eq!(
             callers_of(&db, "formatMoney", "src/util/money.ts"),
@@ -1095,11 +1127,6 @@ mod tests {
 
         let db = Database::open_in_memory().unwrap();
         index_full(&db, dir.path(), None).unwrap();
-        reindex(
-            &db,
-            dir.path(),
-            &["pkg/domain/cart.py", "pkg/domain/audit.py"],
-        );
         resolve_imports(&db).unwrap();
 
         assert_eq!(

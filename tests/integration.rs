@@ -15,18 +15,11 @@ fn setup_indexed_project() -> (tempfile::TempDir, PathBuf) {
 }
 
 fn helios_bin() -> PathBuf {
-    // Use cargo to find the binary
-    let output = Command::new("cargo")
-        .args(["build", "--quiet"])
-        .output()
-        .expect("cargo build failed");
-    assert!(output.status.success(), "cargo build failed");
-
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("target");
-    path.push("debug");
-    path.push("helios");
-    path
+    // Cargo builds the binary before the test binary runs and passes its path
+    // in. Shelling out to `cargo build` here instead raced: every test called
+    // this, so dozens of builds ran at once and one replacing `target/debug/
+    // helios` made another test's spawn fail with NotFound.
+    PathBuf::from(env!("CARGO_BIN_EXE_helios"))
 }
 
 /// Number of raw reference rows linked to symbols named `name`.
