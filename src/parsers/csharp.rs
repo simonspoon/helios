@@ -65,9 +65,7 @@ fn in_interface_body(node: tree_sitter::Node) -> bool {
     while let Some(parent) = current {
         match parent.kind() {
             "interface_declaration" => return true,
-            "class_declaration"
-            | "struct_declaration"
-            | "record_declaration"
+            "class_declaration" | "struct_declaration" | "record_declaration"
             | "enum_declaration" => return false,
             _ => {}
         }

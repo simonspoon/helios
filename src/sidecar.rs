@@ -384,8 +384,15 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<RunOutput, Ru
                 if deadline.is_some_and(|d| Instant::now() >= d) {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = stdout_thread.join();
-                    let _ = stderr_thread.join();
+                    // The drain threads are deliberately not joined. Killing the
+                    // helper does not kill anything it spawned, and a surviving
+                    // grandchild holds the inherited pipe ends open, so joining
+                    // here waits out the very hang the timeout exists to escape
+                    // — up to the child's full runtime. Whether that happens is
+                    // the shell's choice (some `exec` a lone last command, some
+                    // fork), which is why this only bit on Linux CI. The output
+                    // is discarded on this path anyway; the threads end on their
+                    // own once the last writer exits.
                     return Err(RunError::TimedOut);
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -567,7 +574,11 @@ mod tests {
     #[test]
     fn analyze_hung_helper_times_out() {
         let dir = tempfile::tempdir().unwrap();
-        let sidecar = script_sidecar(dir.path(), "sleep 30");
+        // Trailing `:` so the shell cannot `exec` the sleep away: the helper
+        // stays a parent, and killing it leaves a live grandchild holding the
+        // inherited pipes — the shape that hung this test on Linux CI while a
+        // lone `sleep 30`, which some shells do `exec`, passed on macOS.
+        let sidecar = script_sidecar(dir.path(), "sleep 30\n:");
         let start = Instant::now();
         let err = sidecar
             .analyze(dir.path(), &[], Duration::from_millis(250))

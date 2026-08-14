@@ -769,6 +769,23 @@ mod tests {
         );
     }
 
+    /// Re-parse the referencing files after a full index.
+    ///
+    /// `index_file` resolves a reference against the symbols already in the
+    /// database, so a file the walk reaches before its import targets records
+    /// no reference rows at all. The walk order is the filesystem's — stable on
+    /// one machine, different on another — so a test that asserts on references
+    /// must re-parse the referencing files once every definition is in, or it
+    /// passes or fails by directory-listing order. `delete_file` first because
+    /// `index_file` skips a path whose content hash is unchanged.
+    fn reindex(db: &Database, root: &Path, paths: &[&str]) {
+        for path in paths {
+            db.delete_file(path).unwrap();
+        }
+        let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        index_incremental(db, root, &paths, &[]).unwrap();
+    }
+
     /// Files referencing `formatMoney`, keyed by the definition they are
     /// attributed to.
     fn callers_of(db: &Database, name: &str, defined_in: &str) -> Vec<String> {
@@ -828,6 +845,15 @@ mod tests {
 
         let db = Database::open_in_memory().unwrap();
         index_full(&db, dir.path(), None).unwrap();
+        reindex(
+            &db,
+            dir.path(),
+            &[
+                "src/domain/cart.ts",
+                "src/reports/audit.ts",
+                "src/reports/globals.ts",
+            ],
+        );
         // Before resolution every caller counts against both definitions.
         assert_eq!(
             callers_of(&db, "formatMoney", "src/util/money.ts").len(),
@@ -881,6 +907,7 @@ mod tests {
 
         let db = Database::open_in_memory().unwrap();
         index_full(&db, dir.path(), None).unwrap();
+        reindex(&db, dir.path(), &["src/cart.ts"]);
         resolve_imports(&db).unwrap();
         assert_eq!(
             callers_of(&db, "formatMoney", "src/legacy/money.ts"),
@@ -941,6 +968,7 @@ mod tests {
 
         let db = Database::open_in_memory().unwrap();
         index_full(&db, dir.path(), None).unwrap();
+        reindex(&db, dir.path(), &["src/cart.ts"]);
         resolve_imports(&db).unwrap();
 
         // `w.formatMoney()` is the widget's method, not the imported function.
@@ -975,9 +1003,7 @@ mod tests {
 
         let db = Database::open_in_memory().unwrap();
         index_full(&db, dir.path(), None).unwrap();
-        // `app.py` is walked before its targets, so its references land on the
-        // re-index; both passes then see the whole file set.
-        index_incremental(&db, dir.path(), &["pkg/app.py".to_string()], &[]).unwrap();
+        reindex(&db, dir.path(), &["pkg/app.py"]);
         resolve_imports(&db).unwrap();
 
         for target in ["pkg/fast.py", "pkg/slow.py"] {
@@ -1013,6 +1039,7 @@ mod tests {
 
         let db = Database::open_in_memory().unwrap();
         index_full(&db, dir.path(), None).unwrap();
+        reindex(&db, dir.path(), &["src/cart.ts"]);
         resolve_imports(&db).unwrap();
         assert_eq!(
             callers_of(&db, "formatMoney", "src/util/money.ts"),
@@ -1068,6 +1095,11 @@ mod tests {
 
         let db = Database::open_in_memory().unwrap();
         index_full(&db, dir.path(), None).unwrap();
+        reindex(
+            &db,
+            dir.path(),
+            &["pkg/domain/cart.py", "pkg/domain/audit.py"],
+        );
         resolve_imports(&db).unwrap();
 
         assert_eq!(
