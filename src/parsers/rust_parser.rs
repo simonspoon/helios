@@ -33,7 +33,7 @@ impl RustParser {
         "private".to_string()
     }
 
-    fn find_scope(source: &[u8], node: tree_sitter::Node) -> Option<String> {
+    pub fn find_scope(source: &[u8], node: tree_sitter::Node) -> Option<String> {
         let mut current = node.parent();
         while let Some(parent) = current {
             match parent.kind() {

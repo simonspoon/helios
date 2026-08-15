@@ -1,6 +1,7 @@
 mod commands;
 mod db;
 pub mod errors;
+mod flow;
 mod git;
 mod indexer;
 mod parsers;
@@ -91,6 +92,20 @@ enum Command {
         #[arg(long, default_value = "1")]
         depth: u32,
     },
+    /// Control-flow graph of one function body (Rust only)
+    Flow {
+        /// Function or method name (Class.Method, path/to/file.rs:name)
+        target: String,
+        /// Restrict the target to definitions in this scope (class or impl block)
+        #[arg(long)]
+        scope: Option<String>,
+        /// Restrict the target to definitions in files matching this path
+        #[arg(long)]
+        file: Option<String>,
+        /// Emit a mermaid flowchart instead of an indented tree
+        #[arg(long)]
+        mermaid: bool,
+    },
     /// Directory-level overview
     Summary {
         /// Path to summarize (defaults to project root)
@@ -158,6 +173,19 @@ fn main() {
             cli.json,
             compact,
             *depth,
+            scope.as_deref(),
+            file.as_deref(),
+        ),
+        Command::Flow {
+            target,
+            scope,
+            file,
+            mermaid,
+        } => commands::flow::run(
+            target,
+            cli.json,
+            compact,
+            *mermaid,
             scope.as_deref(),
             file.as_deref(),
         ),

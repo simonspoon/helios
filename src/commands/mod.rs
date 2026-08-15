@@ -2,6 +2,7 @@ pub mod deps;
 pub mod diff;
 pub mod export;
 pub mod files;
+pub mod flow;
 pub mod init;
 pub mod status;
 pub mod summary;

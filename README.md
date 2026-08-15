@@ -228,6 +228,107 @@ specifiers), Python (relative and dotted-absolute modules) and Rust
 package or namespace rather than a file: they are reported as raw specifier
 text, and a raw specifier still works as a `deps` target.
 
+### `helios flow <TARGET> [--scope <S>] [--file <P>] [--mermaid]`
+
+Show the control-flow graph of a single function or method body: branches,
+loops, match arms, outward calls, and returns. Calls are leaf nodes labelled
+with the callee — the callee's body is never expanded, so the graph stays
+inside the one function you asked about.
+
+**Rust only for now.** A target in any other indexed language exits with an
+error naming the language; the graph builder is per-language and only Rust is
+mapped so far.
+
+```bash
+# Bare name
+helios flow parse_target
+
+# One definition of an ambiguous name, three ways to say it
+helios flow "run" --file src/commands/status.rs
+helios flow "find_definitions" --scope Database
+helios flow "Database.find_definitions"
+helios flow "src/commands/deps.rs:parse_target"
+```
+
+- `--scope <S>` — Restrict the target to definitions in this scope (class or impl block), matched exactly
+- `--file <P>` — Restrict the target to definitions in files matching this path (substring)
+- `--mermaid` — Emit a mermaid flowchart instead of the indented tree
+
+Target spellings match `helios deps`: a bare name, `Class.Method`, or
+`path/to/file.rs:name`, plus `--scope` and `--file` narrowing. A name that
+matches more than one definition is an error listing the candidates.
+
+Default output is an indented tree. Nodes are numbered and carry a kind
+(`entry`, `exit`, `branch`, `match`, `loop`, `call`, `return`, `break`,
+`continue`) and a source line. Bracketed labels are edges — `[true]`/`[false]`
+for branches, the pattern for match arms, `[body]`/`[repeat]`/`[done]` for
+loops. A `->` line is a jump back to an already-printed node instead of
+repeating its subtree, and `! Err ?` marks the early exit of a `?` operator:
+
+```
+$ helios flow mermaid_shape
+src/commands/flow.rs:18-27 mermaid_shape
+#0 entry mermaid_shape(kind: &str, label: &str) -> String :18
+#2 call escape_mermaid(…) :19
+#3 match match kind :20
+  ["entry" | "exit"]
+    #4 call format! :21
+    #1 exit end :27
+  ["branch" | "match"]
+    #5 call format! :22
+    -> #1 exit (end)
+  ["loop"]
+    #6 call format! :23
+    -> #1 exit (end)
+  ["return"]
+    #7 call format! :24
+    -> #1 exit (end)
+  [_]
+    #8 call format! :25
+    -> #1 exit (end)
+```
+
+`--mermaid` emits the same graph as a mermaid flowchart, ready to paste into
+any diagram viewer:
+
+```
+$ helios flow mermaid_shape --mermaid
+flowchart TD
+  n0(["mermaid_shape(kind: &str, label: &str) -> String"])
+  n1(["end"])
+  n2["escape_mermaid(…)"]
+  n3{"match kind"}
+  n4["format!"]
+  n5["format!"]
+  n6["format!"]
+  n7["format!"]
+  n8["format!"]
+  n0 --> n2
+  n2 --> n3
+  n3 -->|"#quot;entry#quot; #124; #quot;exit#quot;"| n4
+  n3 -->|"#quot;branch#quot; #124; #quot;match#quot;"| n5
+  n3 -->|"#quot;loop#quot;"| n6
+  n3 -->|"#quot;return#quot;"| n7
+  n3 -->|"_"| n8
+  n4 --> n1
+  n5 --> n1
+  n6 --> n1
+  n7 --> n1
+  n8 --> n1
+```
+
+Quotes and pipes inside a label are emitted as mermaid entity codes
+(`#quot;`, `#124;`) so they render as text instead of closing the label early.
+
+`--json` returns the graph as data: `function` (name, scope, file, line,
+end_line, language, params, returns), `nodes` (`id`, `kind`, `label`, `line`)
+and `edges` (`from`, `to`, and `label` where the edge is conditional).
+
+Two deliberate omissions: calls inside a closure are not collected — they run
+when the closure is invoked, not at the point it is defined — and nested `fn`
+items are not descended into. A statement that makes no calls and takes no
+branch adds no node, so the graph shows control flow rather than every line.
+
 ### `helios summary [PATH]`
 
 Generate a directory-level overview with symbol counts by language and kind.
@@ -296,6 +397,7 @@ commands/
   update.rs          Incremental indexing (git-aware)
   symbols.rs         Symbol search & filtering
   deps.rs            Dependency analysis (transitive via --depth)
+  flow.rs            Control-flow graph of one function body (Rust)
   summary.rs         Directory-level overview
   diff.rs            Symbol changes since last index
   status.rs          Index health & staleness
@@ -303,6 +405,7 @@ commands/
   export.rs          Full index export
 indexer.rs           Coordinates parsing and DB insertion
 resolver.rs          Resolves import specifiers to indexed files
+flow.rs              Builds the control-flow graph from a function body
 parsers/
   mod.rs             Language detection & parser factory
   rust_parser.rs     Functions, structs, traits, enums, mods

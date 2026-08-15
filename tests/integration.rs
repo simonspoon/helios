@@ -3846,3 +3846,374 @@ fn test_deps_dotted_target_falls_back_to_file_mode() {
         "expected app.py to import pkg.money: {value}"
     );
 }
+
+// --- flow subcommand ---
+
+/// A project whose Rust sources give `flow` something to walk: a branching
+/// method inside an impl block, a free function whose name is deliberately
+/// duplicated across two files, and a Python function for the
+/// unsupported-language path.
+fn setup_flow_project() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+
+    std::fs::write(
+        dir.path().join("src/pricing.rs"),
+        r#"pub struct Pricing {
+    pub rate: i32,
+}
+
+impl Pricing {
+    pub fn compute(&self, units: i32) -> i32 {
+        if units > 10 {
+            discount(units)
+        } else {
+            units * self.rate
+        }
+    }
+}
+
+pub fn discount(units: i32) -> i32 {
+    units / 2
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        dir.path().join("src/legacy.rs"),
+        "pub fn discount(units: i32) -> i32 {\n    units\n}\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        dir.path().join("lib.py"),
+        "def summarize(rows):\n    if rows:\n        return len(rows)\n    return 0\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed during setup");
+    (dir, bin)
+}
+
+fn flow_output(bin: &PathBuf, dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    let mut full = vec!["flow"];
+    full.extend_from_slice(args);
+    Command::new(bin)
+        .args(&full)
+        .current_dir(dir)
+        .output()
+        .expect("helios flow")
+}
+
+fn flow_stdout(bin: &PathBuf, dir: &std::path::Path, args: &[&str]) -> String {
+    let output = flow_output(bin, dir, args);
+    assert!(
+        output.status.success(),
+        "helios flow {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn test_flow_tree_output() {
+    let (dir, bin) = setup_flow_project();
+
+    let stdout = flow_stdout(&bin, dir.path(), &["Pricing.compute"]);
+
+    assert!(
+        stdout.starts_with("src/pricing.rs:6-12 compute\n"),
+        "tree should be headed by the function's location: {stdout}"
+    );
+    assert!(
+        stdout.contains("entry Pricing.compute(&self, units: i32) -> i32"),
+        "tree should open at the entry node: {stdout}"
+    );
+    assert!(
+        stdout.contains("branch units > 10"),
+        "the if condition should appear as a branch: {stdout}"
+    );
+    assert!(
+        stdout.contains("[true]") && stdout.contains("[false]"),
+        "both branch arms should be labelled: {stdout}"
+    );
+    assert!(
+        stdout.contains("call discount(…)"),
+        "the call in the true arm should appear: {stdout}"
+    );
+    assert!(
+        stdout.contains("exit end"),
+        "the tree should reach the exit node: {stdout}"
+    );
+}
+
+#[test]
+fn test_flow_json_output() {
+    let (dir, bin) = setup_flow_project();
+
+    let output = Command::new(&bin)
+        .args(["--json", "flow", "Pricing.compute"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios --json flow");
+    assert!(output.status.success(), "helios --json flow failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("parsing flow JSON ({e}): {stdout}"));
+
+    assert_eq!(value["function"]["name"], "compute");
+    assert_eq!(value["function"]["scope"], "Pricing");
+    assert_eq!(value["function"]["file"], "src/pricing.rs");
+    assert_eq!(value["function"]["language"], "rust");
+
+    let kinds: Vec<&str> = value["nodes"]
+        .as_array()
+        .expect("nodes array")
+        .iter()
+        .map(|n| n["kind"].as_str().expect("node kind"))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["entry", "exit", "branch", "call", "return", "return"],
+        "unexpected node kinds: {stdout}"
+    );
+
+    let edges = value["edges"].as_array().expect("edges array");
+    let labels: Vec<&str> = edges.iter().filter_map(|e| e["label"].as_str()).collect();
+    assert_eq!(
+        labels,
+        vec!["true", "false"],
+        "unexpected edge labels: {stdout}"
+    );
+    assert!(
+        edges
+            .iter()
+            .all(|e| e["from"].is_number() && e["to"].is_number()),
+        "every edge needs numeric endpoints: {stdout}"
+    );
+}
+
+#[test]
+fn test_flow_mermaid_output() {
+    let (dir, bin) = setup_flow_project();
+
+    let stdout = flow_stdout(&bin, dir.path(), &["Pricing.compute", "--mermaid"]);
+
+    assert!(
+        stdout.starts_with("flowchart TD\n"),
+        "mermaid output should open with the flowchart header: {stdout}"
+    );
+    assert!(
+        stdout.contains("n2{\"units > 10\"}"),
+        "a branch node should use the decision shape: {stdout}"
+    );
+    assert!(
+        stdout.contains("n0 --> n2"),
+        "unlabelled edges should be plain arrows: {stdout}"
+    );
+    assert!(
+        stdout.contains("-->|\"true\"|") && stdout.contains("-->|\"false\"|"),
+        "branch edges should carry their labels: {stdout}"
+    );
+}
+
+#[test]
+fn test_flow_target_spellings_resolve() {
+    let (dir, bin) = setup_flow_project();
+
+    // A bare unique name, and the same definition reached via Scope.Method.
+    let bare = flow_stdout(&bin, dir.path(), &["compute"]);
+    let scoped_name = flow_stdout(&bin, dir.path(), &["Pricing.compute"]);
+    assert_eq!(bare, scoped_name);
+    assert!(bare.starts_with("src/pricing.rs:6-12 compute\n"), "{bare}");
+
+    // --scope reaches the same definition as the dotted spelling.
+    let scope_flag = flow_stdout(&bin, dir.path(), &["compute", "--scope", "Pricing"]);
+    assert_eq!(scope_flag, scoped_name);
+
+    // The duplicated name needs narrowing: path:name and --file both work, and
+    // they select genuinely different bodies.
+    let qualified = flow_stdout(&bin, dir.path(), &["src/pricing.rs:discount"]);
+    assert!(
+        qualified.starts_with("src/pricing.rs:15-17 discount\n") && qualified.contains("units / 2"),
+        "path-qualified target should select the pricing.rs body: {qualified}"
+    );
+
+    let by_file = flow_stdout(&bin, dir.path(), &["discount", "--file", "src/legacy.rs"]);
+    assert!(
+        by_file.starts_with("src/legacy.rs:1-3 discount\n") && !by_file.contains("units / 2"),
+        "--file should select the legacy.rs body: {by_file}"
+    );
+}
+
+#[test]
+fn test_flow_ambiguous_target_errors() {
+    let (dir, bin) = setup_flow_project();
+
+    let output = flow_output(&bin, dir.path(), &["discount"]);
+
+    let code = output.status.code().expect("should have exit code");
+    assert_eq!(
+        code, 1,
+        "an ambiguous flow target should exit 1, got {code}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("matches 2 definitions"),
+        "stderr should report the ambiguity, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("narrow with --file or --scope"),
+        "stderr should suggest narrowing, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("src/pricing.rs:15") && stderr.contains("src/legacy.rs:1"),
+        "stderr should list both candidates, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_flow_unknown_target_errors() {
+    let (dir, bin) = setup_flow_project();
+
+    let output = flow_output(&bin, dir.path(), &["nosuchfunction"]);
+
+    let code = output.status.code().expect("should have exit code");
+    assert_eq!(code, 1, "an unknown flow target should exit 1, got {code}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no function named nosuchfunction"),
+        "stderr should name the missing function, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_flow_no_index_exits_2() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    let output = flow_output(&bin, dir.path(), &["anything"]);
+
+    let code = output.status.code().expect("should have exit code");
+    assert_eq!(
+        code, 2,
+        "helios flow without index should exit 2, got {code}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No index found"),
+        "stderr should mention the missing index, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_flow_unsupported_language_errors() {
+    let (dir, bin) = setup_flow_project();
+
+    let output = flow_output(&bin, dir.path(), &["summarize"]);
+
+    let code = output.status.code().expect("should have exit code");
+    assert_eq!(code, 1, "a non-Rust flow target should exit 1, got {code}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("flow does not support python yet"),
+        "stderr should name the unsupported language, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("supported: rust"),
+        "stderr should say what is supported, got: {stderr}"
+    );
+}
+
+/// A bare name that happens to spell a file extension is still a function.
+/// Target parsing used to read `go` as a path and reject it outright with
+/// "flow needs a function or method, not a file".
+#[test]
+fn test_flow_extension_like_name_resolves() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    std::fs::write(
+        dir.path().join("ext.rs"),
+        "pub fn go() -> i32 {\n    rs()\n}\n\npub fn rs() -> i32 {\n    1\n}\n",
+    )
+    .unwrap();
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    let go = flow_stdout(&bin, dir.path(), &["go"]);
+    assert!(
+        go.starts_with("ext.rs:1-3 go\n"),
+        "`go` should resolve to the function, not be read as a file: {go}"
+    );
+    assert!(
+        go.contains("entry go() -> i32") && go.contains("call rs(…)"),
+        "the graph should be `go`'s own body: {go}"
+    );
+
+    let rs = flow_stdout(&bin, dir.path(), &["rs"]);
+    assert!(
+        rs.starts_with("ext.rs:5-7 rs\n") && rs.contains("return 1"),
+        "`rs` should resolve to the function too: {rs}"
+    );
+}
+
+/// `--scope` must be checked against the source, not just printed as a label.
+/// The index stores a line number, so once the file shifts under a stale index
+/// the recorded line lands in the wrong impl block — the scope is what tells
+/// the two `go` methods apart.
+#[test]
+fn test_flow_scope_survives_a_stale_index() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    let source = dir.path().join("pair.rs");
+    std::fs::write(
+        &source,
+        "pub struct A;\npub struct B;\n\nimpl A {\n    pub fn go(&self) -> i32 {\n        11\n    }\n}\n\nimpl B {\n    pub fn go(&self) -> i32 {\n        22\n    }\n}\n",
+    )
+    .unwrap();
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    let fresh = flow_stdout(&bin, dir.path(), &["go", "--scope", "B"]);
+    assert!(
+        fresh.contains("entry B.go(&self) -> i32") && fresh.contains("return 22"),
+        "--scope B should select B's body: {fresh}"
+    );
+    assert!(
+        !fresh.contains("return 11"),
+        "A's body must not appear: {fresh}"
+    );
+
+    // Shift every definition down three lines, leaving the index stale: the
+    // recorded line for B.go now points inside `impl A`.
+    let shifted = format!(
+        "// a comment added after indexing\n// another comment\n// and a third\n{}",
+        std::fs::read_to_string(&source).expect("reading fixture")
+    );
+    std::fs::write(&source, shifted).unwrap();
+
+    let stale = flow_stdout(&bin, dir.path(), &["go", "--scope", "B"]);
+    assert!(
+        stale.contains("entry B.go(&self) -> i32") && stale.contains("return 22"),
+        "--scope B must still select B's body under a stale index: {stale}"
+    );
+    assert!(
+        !stale.contains("return 11"),
+        "A's body must not be shown labelled as B.go: {stale}"
+    );
+}

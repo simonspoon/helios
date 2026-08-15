@@ -7,14 +7,14 @@ use crate::errors::NoIndexError;
 use crate::parsers::detect_language;
 
 /// A symbol target: the name to look up plus the narrowing the user asked for.
-struct SymbolTarget {
-    name: String,
-    scope: Option<String>,
-    file: Option<String>,
+pub struct SymbolTarget {
+    pub name: String,
+    pub scope: Option<String>,
+    pub file: Option<String>,
     /// Whether an empty result should be retried as a file target. Only a bare
     /// dotted target sets this — it may be a module path rather than a
     /// qualified name.
-    may_be_file: bool,
+    pub may_be_file: bool,
 }
 
 /// Which definition(s) a target names, and how it was spelled.
@@ -24,7 +24,7 @@ struct SymbolTarget {
 /// one — it has a path separator or a source extension — and a *symbol*
 /// otherwise. `--scope` / `--file` force symbol mode, since they only narrow a
 /// definition.
-fn parse_target(target: &str, scope: Option<&str>, file: Option<&str>) -> Option<SymbolTarget> {
+pub fn parse_target(target: &str, scope: Option<&str>, file: Option<&str>) -> Option<SymbolTarget> {
     // `path/to/file.ts:name` — a file and a name, so unambiguously a symbol.
     if let Some((path, name)) = target.rsplit_once(':')
         && !name.is_empty()
