@@ -329,6 +329,13 @@ when the closure is invoked, not at the point it is defined — and nested `fn`
 items are not descended into. A statement that makes no calls and takes no
 branch adds no node, so the graph shows control flow rather than every line.
 
+Three approximations, all in the same direction — a decision the graph draws as
+a straight line. A branch nested inside an expression (`foo(if a { p() } else
+{ q() })`) contributes `p` and `q` as sequential calls rather than as arms; a
+`while` condition's calls sit before the loop header, so the back-edge re-enters
+past them; and match-arm guards hang off the match node in parallel, so the
+graph does not show that the second arm's guard only runs once the first fails.
+
 ### `helios summary [PATH]`
 
 Generate a directory-level overview with symbol counts by language and kind.
