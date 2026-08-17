@@ -1,92 +1,16 @@
-//! Control-flow graph of a single function body.
-//!
-//! `helios flow <symbol>` answers "what does this method do?" — the branches it
-//! takes, the loops it runs, the calls it makes, and where it returns. The graph
-//! stops at the function boundary: a call is a labelled node, never an expansion
-//! of the callee's body.
-//!
-//! Only Rust is wired up (see `build`); other languages parse fine but have no
-//! statement mapping yet, so they are rejected with a clear message.
+//! The Rust statement mapping for `helios flow`.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use tree_sitter::{Node, Parser};
 
+use super::{
+    Breakable, Builder, ERR_EXIT, FlowEdge, FlowGraph, FunctionInfo, Pending, label_of, line_of,
+    qualified,
+};
 use crate::parsers::rust_parser::RustParser;
-
-/// Edge label for the early return a `?` operator can take.
-pub const ERR_EXIT: &str = "Err ?";
-
-/// How wide a label may get before it is elided.
-const LABEL_WIDTH: usize = 60;
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct FunctionInfo {
-    pub name: String,
-    pub scope: Option<String>,
-    pub file: String,
-    pub line: i64,
-    pub end_line: i64,
-    pub language: String,
-    pub params: Vec<String>,
-    pub returns: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct FlowNode {
-    pub id: usize,
-    /// entry, exit, branch, match, loop, call, return, break, continue
-    pub kind: String,
-    pub label: String,
-    pub line: i64,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct FlowEdge {
-    pub from: usize,
-    pub to: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct FlowGraph {
-    pub function: FunctionInfo,
-    pub nodes: Vec<FlowNode>,
-    pub edges: Vec<FlowEdge>,
-}
-
-/// A dangling predecessor: the node the next statement should hang off, and the
-/// label the connecting edge carries ("true", an arm pattern, ...).
-type Pending = (usize, Option<String>);
 
 /// Node kinds that hold a Rust function body, in definition order.
 const RUST_FN_KINDS: &[&str] = &["function_item", "function_signature_item"];
-
-/// Collapse whitespace and elide, so a label stays one readable line.
-fn label_of(source: &[u8], node: Node) -> String {
-    let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
-    let mut out = String::new();
-    let mut space = false;
-    for ch in text.chars() {
-        if ch.is_whitespace() {
-            space = !out.is_empty();
-        } else {
-            if space {
-                out.push(' ');
-            }
-            space = false;
-            out.push(ch);
-        }
-    }
-    if out.chars().count() > LABEL_WIDTH {
-        out = out.chars().take(LABEL_WIDTH - 1).collect::<String>() + "…";
-    }
-    out
-}
-
-fn line_of(node: Node) -> i64 {
-    node.start_position().row as i64 + 1
-}
 
 /// Locate the function whose name matches `name` and whose body contains
 /// `line`. The index records the *name* position, so the innermost enclosing
@@ -137,14 +61,6 @@ fn find_rust_function<'t>(
     }
 }
 
-struct LoopCtx {
-    header: usize,
-    /// `'outer` on a labelled loop, so `break 'outer` finds the right one.
-    label: Option<String>,
-    /// `breaks` that leave this loop, to be joined onto whatever follows it.
-    breaks: Vec<Pending>,
-}
-
 /// The `'name` on a labelled loop, or on the `break`/`continue` naming it.
 fn loop_label(source: &[u8], node: Node) -> Option<String> {
     (0..node.named_child_count() as u32)
@@ -153,53 +69,17 @@ fn loop_label(source: &[u8], node: Node) -> Option<String> {
         .map(|c| label_of(source, c))
 }
 
-struct Builder<'a> {
-    source: &'a [u8],
-    nodes: Vec<FlowNode>,
-    edges: Vec<FlowEdge>,
-    exit: usize,
-    loops: Vec<LoopCtx>,
-}
-
-impl<'a> Builder<'a> {
-    fn add(&mut self, kind: &str, label: String, line: i64) -> usize {
-        let id = self.nodes.len();
-        self.nodes.push(FlowNode {
-            id,
-            kind: kind.to_string(),
-            label,
-            line,
-        });
-        id
-    }
-
-    fn connect(&mut self, tails: &[Pending], to: usize) {
-        for (from, label) in tails {
-            self.edges.push(FlowEdge {
-                from: *from,
-                to,
-                label: label.clone(),
-            });
-        }
-    }
-
+impl Builder<'_> {
     /// Which enclosing loop a `break`/`continue` leaves: the one it names, or
     /// the innermost when it names none.
     fn target_loop(&self, node: Node) -> Option<usize> {
         match loop_label(self.source, node) {
             Some(name) => self
-                .loops
+                .breakables
                 .iter()
                 .rposition(|ctx| ctx.label.as_deref() == Some(name.as_str())),
-            None => self.loops.len().checked_sub(1),
+            None => self.breakables.len().checked_sub(1),
         }
-    }
-
-    /// Chain a node onto the pending predecessors and become the new tail.
-    fn chain(&mut self, tails: Vec<Pending>, kind: &str, label: String, line: i64) -> usize {
-        let id = self.add(kind, label, line);
-        self.connect(&tails, id);
-        id
     }
 
     /// Statements of a block, in order. Returns the tails that fall out of it;
@@ -262,7 +142,7 @@ impl<'a> Builder<'a> {
                 let tails = self.emit_calls(node, tails);
                 let id = self.chain(tails, "break", label_of(self.source, node), line_of(node));
                 let target = self.target_loop(node);
-                match target.and_then(|i| self.loops.get_mut(i)) {
+                match target.and_then(|i| self.breakables.get_mut(i)) {
                     Some(ctx) => ctx.breaks.push((id, None)),
                     // A stray break outside a loop only happens in code that
                     // does not compile; treat it as an exit rather than lose it.
@@ -281,7 +161,7 @@ impl<'a> Builder<'a> {
                     label_of(self.source, node),
                     line_of(node),
                 );
-                if let Some(header) = self.target_loop(node).map(|i| self.loops[i].header) {
+                if let Some(header) = self.target_loop(node).map(|i| self.breakables[i].header) {
                     self.edges.push(FlowEdge {
                         from: id,
                         to: header,
@@ -468,9 +348,11 @@ impl<'a> Builder<'a> {
         };
         let id = self.chain(tails, "loop", label, line_of(node));
 
-        self.loops.push(LoopCtx {
+        self.breakables.push(Breakable {
             header: id,
             label: loop_label(self.source, node),
+            is_loop: true,
+            finally_depth: 0,
             breaks: Vec::new(),
         });
         // A loop body is never in tail position: the value of a `loop` comes
@@ -479,7 +361,7 @@ impl<'a> Builder<'a> {
             Some(body) => self.block(body, vec![(id, Some("body".into()))], false),
             None => Vec::new(),
         };
-        let ctx = self.loops.pop().expect("loop context pushed above");
+        let ctx = self.breakables.pop().expect("loop context pushed above");
 
         // Falling off the end of the body goes back round. A tail that already
         // carries a label ("false" off a trailing `if`) keeps it — the edge
@@ -620,22 +502,14 @@ fn call_label(source: &[u8], node: Node) -> (String, bool) {
     (label, fallible)
 }
 
-/// Build the flow graph for the function named `name` at `line` in `source`.
-pub fn build(
-    language: &str,
+/// Build the flow graph for the Rust function named `name` at `line`.
+pub(super) fn build(
     source: &str,
     file: &str,
     name: &str,
     scope: Option<&str>,
     line: i64,
 ) -> Result<FlowGraph> {
-    if language != "rust" {
-        bail!(
-            "flow does not support {language} yet (supported: rust); \
-             the graph builder is per-language and only Rust is mapped so far"
-        );
-    }
-
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -644,13 +518,10 @@ pub fn build(
     let src = source.as_bytes();
 
     let func = find_rust_function(tree.root_node(), src, name, scope, line).ok_or_else(|| {
-        let qualified = match scope {
-            Some(s) => format!("{s}.{name}"),
-            None => name.to_string(),
-        };
         anyhow!(
-            "no function body for {qualified} at {file}:{line} \
-             (the index may be stale — run `helios update`)"
+            "no function body for {} at {file}:{line} \
+             (the index may be stale — run `helios update`)",
+            qualified(scope, name)
         )
     })?;
 
@@ -671,43 +542,23 @@ pub fn build(
         file: file.to_string(),
         line: line_of(func),
         end_line: func.end_position().row as i64 + 1,
-        language: language.to_string(),
+        language: "rust".to_string(),
         params,
         returns: func
             .child_by_field_name("return_type")
             .map(|r| label_of(src, r)),
     };
 
-    let signature = match (&function.scope, function.returns.as_deref()) {
-        (Some(s), Some(r)) => format!("{s}.{name}({}) -> {r}", function.params.join(", ")),
-        (Some(s), None) => format!("{s}.{name}({})", function.params.join(", ")),
-        (None, Some(r)) => format!("{name}({}) -> {r}", function.params.join(", ")),
-        (None, None) => format!("{name}({})", function.params.join(", ")),
-    };
-
-    let mut builder = Builder {
-        source: src,
-        nodes: Vec::new(),
-        edges: Vec::new(),
-        exit: 0,
-        loops: Vec::new(),
-    };
-    let entry = builder.add("entry", signature, function.line);
-    let exit = builder.add("exit", "end".to_string(), function.end_line);
-    builder.exit = exit;
-    debug_assert_eq!(entry, 0);
+    let mut builder = Builder::start(src, &function);
+    let exit = builder.exit;
 
     let body = func
         .child_by_field_name("body")
         .ok_or_else(|| anyhow!("{name} has no body at {file}:{line}"))?;
-    let tails = builder.block(body, vec![(entry, None)], true);
+    let tails = builder.block(body, vec![(0, None)], true);
     builder.connect(&tails, exit);
 
-    Ok(FlowGraph {
-        function,
-        nodes: builder.nodes,
-        edges: builder.edges,
-    })
+    Ok(builder.finish(function))
 }
 
 #[cfg(test)]
@@ -720,7 +571,7 @@ mod tests {
             .position(|l| l.contains(&format!("fn {name}")))
             .map(|i| i as i64 + 1)
             .unwrap_or(1);
-        build("rust", source, "test.rs", name, None, line).unwrap()
+        build(source, "test.rs", name, None, line).unwrap()
     }
 
     fn kinds(g: &FlowGraph, kind: &str) -> Vec<String> {
@@ -1056,7 +907,7 @@ fn outer() {
             .position(|l| l.contains("fn helper"))
             .map(|i| i as i64 + 1)
             .unwrap();
-        let g = build("rust", source, "test.rs", "helper", None, line).unwrap();
+        let g = build(source, "test.rs", "helper", None, line).unwrap();
         assert_eq!(kinds(&g, "call"), vec!["inner_call(…)"]);
     }
 
@@ -1327,24 +1178,18 @@ impl B {
     }
 }
 "#;
-        let g = build("rust", source, "test.rs", "go", Some("B"), 7).unwrap();
+        let g = build(source, "test.rs", "go", Some("B"), 7).unwrap();
         assert_eq!(kinds(&g, "call"), vec!["b_go(…)"]);
 
-        let g = build("rust", source, "test.rs", "go", Some("A"), 13).unwrap();
+        let g = build(source, "test.rs", "go", Some("A"), 13).unwrap();
         assert_eq!(kinds(&g, "call"), vec!["a_go(…)"]);
     }
 
     #[test]
     fn a_stale_line_still_finds_the_only_function_with_that_name() {
         let source = "fn moved() {\n    work();\n}\n";
-        let g = build("rust", source, "test.rs", "moved", None, 97).unwrap();
+        let g = build(source, "test.rs", "moved", None, 97).unwrap();
         assert_eq!(kinds(&g, "call"), vec!["work(…)"]);
         assert_eq!(g.function.line, 1, "the graph reports where it really is");
-    }
-
-    #[test]
-    fn unsupported_language_is_rejected() {
-        let err = build("python", "def f(): pass", "a.py", "f", None, 1).unwrap_err();
-        assert!(err.to_string().contains("does not support python"));
     }
 }

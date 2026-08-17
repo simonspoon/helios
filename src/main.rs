@@ -92,7 +92,7 @@ enum Command {
         #[arg(long, default_value = "1")]
         depth: u32,
     },
-    /// Control-flow graph of one function body (Rust only)
+    /// Control-flow graph of one function body (Rust and C#)
     Flow {
         /// Function or method name (Class.Method, path/to/file.rs:name)
         target: String,
@@ -102,6 +102,9 @@ enum Command {
         /// Restrict the target to definitions in files matching this path
         #[arg(long)]
         file: Option<String>,
+        /// Select the definition declared on this line (tells overloads apart)
+        #[arg(long)]
+        line: Option<i64>,
         /// Emit a mermaid flowchart instead of an indented tree
         #[arg(long)]
         mermaid: bool,
@@ -180,6 +183,7 @@ fn main() {
             target,
             scope,
             file,
+            line,
             mermaid,
         } => commands::flow::run(
             target,
@@ -188,6 +192,7 @@ fn main() {
             *mermaid,
             scope.as_deref(),
             file.as_deref(),
+            *line,
         ),
         Command::Summary { path } => commands::summary::run(path.as_deref(), cli.json, compact),
         Command::Status => commands::status::run(cli.json, compact),

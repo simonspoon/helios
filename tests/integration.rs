@@ -4070,7 +4070,7 @@ fn test_flow_ambiguous_target_errors() {
         "stderr should report the ambiguity, got: {stderr}"
     );
     assert!(
-        stderr.contains("narrow with --file or --scope"),
+        stderr.contains("narrow with --file, --scope or --line"),
         "stderr should suggest narrowing, got: {stderr}"
     );
     assert!(
@@ -4215,5 +4215,302 @@ fn test_flow_scope_survives_a_stale_index() {
     assert!(
         !stale.contains("return 11"),
         "A's body must not be shown labelled as B.go: {stale}"
+    );
+}
+
+/// A C# project whose methods exercise the constructs `flow` maps: an if/else,
+/// a foreach with `continue` and `break`, a switch, a try/catch and a throw in
+/// `Total`; a switch with no default and both `yield` forms in `Pending`.
+/// `Rate` is an arrow-bodied property, the other shape of C# body.
+fn setup_csharp_flow_project() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    std::fs::write(
+        dir.path().join("Orders.cs"),
+        r#"using System;
+
+namespace Shop {
+    public class Orders {
+        public int Total(int units) {
+            if (units > 10) {
+                Log("bulk");
+            } else {
+                Log("retail");
+            }
+
+            foreach (var item in Fetch()) {
+                if (Skip(item)) {
+                    continue;
+                }
+                if (Done(item)) {
+                    break;
+                }
+                Handle(item);
+            }
+
+            switch (units) {
+                case 0:
+                    Log("empty");
+                    break;
+                default:
+                    Log("some");
+                    break;
+            }
+
+            try {
+                Commit();
+            } catch (InvalidOperationException e) {
+                Rollback(e);
+            }
+
+            if (units < 0) {
+                throw new ArgumentException("negative");
+            }
+            return units * 2;
+        }
+
+        public IEnumerable<int> Pending(int mode) {
+            switch (mode) {
+                case 0:
+                    Log("none");
+                    break;
+            }
+            yield return Next();
+            yield break;
+        }
+
+        public int Rate => Lookup();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed during setup");
+    (dir, bin)
+}
+
+#[test]
+fn test_flow_csharp_tree_output() {
+    let (dir, bin) = setup_csharp_flow_project();
+
+    let stdout = flow_stdout(&bin, dir.path(), &["Orders.Total"]);
+
+    assert!(
+        stdout.starts_with("Orders.cs:5-41 Total\n"),
+        "tree should be headed by the method's location: {stdout}"
+    );
+    assert!(
+        stdout.contains("entry Orders.Total(int units) -> int"),
+        "tree should open at the entry node: {stdout}"
+    );
+    assert!(
+        stdout.contains("branch units > 10") && stdout.contains("[true]"),
+        "the if condition should appear as a branch: {stdout}"
+    );
+    assert!(
+        stdout.contains("loop foreach (var item in Fetch())"),
+        "the foreach header should appear as a loop: {stdout}"
+    );
+    for marker in ["[body]", "[repeat]", "[done]"] {
+        assert!(
+            stdout.contains(marker),
+            "the loop should carry {marker}: {stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("continue continue;") && stdout.contains("break break;"),
+        "continue and break should be nodes: {stdout}"
+    );
+    assert!(
+        stdout.contains("match switch units") && stdout.contains("[default]"),
+        "the switch and its default label should appear: {stdout}"
+    );
+    assert!(
+        stdout.contains("branch try") && stdout.contains("[catch (InvalidOperationException e)]"),
+        "the try and its catch edge should appear: {stdout}"
+    );
+    assert!(
+        stdout.contains("throw throw new ArgumentException(\"negative\");"),
+        "the throw should be its own node: {stdout}"
+    );
+    assert!(
+        stdout.contains("call new ArgumentException(…)"),
+        "object creation should be a call node: {stdout}"
+    );
+    assert!(
+        stdout.contains("return return units * 2;") && stdout.contains("exit end"),
+        "the tree should reach the exit node: {stdout}"
+    );
+}
+
+#[test]
+fn test_flow_csharp_json_output() {
+    let (dir, bin) = setup_csharp_flow_project();
+
+    let output = Command::new(&bin)
+        .args(["--json", "flow", "Orders.Rate"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios --json flow");
+    assert!(output.status.success(), "helios --json flow failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("parsing flow JSON ({e}): {stdout}"));
+
+    assert_eq!(value["function"]["name"], "Rate");
+    assert_eq!(value["function"]["scope"], "Orders");
+    assert_eq!(value["function"]["file"], "Orders.cs");
+    assert_eq!(value["function"]["language"], "csharp");
+    assert_eq!(value["function"]["returns"], "int");
+
+    let kinds: Vec<&str> = value["nodes"]
+        .as_array()
+        .expect("nodes array")
+        .iter()
+        .map(|n| n["kind"].as_str().expect("node kind"))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["entry", "exit", "call", "return"],
+        "an arrow body is a call and a return: {stdout}"
+    );
+
+    let edges = value["edges"].as_array().expect("edges array");
+    assert!(
+        edges
+            .iter()
+            .all(|e| e["from"].is_number() && e["to"].is_number()),
+        "every edge needs numeric endpoints: {stdout}"
+    );
+}
+
+#[test]
+fn test_flow_csharp_mermaid_output() {
+    let (dir, bin) = setup_csharp_flow_project();
+
+    let stdout = flow_stdout(&bin, dir.path(), &["Orders.Total", "--mermaid"]);
+
+    assert!(
+        stdout.starts_with("flowchart TD\n"),
+        "mermaid output should open with the flowchart header: {stdout}"
+    );
+    assert!(
+        stdout.contains("n0([\"Orders.Total(int units) -> int\"])"),
+        "the entry node should carry the signature: {stdout}"
+    );
+    assert!(
+        stdout.contains("{\"units > 10\"}"),
+        "a branch node should use the decision shape: {stdout}"
+    );
+    assert!(
+        stdout.contains("{{\"foreach (var item in Fetch())\"}}"),
+        "a loop header should use the loop shape: {stdout}"
+    );
+    assert!(
+        stdout.contains("-->|\"true\"|") && stdout.contains("-->|\"default\"|"),
+        "branch and switch edges should carry their labels: {stdout}"
+    );
+}
+
+#[test]
+fn test_flow_csharp_no_match_edge_and_yield_nodes() {
+    let (dir, bin) = setup_csharp_flow_project();
+
+    let stdout = flow_stdout(&bin, dir.path(), &["Orders.Pending"]);
+
+    assert!(
+        stdout.contains("match switch mode"),
+        "the switch should appear: {stdout}"
+    );
+    assert!(
+        stdout.contains("[no match]"),
+        "a switch with no default can match nothing: {stdout}"
+    );
+    assert!(
+        stdout.contains("yield yield return Next();"),
+        "`yield return` should be its own kind: {stdout}"
+    );
+    assert!(
+        stdout.contains("return yield break;"),
+        "`yield break` should end the iterator: {stdout}"
+    );
+    assert!(
+        stdout.contains("exit end"),
+        "the tree should reach the exit node: {stdout}"
+    );
+}
+
+/// Two overloads share a name, a scope and a file, so neither `--scope` nor
+/// `--file` can tell them apart; `--line` is what picks one.
+#[test]
+fn test_flow_csharp_overloads_need_line() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    std::fs::write(
+        dir.path().join("Math.cs"),
+        r#"public class Calc {
+    public int Add(int a) {
+        return One(a);
+    }
+
+    public int Add(int a, int b) {
+        return Two(a, b);
+    }
+}
+"#,
+    )
+    .unwrap();
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    // Ambiguous on its own, and the advice names the flag that can fix it.
+    let output = flow_output(&bin, dir.path(), &["Calc.Add"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("matches 2 definitions"),
+        "stderr should report the ambiguity: {stderr}"
+    );
+    assert!(
+        stderr.contains("narrow with --file, --scope or --line"),
+        "stderr should suggest --line: {stderr}"
+    );
+    assert!(
+        stderr.contains("Math.cs:2") && stderr.contains("Math.cs:6"),
+        "the candidate lines are what --line takes: {stderr}"
+    );
+
+    let first = flow_stdout(&bin, dir.path(), &["Calc.Add", "--line", "2"]);
+    assert!(
+        first.contains("entry Calc.Add(int a)") && first.contains("call One(…)"),
+        "--line 2 should select the one-argument overload: {first}"
+    );
+    assert!(!first.contains("Two(…)"), "{first}");
+
+    let second = flow_stdout(&bin, dir.path(), &["Calc.Add", "--line", "6"]);
+    assert!(
+        second.contains("entry Calc.Add(int a, int b)") && second.contains("call Two(…)"),
+        "--line 6 should select the two-argument overload: {second}"
+    );
+    assert!(!second.contains("One(…)"), "{second}");
+
+    // A line no definition starts on is an error, not a silent fallback.
+    let output = flow_output(&bin, dir.path(), &["Calc.Add", "--line", "99"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("declared on line 99"),
+        "stderr should name the line that matched nothing: {stderr}"
     );
 }

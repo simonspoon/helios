@@ -21,7 +21,9 @@ fn mermaid_shape(kind: &str, label: &str) -> String {
         "entry" | "exit" => format!("([\"{text}\"])"),
         "branch" | "match" => format!("{{\"{text}\"}}"),
         "loop" => format!("{{{{\"{text}\"}}}}"),
-        "return" => format!("[/\"{text}\"/]"),
+        // A throw ends the path just as a return does, so it gets the same
+        // shape rather than reading as an ordinary step.
+        "return" | "throw" => format!("[/\"{text}\"/]"),
         _ => format!("[\"{text}\"]"),
     }
 }
@@ -120,6 +122,7 @@ pub fn run(
     mermaid: bool,
     scope: Option<&str>,
     file: Option<&str>,
+    line: Option<i64>,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let db_path = cwd.join(".helios/index.db");
@@ -159,10 +162,16 @@ pub fn run(
         )?
         .into_iter()
         .filter(|(sym, _)| sym.name == symbol.name)
+        // Overloads differ only by their parameters, which the index does not
+        // record, so the line is the only thing that tells them apart.
+        .filter(|(sym, _)| line.is_none_or(|l| sym.line == l))
         .collect();
 
     let (sym, path) = match matches.len() {
-        0 => bail!("no function named {target} in the index"),
+        0 => match line {
+            Some(l) => bail!("no function named {target} declared on line {l}"),
+            None => bail!("no function named {target} in the index"),
+        },
         1 => matches.into_iter().next().expect("one match"),
         _ => {
             let candidates: Vec<String> = matches
@@ -173,7 +182,7 @@ pub fn run(
                 })
                 .collect();
             bail!(
-                "{target} matches {} definitions; narrow with --file or --scope:\n  {}",
+                "{target} matches {} definitions; narrow with --file, --scope or --line:\n  {}",
                 candidates.len(),
                 candidates.join("\n  ")
             );

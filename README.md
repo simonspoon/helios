@@ -228,63 +228,83 @@ specifiers), Python (relative and dotted-absolute modules) and Rust
 package or namespace rather than a file: they are reported as raw specifier
 text, and a raw specifier still works as a `deps` target.
 
-### `helios flow <TARGET> [--scope <S>] [--file <P>] [--mermaid]`
+### `helios flow <TARGET> [--scope <S>] [--file <P>] [--line <N>] [--mermaid]`
 
 Show the control-flow graph of a single function or method body: branches,
 loops, match arms, outward calls, and returns. Calls are leaf nodes labelled
 with the callee — the callee's body is never expanded, so the graph stays
 inside the one function you asked about.
 
-**Rust only for now.** A target in any other indexed language exits with an
-error naming the language; the graph builder is per-language and only Rust is
-mapped so far.
+**Rust and C# for now.** A target in any other indexed language exits with an
+error naming the language; the graph builder is per-language and only those two
+are mapped so far. A C# target is a method, a constructor, or an arrow-bodied
+property; a property with `get`/`set` accessors is several bodies rather than
+one, and is rejected as such.
 
 ```bash
 # Bare name
 helios flow parse_target
+
+# A C# method, and one written as an expression body
+helios flow "Orders.Total"
+helios flow "Orders.Rate"
 
 # One definition of an ambiguous name, three ways to say it
 helios flow "run" --file src/commands/status.rs
 helios flow "find_definitions" --scope Database
 helios flow "Database.find_definitions"
 helios flow "src/commands/deps.rs:parse_target"
+
+# Two C# overloads share a name, a scope and a file; the line tells them apart
+helios flow "Calc.Add" --line 6
 ```
 
 - `--scope <S>` — Restrict the target to definitions in this scope (class or impl block), matched exactly
 - `--file <P>` — Restrict the target to definitions in files matching this path (substring)
+- `--line <N>` — Select the definition declared on this line
 - `--mermaid` — Emit a mermaid flowchart instead of the indented tree
 
 Target spellings match `helios deps`: a bare name, `Class.Method`, or
-`path/to/file.rs:name`, plus `--scope` and `--file` narrowing. A name that
-matches more than one definition is an error listing the candidates.
+`path/to/file.rs:name`, plus `--scope`, `--file` and `--line` narrowing. A name
+that matches more than one definition is an error listing the candidates with
+their lines. C# overloads are what `--line` is for: they share a name, a scope
+and a file, so the line is the only thing that separates them.
 
 Default output is an indented tree. Nodes are numbered and carry a kind
 (`entry`, `exit`, `branch`, `match`, `loop`, `call`, `return`, `break`,
-`continue`) and a source line. Bracketed labels are edges — `[true]`/`[false]`
-for branches, the pattern for match arms, `[body]`/`[repeat]`/`[done]` for
-loops. A `->` line is a jump back to an already-printed node instead of
-repeating its subtree, and `! Err ?` marks the early exit of a `?` operator:
+`continue`, and in C# also `throw`, `yield` and `goto`) and a source line.
+Bracketed labels are edges — `[true]`/`[false]` for branches, the pattern for
+match arms and switch cases, `[body]`/`[repeat]`/`[done]` for loops, `[try]`
+and `[catch …]` for a `try` statement, and `[no match]` for the path round a C#
+`switch` that has no `default` label and so can match nothing. A `->` line is a
+jump back to an already-printed node instead of repeating its subtree, and
+`! Err ?` marks the early exit of a Rust `?` operator:
 
 ```
 $ helios flow mermaid_shape
-src/commands/flow.rs:18-27 mermaid_shape
+src/commands/flow.rs:18-29 mermaid_shape
 #0 entry mermaid_shape(kind: &str, label: &str) -> String :18
 #2 call escape_mermaid(…) :19
 #3 match match kind :20
   ["entry" | "exit"]
     #4 call format! :21
-    #1 exit end :27
+    #5 return format!("([\"{text}\"])") :21
+    #1 exit end :29
   ["branch" | "match"]
-    #5 call format! :22
+    #6 call format! :22
+    #7 return format!("{{\"{text}\"}}") :22
     -> #1 exit (end)
   ["loop"]
-    #6 call format! :23
+    #8 call format! :23
+    #9 return format!("{{{{\"{text}\"}}}}") :23
     -> #1 exit (end)
-  ["return"]
-    #7 call format! :24
+  ["return" | "throw"]
+    #10 call format! :26
+    #11 return format!("[/\"{text}\"/]") :26
     -> #1 exit (end)
   [_]
-    #8 call format! :25
+    #12 call format! :27
+    #13 return format!("[\"{text}\"]") :27
     -> #1 exit (end)
 ```
 
@@ -299,22 +319,32 @@ flowchart TD
   n2["escape_mermaid(…)"]
   n3{"match kind"}
   n4["format!"]
-  n5["format!"]
+  n5[/"format!(#quot;([\#quot;{text}\#quot;])#quot;)"/]
   n6["format!"]
-  n7["format!"]
+  n7[/"format!(#quot;{{\#quot;{text}\#quot;}}#quot;)"/]
   n8["format!"]
+  n9[/"format!(#quot;{{{{\#quot;{text}\#quot;}}}}#quot;)"/]
+  n10["format!"]
+  n11[/"format!(#quot;[/\#quot;{text}\#quot;/]#quot;)"/]
+  n12["format!"]
+  n13[/"format!(#quot;[\#quot;{text}\#quot;]#quot;)"/]
   n0 --> n2
   n2 --> n3
   n3 -->|"#quot;entry#quot; #124; #quot;exit#quot;"| n4
-  n3 -->|"#quot;branch#quot; #124; #quot;match#quot;"| n5
-  n3 -->|"#quot;loop#quot;"| n6
-  n3 -->|"#quot;return#quot;"| n7
-  n3 -->|"_"| n8
-  n4 --> n1
+  n4 --> n5
   n5 --> n1
-  n6 --> n1
+  n3 -->|"#quot;branch#quot; #124; #quot;match#quot;"| n6
+  n6 --> n7
   n7 --> n1
-  n8 --> n1
+  n3 -->|"#quot;loop#quot;"| n8
+  n8 --> n9
+  n9 --> n1
+  n3 -->|"#quot;return#quot; #124; #quot;throw#quot;"| n10
+  n10 --> n11
+  n11 --> n1
+  n3 -->|"_"| n12
+  n12 --> n13
+  n13 --> n1
 ```
 
 Quotes and pipes inside a label are emitted as mermaid entity codes
@@ -324,10 +354,11 @@ Quotes and pipes inside a label are emitted as mermaid entity codes
 end_line, language, params, returns), `nodes` (`id`, `kind`, `label`, `line`)
 and `edges` (`from`, `to`, and `label` where the edge is conditional).
 
-Two deliberate omissions: calls inside a closure are not collected — they run
-when the closure is invoked, not at the point it is defined — and nested `fn`
-items are not descended into. A statement that makes no calls and takes no
-branch adds no node, so the graph shows control flow rather than every line.
+Two deliberate omissions: calls inside a closure or a C# lambda are not
+collected — they run when it is invoked, not at the point it is defined — and
+nested `fn` items and C# local functions are not descended into. A statement
+that makes no calls and takes no branch adds no node, so the graph shows control
+flow rather than every line.
 
 Three approximations, all in the same direction — a decision the graph draws as
 a straight line. A branch nested inside an expression (`foo(if a { p() } else
@@ -335,6 +366,37 @@ a straight line. A branch nested inside an expression (`foo(if a { p() } else
 `while` condition's calls sit before the loop header, so the back-edge re-enters
 past them; and match-arm guards hang off the match node in parallel, so the
 graph does not show that the second arm's guard only runs once the first fails.
+
+C# adds five of its own, in the same direction. A ternary `?:` and the `??` and
+`?.` short-circuits are drawn as a straight line rather than as a fork; a
+`throw` inside a `try` goes to the function exit rather than to the enclosing
+`catch`, and every `catch` edge is drawn from the entry of the `try`, so the
+graph does not say which statement threw; a `do` loop is drawn with its test
+first, so the graph does not show that the body always runs once; and a `switch`
+*expression* that matches nothing throws at runtime, which the graph does not
+draw — unlike a `switch` statement, whose missed path is the `[no match]` edge.
+
+`goto` is the one place the graph stops rather than approximates. A `goto` — or
+a `goto case` — is a node with no outgoing edge: the path ends there, because
+following it is not modelled. Nothing after the jump is joined on, so the graph
+never claims a path that does not exist. For the same reason a `goto` out of a
+`try` is not shown running the enclosing `finally`, though at runtime it does:
+the block would sit in front of a dead end and assert a path that goes nowhere.
+The cost is at the other end — a labelled statement reached only by a `goto`
+may not appear in the graph at all, because nothing the graph does follow leads
+to it, and drawing it would mean a node with no way in.
+
+A `switch` expression is drawn as a decision where it *is* the value: the
+right-hand side of a `return`, an assignment or a declaration, an arrow body, or
+another arm. Elsewhere it is one subexpression among several — an argument
+(`Use(n switch {…})`), a `yield return`, an operand of a larger expression — and
+its arms are flattened into the sequence of calls they make, like any other
+branch nested inside an expression.
+
+A `finally` runs on every way out of its `try`, including a `return`, `throw`,
+`break` or `continue` that leaves early, so its block is drawn once per path
+that runs it. Seeing the same `finally` body more than once in one graph is the
+construct, not a bug.
 
 ### `helios summary [PATH]`
 
@@ -404,7 +466,7 @@ commands/
   update.rs          Incremental indexing (git-aware)
   symbols.rs         Symbol search & filtering
   deps.rs            Dependency analysis (transitive via --depth)
-  flow.rs            Control-flow graph of one function body (Rust)
+  flow.rs            Control-flow graph of one function body
   summary.rs         Directory-level overview
   diff.rs            Symbol changes since last index
   status.rs          Index health & staleness
@@ -412,7 +474,10 @@ commands/
   export.rs          Full index export
 indexer.rs           Coordinates parsing and DB insertion
 resolver.rs          Resolves import specifiers to indexed files
-flow.rs              Builds the control-flow graph from a function body
+flow/
+  mod.rs             Graph shape shared by every language, and the dispatch
+  rust.rs            Rust statement mapping
+  csharp.rs          C# statement mapping
 parsers/
   mod.rs             Language detection & parser factory
   rust_parser.rs     Functions, structs, traits, enums, mods

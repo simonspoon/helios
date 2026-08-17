@@ -75,7 +75,7 @@ fn in_interface_body(node: tree_sitter::Node) -> bool {
 }
 
 /// Walk up to find enclosing class/struct/namespace name for scope
-fn find_scope(source: &[u8], node: tree_sitter::Node) -> Option<String> {
+pub(crate) fn find_scope(source: &[u8], node: tree_sitter::Node) -> Option<String> {
     let mut current = node.parent();
     while let Some(parent) = current {
         match parent.kind() {
