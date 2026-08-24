@@ -3380,7 +3380,7 @@ fn test_update_warns_on_cs_change_under_semantic_index() {
         "update must warn about stale semantic references, stderr: {stderr}"
     );
     assert!(
-        stderr.contains("1 C# file(s) changed"),
+        stderr.contains("1 C#/XAML file(s) changed"),
         "warning must count the changed .cs files, stderr: {stderr}"
     );
     assert_eq!(
@@ -4513,4 +4513,109 @@ fn test_flow_csharp_overloads_need_line() {
         stderr.contains("declared on line 99"),
         "stderr should name the line that matched nothing: {stderr}"
     );
+}
+
+// --- XAML data bindings (leg A, semantic mode only) ---
+
+const MAUI_VIEWMODEL_CS: &str = r#"
+namespace App {
+    public abstract class BaseViewModel {
+        public bool IsBusy { get; set; }
+    }
+    public class MainViewModel : BaseViewModel {
+        public string Query { get; set; }
+    }
+}
+"#;
+
+const MAUI_PAGE_XAML: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             xmlns:vm="clr-namespace:App"
+             x:DataType="vm:MainViewModel">
+    <Entry Text="{Binding Query}" />
+    <ActivityIndicator IsRunning="{Binding IsBusy}" />
+</ContentPage>
+"#;
+
+/// `helios init` indexes `.xaml` and the sidecar attributes its `{Binding}`
+/// paths to the ViewModel members named by `x:DataType` — including `IsBusy`,
+/// declared on the base class, which a name match against the markup alone
+/// could not reach.
+#[test]
+fn test_e2e_xaml_bindings_resolve_to_viewmodel_members() {
+    let Some(dll) = built_roslyn_dll() else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    std::fs::write(dir.path().join("MainViewModel.cs"), MAUI_VIEWMODEL_CS).unwrap();
+    std::fs::write(dir.path().join("MainPage.xaml"), MAUI_PAGE_XAML).unwrap();
+
+    init_with_sidecar(dir.path(), &dll, "roslyn");
+
+    let conn = index_db(dir.path());
+    let mut stmt = conn
+        .prepare(
+            "SELECT r.line, s.docid FROM references_ r
+             JOIN symbols s ON s.id = r.symbol_id
+             JOIN files f ON f.id = r.file_id
+             WHERE f.path = 'MainPage.xaml' ORDER BY r.line",
+        )
+        .unwrap();
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            (
+                line_of(MAUI_PAGE_XAML, "{Binding Query}"),
+                "P:App.MainViewModel.Query".to_string()
+            ),
+            (
+                line_of(MAUI_PAGE_XAML, "{Binding IsBusy}"),
+                "P:App.BaseViewModel.IsBusy".to_string()
+            ),
+        ]
+    );
+}
+
+/// Without the helper the same repo still indexes: `.xaml` files are file rows
+/// with no symbols and no bindings, and nothing errors.
+#[test]
+fn test_xaml_without_sidecar_indexes_without_bindings() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    std::fs::write(dir.path().join("MainViewModel.cs"), MAUI_VIEWMODEL_CS).unwrap();
+    std::fs::write(dir.path().join("MainPage.xaml"), MAUI_PAGE_XAML).unwrap();
+
+    let output = Command::new(helios_bin())
+        .arg("init")
+        .env("HELIOS_ROSLYN", "")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success());
+
+    let conn = index_db(dir.path());
+    let indexed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE path = 'MainPage.xaml' AND language = 'xaml'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(indexed, 1, "the .xaml file is indexed either way");
+
+    let bindings: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM references_ r JOIN files f ON f.id = r.file_id
+             WHERE f.path = 'MainPage.xaml'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(bindings, 0, "no parser, so no references from markup");
 }

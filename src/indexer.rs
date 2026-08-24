@@ -58,12 +58,19 @@ fn walk_rel_path(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// Root-relative paths of the C# files a full index of `root` will cover.
-/// Passed to the Roslyn sidecar so it reports on exactly the indexed file set
-/// instead of guessing which paths the walk skips. Walk errors propagate —
-/// a silently shorter list would drop those files' references (the sidecar
-/// output replaces the entire `.cs` reference set).
-pub fn indexed_csharp_files(root: &Path) -> Result<Vec<String>> {
+/// Languages whose references come from the Roslyn sidecar instead of a
+/// tree-sitter parser: `.cs`, and the `.xaml` markup whose data bindings the
+/// sidecar resolves against the same compilation.
+pub(crate) fn is_sidecar_language(language: &str) -> bool {
+    matches!(language, "csharp" | "xaml")
+}
+
+/// Root-relative paths of the files a full index of `root` will cover that the
+/// Roslyn sidecar reports on — `.cs` and `.xaml`. Passed to the sidecar so it
+/// reports on exactly the indexed file set instead of guessing which paths the
+/// walk skips. Walk errors propagate — a silently shorter list would drop those
+/// files' references (the sidecar output replaces the entire set).
+pub fn indexed_sidecar_files(root: &Path) -> Result<Vec<String>> {
     let mut files = Vec::new();
     for entry in walk(root) {
         let entry = entry.context("walking directory")?;
@@ -72,7 +79,8 @@ pub fn indexed_csharp_files(root: &Path) -> Result<Vec<String>> {
             continue;
         }
         let rel_path = walk_rel_path(root, path);
-        if !rel_path.starts_with(".helios") && parsers::detect_language(&rel_path) == Some("csharp")
+        if !rel_path.starts_with(".helios")
+            && parsers::detect_language(&rel_path).is_some_and(is_sidecar_language)
         {
             files.push(rel_path);
         }
@@ -96,17 +104,17 @@ pub fn indexed_csharp_files(root: &Path) -> Result<Vec<String>> {
 /// deferred to `ingest_semantic`, which runs after the walk (symbols and
 /// imports are still inserted here either way). `.cs` files the walk sees that
 /// are missing from the snapshot — created between the snapshot and the walk —
-/// are reported in `IndexStats::cs_missing_from_snapshot`; they carry no
+/// are reported in `IndexStats::missing_from_snapshot`; they carry no
 /// semantic references until the next init.
 pub fn index_full(
     db: &Database,
     root: &Path,
-    cs_snapshot: Option<&[String]>,
+    sidecar_snapshot: Option<&[String]>,
 ) -> Result<IndexStats> {
     let mut stats = IndexStats::default();
-    let semantic_csharp = cs_snapshot.is_some();
+    let semantic = sidecar_snapshot.is_some();
     let snapshot: Option<HashSet<&str>> =
-        cs_snapshot.map(|files| files.iter().map(String::as_str).collect());
+        sidecar_snapshot.map(|files| files.iter().map(String::as_str).collect());
 
     // Files this walk parsed, for the reference pass below. Only those: a file
     // whose content hash was unchanged keeps the reference rows it already has,
@@ -131,21 +139,21 @@ pub fn index_full(
         }
 
         if let Some(language) = parsers::detect_language(&rel_path) {
-            if language == "csharp"
+            if is_sidecar_language(language)
                 && let Some(snapshot) = &snapshot
                 && !snapshot.contains(rel_path.as_str())
             {
-                stats.cs_missing_from_snapshot.push(rel_path.clone());
+                stats.missing_from_snapshot.push(rel_path.clone());
             }
             match index_file_definitions(db, path, &rel_path, language) {
                 Ok(file_stats) => {
                     stats.files_indexed += 1;
                     stats.symbols_found += file_stats.symbols;
                     stats.imports_found += file_stats.imports;
-                    if language == "csharp" && file_stats.reparsed {
-                        stats.cs_changed += 1;
+                    if is_sidecar_language(language) && file_stats.reparsed {
+                        stats.semantic_changed += 1;
                     }
-                    if file_stats.reparsed && !(semantic_csharp && language == "csharp") {
+                    if file_stats.reparsed && !(semantic && is_sidecar_language(language)) {
                         parsed.push((path.to_path_buf(), rel_path.clone(), language));
                     }
                 }
@@ -231,12 +239,12 @@ pub fn index_file(
     abs_path: &Path,
     rel_path: &str,
     language: &str,
-    semantic_csharp: bool,
+    semantic: bool,
 ) -> Result<FileStats> {
     let stats = index_file_definitions(db, abs_path, rel_path, language)?;
-    // In semantic mode `.cs` references come from the Roslyn sidecar, ingested
-    // after the walk with exact DocId resolution (P3-M4).
-    if stats.reparsed && !(semantic_csharp && language == "csharp") {
+    // In semantic mode `.cs` and `.xaml` references come from the Roslyn
+    // sidecar, ingested after the walk with exact DocId resolution (P3-M4).
+    if stats.reparsed && !(semantic && is_sidecar_language(language)) {
         index_file_references(db, abs_path, rel_path, language)?;
     }
     Ok(stats)
@@ -365,8 +373,8 @@ pub fn index_incremental(
     for path in deleted {
         db.delete_file(path)?;
         stats.files_deleted += 1;
-        if parsers::detect_language(path) == Some("csharp") {
-            stats.cs_changed += 1;
+        if parsers::detect_language(path).is_some_and(is_sidecar_language) {
+            stats.semantic_changed += 1;
         }
     }
 
@@ -384,8 +392,8 @@ pub fn index_incremental(
                     stats.files_indexed += 1;
                     stats.symbols_found += file_stats.symbols;
                     stats.imports_found += file_stats.imports;
-                    if language == "csharp" && file_stats.reparsed {
-                        stats.cs_changed += 1;
+                    if is_sidecar_language(language) && file_stats.reparsed {
+                        stats.semantic_changed += 1;
                     }
                 }
                 Err(e) => {
@@ -433,6 +441,9 @@ pub fn ingest_semantic(db: &Database, semantic: Option<&AnalyzeOutput>) -> Resul
 
     let docid_map = db.docid_symbol_map()?;
     db.delete_references_from_language("csharp")?;
+    // XAML holds no symbols of its own, only binding references the sidecar
+    // resolved; they are replaced wholesale like the `.cs` set.
+    db.delete_references_from_language("xaml")?;
 
     for reference in &output.references {
         if reference.is_definition {
@@ -503,14 +514,16 @@ pub struct IndexStats {
     pub files_deleted: usize,
     pub symbols_found: usize,
     pub imports_found: usize,
-    /// `.cs` files the walk indexed that the Roslyn sidecar snapshot missed
-    /// (created mid-run); they have no semantic references until the next init.
-    pub cs_missing_from_snapshot: Vec<String>,
-    /// `.cs` files this pass rewrote (content changed) or deleted. Under a
-    /// semantic (roslyn) index these files' outbound references degrade to
-    /// tree-sitter and inbound semantic references onto their symbols cascade
-    /// away with the deleted symbol rows (W1) — `update` warns on this.
-    pub cs_changed: usize,
+    /// `.cs`/`.xaml` files the walk indexed that the Roslyn sidecar snapshot
+    /// missed (created mid-run); they have no semantic references until the
+    /// next init.
+    pub missing_from_snapshot: Vec<String>,
+    /// `.cs`/`.xaml` files this pass rewrote (content changed) or deleted.
+    /// Under a semantic (roslyn) index these files' outbound references degrade
+    /// to tree-sitter — to nothing at all for `.xaml`, which has no parser —
+    /// and inbound semantic references onto their symbols cascade away with the
+    /// deleted symbol rows (W1) — `update` warns on this.
+    pub semantic_changed: usize,
 }
 
 pub(crate) struct FileStats {
@@ -757,34 +770,68 @@ mod tests {
         );
     }
 
-    /// `cs_changed` counts only `.cs` files whose rows were rewritten or
-    /// deleted — unchanged-hash files and other languages don't count.
+    /// `semantic_changed` counts only sidecar-resolved files (`.cs`, `.xaml`)
+    /// whose rows were rewritten or deleted — unchanged-hash files and other
+    /// languages don't count.
     #[test]
-    fn cs_changed_counts_rewritten_and_deleted_cs_files() {
+    fn semantic_changed_counts_rewritten_and_deleted_sidecar_files() {
         let dir = tempfile::tempdir().unwrap();
         let cs = dir.path().join("A.cs");
+        let xaml = dir.path().join("A.xaml");
         std::fs::write(&cs, "class A {}").unwrap();
+        std::fs::write(&xaml, "<ContentPage />").unwrap();
         std::fs::write(dir.path().join("b.py"), "def b():\n    pass\n").unwrap();
 
         let db = Database::open_in_memory().unwrap();
         let stats = index_full(&db, dir.path(), None).unwrap();
-        assert_eq!(stats.cs_changed, 1);
+        assert_eq!(stats.semantic_changed, 2);
 
         // Second pass over identical content: nothing rewritten.
         let stats = index_full(&db, dir.path(), None).unwrap();
-        assert_eq!(stats.cs_changed, 0);
+        assert_eq!(stats.semantic_changed, 0);
 
-        // Incremental: rewritten A.cs and deleted Gone.cs count; the
+        // Incremental: rewritten A.cs/A.xaml and deleted Gone.cs count; the
         // unchanged b.py in the modified list does not.
         std::fs::write(&cs, "class A { void M() { } }").unwrap();
+        std::fs::write(&xaml, "<ContentPage Title=\"x\" />").unwrap();
         let stats = index_incremental(
             &db,
             dir.path(),
-            &["A.cs".to_string(), "b.py".to_string()],
+            &["A.cs".to_string(), "A.xaml".to_string(), "b.py".to_string()],
             &["Gone.cs".to_string()],
         )
         .unwrap();
-        assert_eq!(stats.cs_changed, 2);
+        assert_eq!(stats.semantic_changed, 3);
+    }
+
+    /// A `.xaml` file is indexed as a file row with no symbols, so the sidecar's
+    /// binding references have somewhere to land (`ingest_semantic` drops
+    /// records whose file the index does not hold).
+    #[test]
+    fn xaml_bindings_ingest_onto_viewmodel_symbols() {
+        let db = Database::open_in_memory().unwrap();
+        let vm = add_file(&db, "MainViewModel.cs", "csharp");
+        let view = add_file(&db, "MainPage.xaml", "xaml");
+        let query = add_symbol(&db, vm, "Query", 5, "MainViewModel");
+
+        let output = AnalyzeOutput {
+            definitions: vec![def(
+                "P:App.MainViewModel.Query",
+                "Query",
+                "MainViewModel.cs",
+                5,
+            )],
+            references: vec![wire_ref(
+                "P:App.MainViewModel.Query",
+                "MainPage.xaml",
+                9,
+                30,
+                false,
+            )],
+        };
+        ingest_semantic(&db, Some(&output)).unwrap();
+
+        assert_eq!(all_refs(&db), vec![(query, view, 9, 29)]);
     }
 
     /// The pass runs after the walk, so importers walked before their target
@@ -1150,16 +1197,16 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let snapshot = vec!["Old.cs".to_string()];
         let stats = index_full(&db, dir.path(), Some(&snapshot)).unwrap();
-        assert_eq!(stats.cs_missing_from_snapshot, vec!["New.cs".to_string()]);
+        assert_eq!(stats.missing_from_snapshot, vec!["New.cs".to_string()]);
 
         let db = Database::open_in_memory().unwrap();
         let full: Vec<String> = vec!["Old.cs".into(), "New.cs".into()];
         let stats = index_full(&db, dir.path(), Some(&full)).unwrap();
-        assert!(stats.cs_missing_from_snapshot.is_empty());
+        assert!(stats.missing_from_snapshot.is_empty());
 
         // Tree-sitter mode has no snapshot to diff against.
         let db = Database::open_in_memory().unwrap();
         let stats = index_full(&db, dir.path(), None).unwrap();
-        assert!(stats.cs_missing_from_snapshot.is_empty());
+        assert!(stats.missing_from_snapshot.is_empty());
     }
 }

@@ -21,6 +21,11 @@ Helios parses source code with tree-sitter, extracts symbols, imports, and refer
 | JavaScript | `.js`, `.jsx` |
 | Swift | `.swift` |
 | C# | `.cs` |
+| XAML | `.xaml` |
+
+XAML is indexed for its data bindings only — it declares no symbols of its own,
+and its `{Binding}` paths are attributed to the C# members they name by the
+optional Roslyn helper below.
 
 ## Installation
 
@@ -47,8 +52,18 @@ Roslyn-based helper (`helios-roslyn`) upgrades `.cs` reference resolution to ful
 compiler-level accuracy: overloads, inheritance, interfaces, generics, and inferred
 types resolve to the exact symbol instead of a name match.
 
+The helper also resolves XAML data bindings, which nothing else in helios can:
+a `{Binding Query}` in a `.xaml` file becomes a reference to the ViewModel
+property it names, so `helios deps Query` lists the markup that binds it
+alongside the C# that calls it. The binding context comes from `x:DataType`,
+from the item type of an enclosing `ItemsSource` inside a `DataTemplate`, or
+from whatever the code-behind assigns to `BindingContext`. Bindings whose
+context is only known at runtime (dependency injection, Shell routes, a context
+set by a parent view) are left unresolved rather than guessed.
+
 Helios works fully without the helper — when it is absent, `helios init` silently
-uses the tree-sitter path. Nothing else changes.
+uses the tree-sitter path and `.xaml` files are indexed without bindings.
+Nothing else changes.
 
 ### Requirements
 
@@ -488,9 +503,11 @@ parsers/
   csharp.rs          Classes, structs, records, interfaces, enums, methods, properties
 db.rs                SQLite wrapper (files, symbols, imports, references)
 git.rs               Git integration (HEAD, diff, repo detection)
-sidecar.rs           Roslyn helper detection + invocation (semantic C# mode)
+sidecar.rs           Roslyn helper detection + invocation (semantic C#/XAML mode)
 errors.rs            Typed errors (e.g. NoIndexError -> exit code 2)
 helios-roslyn/       Optional .NET helper: Roslyn-based C# reference resolution
+  Program.cs         Definitions and references from the C# compilations
+  Xaml.cs            XAML `{Binding}` paths resolved against those compilations
 ```
 
 ### Database Schema

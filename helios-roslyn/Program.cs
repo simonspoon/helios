@@ -158,6 +158,10 @@ internal static class Program
             EmitReferences(compilation, root, stdout, indexedFiles, rootDocids, declarationSites, emittedReferences);
         }
 
+        // Pass 3: XAML bindings resolved against the same compilations, emitted
+        // on the same docids. Runs once over all of them, not per compilation.
+        Xaml.EmitBindings(compilations, root, stdout, indexedFiles, rootDocids, emittedReferences);
+
         return 0;
     }
 
@@ -530,7 +534,7 @@ internal static class Program
         return compilations;
     }
 
-    private static List<string> EnumerateFiles(string root, string pattern)
+    internal static List<string> EnumerateFiles(string root, string pattern)
     {
         var options = new EnumerationOptions
         {
@@ -677,7 +681,7 @@ internal static class Program
         return declaration.SyntaxTree.GetLineSpan(declaration.Span).EndLinePosition.Line + 1;
     }
 
-    private static string RelativePath(string root, string path) =>
+    internal static string RelativePath(string root, string path) =>
         Path.GetRelativePath(root, path).Replace('\\', '/');
 
     /// <summary>A repo-relative path that escapes the analysis root.</summary>
@@ -688,7 +692,7 @@ internal static class Program
     /// Is this root-relative path one the index reports on? With --files, exactly
     /// the caller's list; otherwise everything under root minus IsExcludedPath.
     /// </summary>
-    private static bool IsIndexedFile(string relativePath, HashSet<string>? indexedFiles)
+    internal static bool IsIndexedFile(string relativePath, HashSet<string>? indexedFiles)
     {
         if (IsOutsideRoot(relativePath))
         {
@@ -706,16 +710,20 @@ internal static class Program
 
     /// <summary>One on-wire reference record; the single place that converts 0-based spans to 1-based columns.</summary>
     private static void WriteReference(TextWriter stdout, string docid, string file, FileLinePositionSpan span, bool isDefinition) =>
+        WriteReference(stdout, docid, file, span.StartLinePosition.Line + 1, span.StartLinePosition.Character + 1, isDefinition);
+
+    /// <summary>Same record from an already-1-based position (the XAML pass has no Roslyn span).</summary>
+    internal static void WriteReference(TextWriter stdout, string docid, string file, int line, int col, bool isDefinition) =>
         WriteRecord(stdout, new
         {
             type = "reference",
             docid,
             file,
-            line = span.StartLinePosition.Line + 1,
-            col = span.StartLinePosition.Character + 1,
+            line,
+            col,
             is_definition = isDefinition,
         });
 
-    private static void WriteRecord(TextWriter stdout, object record) =>
+    internal static void WriteRecord(TextWriter stdout, object record) =>
         stdout.WriteLine(JsonSerializer.Serialize(record, JsonOpts));
 }

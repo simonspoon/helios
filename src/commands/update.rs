@@ -106,13 +106,16 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
 /// the whole tree-sitter update, and correct scoping must include dependent
 /// projects, converging on a full analyze). Instead, make the W1 fidelity
 /// trade visible: on a semantic index, changed `.cs` files degrade to
-/// tree-sitter resolution and semantic references into their symbols are
-/// cascade-deleted — one warning tells the user `helios init` refreshes them.
+/// tree-sitter resolution (changed `.xaml` files to no bindings at all, having
+/// no parser) and semantic references into their symbols are cascade-deleted —
+/// one warning tells the user `helios init` refreshes them.
 fn warn_semantic_stale(db: &Database, stats: &indexer::IndexStats) -> Result<()> {
-    if stats.cs_changed > 0 && db.get_metadata("csharp_resolver")?.as_deref() == Some("roslyn") {
+    if stats.semantic_changed > 0
+        && db.get_metadata("csharp_resolver")?.as_deref() == Some("roslyn")
+    {
         eprintln!(
-            "warning: {} C# file(s) changed since the semantic (Roslyn) index was built; their references now use tree-sitter resolution — run 'helios init' to refresh",
-            stats.cs_changed
+            "warning: {} C#/XAML file(s) changed since the semantic (Roslyn) index was built; their references no longer use Roslyn resolution — run 'helios init' to refresh",
+            stats.semantic_changed
         );
     }
     Ok(())

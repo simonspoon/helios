@@ -26,20 +26,20 @@ pub fn run(json: bool, compact: bool, quiet: bool, timeout_secs: u64) -> Result<
     // without semantic references until the next init — the walk reports such
     // files and a warning below surfaces them. An empty set skips the
     // sidecar entirely — no dotnet spawns, nothing the ingest could keep.
-    let cs_files = match indexer::indexed_csharp_files(&cwd) {
+    let sidecar_files = match indexer::indexed_sidecar_files(&cwd) {
         Ok(files) => files,
         Err(e) => {
             eprintln!(
-                "warning: listing C# files failed ({e:#}); resolving C# references with tree-sitter"
+                "warning: listing C#/XAML files failed ({e:#}); resolving C# references with tree-sitter"
             );
             Vec::new()
         }
     };
-    let semantic: Option<sidecar::AnalyzeOutput> = if cs_files.is_empty() {
+    let semantic: Option<sidecar::AnalyzeOutput> = if sidecar_files.is_empty() {
         None
     } else {
         sidecar::detect().and_then(
-            |s| match s.analyze(&cwd, &cs_files, Duration::from_secs(timeout_secs)) {
+            |s| match s.analyze(&cwd, &sidecar_files, Duration::from_secs(timeout_secs)) {
                 Ok(output) => Some(output),
                 Err(e) => {
                     eprintln!(
@@ -55,13 +55,13 @@ pub fn run(json: bool, compact: bool, quiet: bool, timeout_secs: u64) -> Result<
     // In semantic mode the walk skips `.cs` reference resolution; the ingest
     // below stamps DocIds and inserts the exact reference set instead, and
     // either way records the resolver provenance (P3-M3..M7).
-    let cs_snapshot = semantic.is_some().then_some(cs_files.as_slice());
-    let stats = indexer::index_full(&db, &cwd, cs_snapshot)?;
-    if !stats.cs_missing_from_snapshot.is_empty() {
+    let sidecar_snapshot = semantic.is_some().then_some(sidecar_files.as_slice());
+    let stats = indexer::index_full(&db, &cwd, sidecar_snapshot)?;
+    if !stats.missing_from_snapshot.is_empty() {
         eprintln!(
-            "warning: {} C# file(s) appeared after the Roslyn snapshot and have no semantic references until the next init: {}",
-            stats.cs_missing_from_snapshot.len(),
-            stats.cs_missing_from_snapshot.join(", ")
+            "warning: {} C#/XAML file(s) appeared after the Roslyn snapshot and have no semantic references until the next init: {}",
+            stats.missing_from_snapshot.len(),
+            stats.missing_from_snapshot.join(", ")
         );
     }
     indexer::ingest_semantic(&db, semantic.as_ref())?;
@@ -82,8 +82,8 @@ pub fn run(json: bool, compact: bool, quiet: bool, timeout_secs: u64) -> Result<
     // Which resolver produced the C# references (P3-M7). Surfaced here, not
     // only in `status`, so a fallback is visible in the summary rather than in
     // a warning line that scrolls past.
-    // Only meaningful when the repo actually has C# in it.
-    let csharp_resolver = if cs_files.is_empty() {
+    // Only meaningful when the repo actually has C#/XAML in it.
+    let csharp_resolver = if sidecar_files.is_empty() {
         None
     } else {
         db.get_metadata("csharp_resolver")?

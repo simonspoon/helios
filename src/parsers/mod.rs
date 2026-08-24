@@ -50,6 +50,10 @@ pub fn detect_language(path: &str) -> Option<&'static str> {
         "js" | "jsx" => Some("javascript"),
         "swift" => Some("swift"),
         "cs" => Some("csharp"),
+        // Markup, not a tree-sitter language: `.xaml` files are indexed so the
+        // Roslyn sidecar can attribute their data bindings, and carry no
+        // symbols of their own (`get_parser` returns None).
+        "xaml" => Some("xaml"),
         _ => None,
     }
 }
