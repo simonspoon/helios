@@ -310,7 +310,18 @@ internal static class Xaml
             foreach (var reference in codeBehind.DeclaringSyntaxReferences)
             {
                 var declaration = reference.GetSyntax();
-                var model = compilation.GetSemanticModel(declaration.SyntaxTree);
+                // GetTypeByMetadataName also resolves types pulled in via a ProjectReference;
+                // a code-behind class declared in another project has a syntax tree that
+                // `compilation` doesn't own, and GetSemanticModel throws on a tree it doesn't
+                // own. Find whichever compilation actually owns the tree instead.
+                var owner = compilation.ContainsSyntaxTree(declaration.SyntaxTree)
+                    ? compilation
+                    : compilations.FirstOrDefault(c => c.ContainsSyntaxTree(declaration.SyntaxTree));
+                if (owner is null)
+                {
+                    continue;
+                }
+                var model = owner.GetSemanticModel(declaration.SyntaxTree);
                 foreach (var assignment in declaration.DescendantNodes().OfType<AssignmentExpressionSyntax>())
                 {
                     if (AssignedName(assignment.Left) != "BindingContext")
