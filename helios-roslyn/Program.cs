@@ -209,7 +209,9 @@ internal static class Program
                 });
 
                 // The declaration site itself, flagged so the consumer never inserts it.
-                WriteReference(stdout, docid, file, span, isDefinition: true);
+                var declarationModel = compilation.GetSemanticModel(location.SourceTree!);
+                var declarationContainer = ContainerDocidAt(declarationModel, location.SourceSpan.Start);
+                WriteReference(stdout, docid, file, span, isDefinition: true, declarationContainer);
             }
         }
     }
@@ -284,7 +286,8 @@ internal static class Program
                 {
                     continue;
                 }
-                WriteReference(stdout, docid, file, span, isDefinition: false);
+                var containerDocid = ContainerDocidAt(model, location.SourceSpan.Start);
+                WriteReference(stdout, docid, file, span, isDefinition: false, containerDocid);
             }
         }
     }
@@ -608,21 +611,20 @@ internal static class Program
                 switch (member)
                 {
                     case INamespaceSymbol ns:
-                        if (ns.Locations.Any(l => l.IsInSource))
+                        if (IsIndexedDefinitionKind(ns) && ns.Locations.Any(l => l.IsInSource))
                         {
                             result.Add(ns);
                         }
                         Visit(ns);
                         break;
-                    case INamedTypeSymbol type when type.TypeKind is TypeKind.Class or TypeKind.Struct or TypeKind.Interface or TypeKind.Enum:
+                    case INamedTypeSymbol type when IsIndexedDefinitionKind(type):
                         if (type.Locations.Any(l => l.IsInSource))
                         {
                             result.Add(type);
                         }
                         Visit(type);
                         break;
-                    case IMethodSymbol method when method.MethodKind is MethodKind.Ordinary or MethodKind.Constructor:
-                    case IPropertySymbol:
+                    case IMethodSymbol or IPropertySymbol when IsIndexedDefinitionKind(member):
                         if (member.Locations.Any(l => l.IsInSource))
                         {
                             result.Add(member);
@@ -709,11 +711,11 @@ internal static class Program
         relativePath.Split('/').Any(part => part is "bin" or "obj" || part.StartsWith('.'));
 
     /// <summary>One on-wire reference record; the single place that converts 0-based spans to 1-based columns.</summary>
-    private static void WriteReference(TextWriter stdout, string docid, string file, FileLinePositionSpan span, bool isDefinition) =>
-        WriteReference(stdout, docid, file, span.StartLinePosition.Line + 1, span.StartLinePosition.Character + 1, isDefinition);
+    private static void WriteReference(TextWriter stdout, string docid, string file, FileLinePositionSpan span, bool isDefinition, string? containerDocid = null) =>
+        WriteReference(stdout, docid, file, span.StartLinePosition.Line + 1, span.StartLinePosition.Character + 1, isDefinition, containerDocid);
 
     /// <summary>Same record from an already-1-based position (the XAML pass has no Roslyn span).</summary>
-    internal static void WriteReference(TextWriter stdout, string docid, string file, int line, int col, bool isDefinition) =>
+    internal static void WriteReference(TextWriter stdout, string docid, string file, int line, int col, bool isDefinition, string? containerDocid = null) =>
         WriteRecord(stdout, new
         {
             type = "reference",
@@ -722,7 +724,62 @@ internal static class Program
             line,
             col,
             is_definition = isDefinition,
+            container_docid = containerDocid,
         });
+
+    /// <summary>
+    /// The DocumentationCommentId of the nearest enclosing symbol at <paramref name="position"/>
+    /// that pass 1 (<see cref="CollectIndexedSymbols"/>) actually emits as a definition, so the
+    /// consumer can always resolve it: walk <see cref="SemanticModel.GetEnclosingSymbol"/> outward
+    /// via <see cref="NextContainer"/>, accepting only symbols <see cref="IsIndexedDefinitionKind"/>
+    /// allows — everything else (lambdas, local functions, accessors, field/event symbols, the
+    /// synthesized top-level-statements entry point, ...) is climbed past regardless of whether it
+    /// happens to carry its own non-null DocumentationCommentId. Null at file/namespace scope, or
+    /// when nothing encloses the position at all.
+    /// </summary>
+    private static string? ContainerDocidAt(SemanticModel model, int position)
+    {
+        for (var symbol = model.GetEnclosingSymbol(position); symbol is not null; symbol = NextContainer(symbol))
+        {
+            // Original definition: pass 1 stamps declared members, never constructed
+            // instantiations (e.g. inside Repository<User>.Get, the enclosing symbol
+            // is the constructed Get, not the generic definition CollectIndexedSymbols
+            // visited) — the same normalization ResolveReferencedSymbol applies to targets.
+            var original = symbol.OriginalDefinition;
+            if (original.IsImplicitlyDeclared || !IsIndexedDefinitionKind(original))
+            {
+                continue;
+            }
+            var docid = original.GetDocumentationCommentId();
+            if (docid is not null)
+            {
+                return docid;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// The next symbol out from <paramref name="symbol"/>. For a property or event accessor,
+    /// that is the property/event itself (<see cref="IMethodSymbol.AssociatedSymbol"/>) — NOT
+    /// <c>ContainingSymbol</c>, which skips straight past it to the declaring type, because
+    /// accessors are members of the type, not of the property, in Roslyn's symbol tree.
+    /// </summary>
+    private static ISymbol? NextContainer(ISymbol symbol) =>
+        symbol is IMethodSymbol { AssociatedSymbol: { } associated } ? associated : symbol.ContainingSymbol;
+
+    /// <summary>
+    /// The symbol kinds pass 1 emits as definitions: the single predicate <see cref="CollectIndexedSymbols"/>
+    /// and <see cref="ContainerDocidAt"/> both gate on, so the two can never drift apart.
+    /// </summary>
+    private static bool IsIndexedDefinitionKind(ISymbol symbol) => symbol switch
+    {
+        INamespaceSymbol => true,
+        INamedTypeSymbol { TypeKind: TypeKind.Class or TypeKind.Struct or TypeKind.Interface or TypeKind.Enum } => true,
+        IMethodSymbol { MethodKind: MethodKind.Ordinary or MethodKind.Constructor } => true,
+        IPropertySymbol => true,
+        _ => false,
+    };
 
     internal static void WriteRecord(TextWriter stdout, object record) =>
         stdout.WriteLine(JsonSerializer.Serialize(record, JsonOpts));

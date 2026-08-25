@@ -67,4 +67,58 @@ public class SemanticResolutionTests
 
         Assert.Equal(get.Docid, UsageAt("repo.Get()").Docid);
     }
+
+    [Fact] // (d1) container_docid: a reference inside a method attributes to that method
+    public void Reference_InsideMethod_ContainerIsEnclosingMethod()
+    {
+        var run = DefinitionAt("Usage.cs", "static void Run()");
+
+        Assert.Equal(run.Docid, UsageAt("calc.Add(42)").ContainerDocid);
+    }
+
+    [Fact] // (d2) container_docid: file/namespace-scope reference has no enclosing symbol
+    public void Reference_AtNamespaceScope_ContainerIsNull()
+    {
+        var namespaceDeclaration = Assert.Single(
+            Output.Value.References,
+            r => r is { File: "Usage.cs", IsDefinition: true } && r.Docid == "N:Semantic");
+
+        Assert.Null(namespaceDeclaration.ContainerDocid);
+    }
+
+    [Fact] // (d3) container_docid: lambda and local-function bodies attribute to the enclosing member
+    public void Reference_InsideLambdaOrLocalFunction_ContainerIsEnclosingMember()
+    {
+        var run = DefinitionAt("Usage.cs", "static void Run()");
+
+        Assert.Equal(run.Docid, UsageAt("calc.Add(1)").ContainerDocid); // lambda body
+        Assert.Equal(run.Docid, UsageAt("calc.Add(2)").ContainerDocid); // local function body
+    }
+
+    [Fact] // (d4) container_docid: a property accessor body attributes to the enclosing property,
+           // not the get-accessor method (which pass 1 never emits as a definition)
+    public void Reference_InsidePropertyAccessor_ContainerIsEnclosingProperty()
+    {
+        var zero = DefinitionAt("Calculator.cs", "int Zero");
+        var line = HelperHarness.LineOf(SemanticFixture, "Calculator.cs", "return Add(0);");
+        var reference = Assert.Single(
+            Output.Value.References,
+            r => r is { File: "Calculator.cs", IsDefinition: false } && r.Line == line);
+
+        Assert.Equal(zero.Docid, reference.ContainerDocid);
+    }
+
+    [Fact] // (d5) container_docid: a field initializer attributes to the containing type
+           // (fields are not an indexed kind, so the field symbol itself is never a usable container)
+    public void Reference_InsideFieldInitializer_ContainerIsContainingType()
+    {
+        var calculator = DefinitionAt("Calculator.cs", "class Calculator");
+        var line = HelperHarness.LineOf(SemanticFixture, "Calculator.cs", "_self = new Calculator();");
+        var references = Output.Value.References
+            .Where(r => r is { File: "Calculator.cs", IsDefinition: false } && r.Line == line)
+            .ToList();
+
+        Assert.NotEmpty(references); // the field type and `new Calculator()` both reference the type
+        Assert.All(references, r => Assert.Equal(calculator.Docid, r.ContainerDocid));
+    }
 }

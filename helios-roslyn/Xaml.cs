@@ -135,7 +135,8 @@ internal static class Xaml
             {
                 return;
             }
-            Program.WriteReference(context.Stdout, docid, context.File, info.LineNumber, column, isDefinition: false);
+            // No C# enclosing symbol for a binding expression in markup.
+            Program.WriteReference(context.Stdout, docid, context.File, info.LineNumber, column, isDefinition: false, containerDocid: null);
         });
     }
 

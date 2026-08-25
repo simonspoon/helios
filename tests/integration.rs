@@ -3170,6 +3170,29 @@ fn test_e2e_semantic_leg_docid_exact_references_and_roslyn_provenance() {
         vec!["M:App.Beta.Save"],
         "b.Save() must resolve to exactly Beta.Save, got rows: {rows:?}"
     );
+
+    // Both call sites sit inside Runner.Go — the real Roslyn helper emits
+    // container_docid on the wire, and it must resolve to that method's
+    // symbol id.
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.name FROM references_ r
+             JOIN symbols s ON s.id = r.symbol_id
+             JOIN files f ON f.id = r.file_id
+             LEFT JOIN symbols c ON c.id = r.container_symbol_id
+             WHERE f.path = 'Program.cs' AND s.name = 'Save'",
+        )
+        .unwrap();
+    let containers: Vec<Option<String>> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        containers,
+        vec![Some("Go".to_string()), Some("Go".to_string())],
+        "both Save() call sites are inside Runner.Go, got: {containers:?}"
+    );
 }
 
 fn write_mixed_fixture(dir: &std::path::Path) {
@@ -3665,6 +3688,49 @@ fn test_deps_symbol_references_are_deduplicated() {
         seen.len(),
         "JSON dependents must be unique: {stdout}"
     );
+}
+
+/// `helios deps <fn>` names the calling function in its References output,
+/// both in the human-readable form and in `--json`.
+#[test]
+fn test_deps_references_name_the_calling_function() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    std::fs::write(
+        dir.path().join("wallet.ts"),
+        "export function helper(): number { return 1; }\nexport class Wallet {\n    format(): number {\n        return helper();\n    }\n}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    let output = Command::new(&bin)
+        .args(["deps", "helper"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps helper");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("in format ->"),
+        "expected the caller's function name in the References output, got: {stdout}"
+    );
+
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "helper"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps --json helper");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+    let dependents = value["dependents"].as_array().expect("dependents array");
+    assert_eq!(dependents.len(), 1, "expected one dependent, got: {stdout}");
+    assert_eq!(dependents[0]["container"].as_str(), Some("format"));
 }
 
 /// A project with two `formatMoney` definitions whose defining files import

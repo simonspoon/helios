@@ -1,3 +1,5 @@
+using System;
+
 namespace Semantic;
 
 public static class Usage
@@ -15,5 +17,13 @@ public static class Usage
 
         var repo = new Repository<User>();
         repo.Get();
+
+        Action lambda = () => calc.Add(1);
+        lambda();
+
+        LocalAdd();
+        return;
+
+        void LocalAdd() => calc.Add(2);
     }
 }

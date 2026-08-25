@@ -185,7 +185,8 @@ impl Database {
                 file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
                 line INTEGER NOT NULL,
                 column INTEGER NOT NULL,
-                qualified INTEGER NOT NULL DEFAULT 0
+                qualified INTEGER NOT NULL DEFAULT 0,
+                container_symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL
             );
 
             CREATE TABLE IF NOT EXISTS metadata (
@@ -243,6 +244,18 @@ impl Database {
             )?;
         }
 
+        // Check if container_symbol_id column exists in references_ table
+        let has_container_symbol_id: bool = self
+            .conn
+            .prepare("SELECT container_symbol_id FROM references_ LIMIT 0")
+            .is_ok();
+
+        if !has_container_symbol_id {
+            self.conn.execute_batch(
+                "ALTER TABLE references_ ADD COLUMN container_symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL",
+            )?;
+        }
+
         // Check if resolved_file_id column exists in imports table
         let has_resolved: bool = self
             .conn
@@ -264,6 +277,12 @@ impl Database {
         // is a no-op and the docid column does not exist yet at that point.
         self.conn
             .execute_batch("CREATE INDEX IF NOT EXISTS idx_symbols_docid ON symbols(docid)")?;
+
+        // Same reasoning as idx_symbols_docid above: on a pre-existing DB the
+        // column does not exist until the ALTER TABLE above runs.
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_refs_container ON references_(container_symbol_id)",
+        )?;
 
         Ok(())
     }
@@ -353,6 +372,19 @@ impl Database {
         self.conn
             .execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
         Ok(())
+    }
+
+    /// `(id, line, end_line)` of every symbol in a file, for matching a
+    /// reference to its innermost enclosing symbol at index time.
+    pub fn symbol_ranges_for_file(&self, file_id: i64) -> Result<Vec<(i64, i64, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, line, end_line FROM symbols WHERE file_id = ?1")?;
+        let rows = stmt.query_map(params![file_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("querying symbol ranges for file")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -720,15 +752,20 @@ impl Database {
     /// graph moves when *either* side of it changes, and an incremental update
     /// only re-indexes the files that changed. A pruned row could not be
     /// brought back when the file it pointed at was the one that moved.
-    pub fn symbol_references(&self, symbol_ids: &[i64]) -> Result<Vec<(String, i64, i64)>> {
+    #[allow(clippy::type_complexity)]
+    pub fn symbol_references(
+        &self,
+        symbol_ids: &[i64],
+    ) -> Result<Vec<(String, i64, i64, Option<String>)>> {
         if symbol_ids.is_empty() {
             return Ok(Vec::new());
         }
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT DISTINCT f.path, r.line, r.column
+            "SELECT DISTINCT f.path, r.line, r.column, c.name
              FROM references_ r
              JOIN files f ON r.file_id = f.id
              JOIN symbols s ON s.id = r.symbol_id
+             LEFT JOIN symbols c ON c.id = r.container_symbol_id
              WHERE r.symbol_id IN ({})
                AND (
                  r.qualified = 1
@@ -761,6 +798,7 @@ impl Database {
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?,
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -769,6 +807,7 @@ impl Database {
 
     // --- Reference operations ---
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_reference(
         &self,
         symbol_id: i64,
@@ -776,11 +815,12 @@ impl Database {
         line: i64,
         column: i64,
         qualified: bool,
+        container_symbol_id: Option<i64>,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO references_ (symbol_id, file_id, line, column, qualified)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![symbol_id, file_id, line, column, qualified],
+            "INSERT INTO references_ (symbol_id, file_id, line, column, qualified, container_symbol_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![symbol_id, file_id, line, column, qualified, container_symbol_id],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -791,6 +831,7 @@ impl Database {
     /// decide which definition a usage targets, so we link the reference to all
     /// candidates rather than silently picking one and attributing the usage to
     /// the wrong definition. Returns the number of reference rows inserted.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_references(
         &self,
         symbol_ids: &[i64],
@@ -798,9 +839,17 @@ impl Database {
         line: i64,
         column: i64,
         qualified: bool,
+        container_symbol_id: Option<i64>,
     ) -> Result<usize> {
         for &symbol_id in symbol_ids {
-            self.insert_reference(symbol_id, file_id, line, column, qualified)?;
+            self.insert_reference(
+                symbol_id,
+                file_id,
+                line,
+                column,
+                qualified,
+                container_symbol_id,
+            )?;
         }
         Ok(symbol_ids.len())
     }
@@ -859,6 +908,32 @@ impl Database {
         for row in rows {
             let (docid, id) = row?;
             map.entry(docid).or_default().push(id);
+        }
+        Ok(map)
+    }
+
+    /// `docid → (symbol_id, file_id)` pairs, for `ingest_semantic` to narrow a
+    /// reference's `container_docid` to the candidate in the reference's own
+    /// file (a container must be a symbol in the same file — see
+    /// `ingest_semantic` for the full rule). A sibling of `docid_symbol_map`
+    /// rather than a change to it: that map's callers want ids only and one
+    /// already asserts its exact return type in a test, and a reference's
+    /// container needs the file_id besides.
+    pub fn docid_symbol_file_map(&self) -> Result<HashMap<String, Vec<(i64, i64)>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT docid, id, file_id FROM symbols WHERE docid IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut map: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+        for row in rows {
+            let (docid, id, file_id) = row?;
+            map.entry(docid).or_default().push((id, file_id));
         }
         Ok(map)
     }
@@ -1329,5 +1404,101 @@ mod tests {
             .collect::<std::result::Result<_, _>>()
             .unwrap();
         assert!(names.iter().any(|n| n == "idx_symbols_docid"));
+    }
+
+    #[test]
+    fn test_legacy_db_migrates_container_symbol_id() {
+        // Hand-create a DB whose references_ table predates container_symbol_id,
+        // then reopen through Database::open to exercise the migration.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    id INTEGER PRIMARY KEY,
+                    path TEXT NOT NULL UNIQUE,
+                    content_hash TEXT NOT NULL,
+                    language TEXT NOT NULL,
+                    last_indexed_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE symbols (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    line INTEGER NOT NULL,
+                    column INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL DEFAULT 0,
+                    visibility TEXT NOT NULL DEFAULT 'private',
+                    scope TEXT,
+                    docid TEXT
+                );
+                CREATE TABLE imports (
+                    id INTEGER PRIMARY KEY,
+                    source_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    import_path TEXT NOT NULL,
+                    alias TEXT,
+                    resolved_file_id INTEGER REFERENCES files(id) ON DELETE SET NULL
+                );
+                CREATE TABLE references_ (
+                    id INTEGER PRIMARY KEY,
+                    symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+                    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    line INTEGER NOT NULL,
+                    column INTEGER NOT NULL,
+                    qualified INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO files (id, path, content_hash, language) VALUES (1, 'src/a.cs', 'h1', 'csharp');
+                INSERT INTO symbols (name, kind, file_id, line, column, end_line, visibility, scope)
+                    VALUES ('Greet', 'fn', 1, 3, 4, 5, 'pub', 'Person');
+                INSERT INTO references_ (symbol_id, file_id, line, column) VALUES (1, 1, 8, 2);",
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(&db_path).unwrap();
+
+        // No data loss
+        let ref_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM references_", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ref_count, 1);
+
+        // The pre-existing row has container_symbol_id = NULL
+        let container: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT container_symbol_id FROM references_ WHERE symbol_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(container.is_none());
+
+        // A new insert through the current API works
+        db.insert_reference(1, 1, 9, 0, false, None).unwrap();
+        let ref_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM references_", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ref_count, 2);
+
+        // Index created by migration
+        let mut stmt = db.conn.prepare("PRAGMA index_list('references_')").unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(
+            names.iter().any(|n| n == "idx_refs_container"),
+            "idx_refs_container missing from {names:?}"
+        );
     }
 }

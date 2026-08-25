@@ -196,8 +196,8 @@ pub fn run(
                 "definitions": defs,
                 "dependencies": deps,
                 "dependents": refs.iter()
-                    .map(|(path, line, col)| {
-                        serde_json::json!({"file": path, "line": line, "column": col})
+                    .map(|(path, line, col, container)| {
+                        serde_json::json!({"file": path, "line": line, "column": col, "container": container})
                     })
                     .collect::<Vec<_>>(),
             });
@@ -259,8 +259,14 @@ pub fn run(
 
             if !refs.is_empty() {
                 println!("References (where {} is used):", target);
-                for (path, line, col) in &refs {
-                    println!("  {}:{}:{} -> {} (reference)", path, line, col, target);
+                for (path, line, col, container) in &refs {
+                    match container {
+                        Some(c) => println!(
+                            "  {}:{}:{} in {} -> {} (reference)",
+                            path, line, col, c, target
+                        ),
+                        None => println!("  {}:{}:{} -> {} (reference)", path, line, col, target),
+                    }
                 }
             }
 

@@ -38,6 +38,49 @@ fn resolve_reference_candidates(
     candidates.iter().map(|(sym, _)| sym.id).collect()
 }
 
+/// Which symbol a reference at `ref_line` sits inside, given the file's
+/// `(id, line, end_line)` symbol ranges.
+///
+/// A candidate must start at or before the reference and, if its `end_line`
+/// is known, end at or after it. `end_line` defaults to 0 for legacy rows
+/// written before ranges were tracked, which reads as "unknown" rather than
+/// "ends at line 0" — such a symbol can never claim a reference. Among the
+/// symbols that do contain the reference, the innermost one wins: the
+/// greatest start line, then (on a tie) the smallest end line, then (on a
+/// further tie) the greatest id, so the result is deterministic.
+fn innermost_enclosing_symbol(ranges: &[(i64, i64, i64)], ref_line: i64) -> Option<i64> {
+    ranges
+        .iter()
+        .filter(|&&(_, line, end_line)| line <= ref_line && end_line >= ref_line)
+        .max_by_key(|&&(id, line, end_line)| (line, -end_line, id))
+        .map(|&(id, _, _)| id)
+}
+
+/// Resolve a semantic reference's `container_docid` to a symbol id, narrowed
+/// to the reference's own file.
+///
+/// A container is necessarily a symbol in the same file as the reference —
+/// unlike the reference's target, which deliberately links every ambiguous
+/// candidate, a call site has exactly one caller. `container_map` (from
+/// `Database::docid_symbol_file_map`) can hold more than one `(id, file_id)`
+/// pair per docid (partial types, multi-targeted builds), so the docid alone
+/// does not pick a symbol — only the one in `file_id` does. No docid, an
+/// unstamped docid, or anything but exactly one same-file match all resolve
+/// to `None` rather than guessing.
+fn resolve_semantic_container(
+    container_map: &HashMap<String, Vec<(i64, i64)>>,
+    container_docid: Option<&str>,
+    file_id: i64,
+) -> Option<i64> {
+    let candidates = container_map.get(container_docid?)?;
+    let mut matches = candidates.iter().filter(|&&(_, fid)| fid == file_id);
+    let (id, _) = matches.next()?;
+    match matches.next() {
+        None => Some(*id),
+        Some(_) => None,
+    }
+}
+
 /// The walker every helios pass uses: hidden files and gitignored paths skipped.
 fn walk(root: &Path) -> ignore::Walk {
     WalkBuilder::new(root)
@@ -346,15 +389,21 @@ fn index_file_references(
         .parse(&content)
         .with_context(|| format!("parsing {}", rel_path))?;
 
+    // The file's own symbols were already inserted by index_file_definitions
+    // (in this pass or an earlier one), so their ranges are visible here.
+    let ranges = db.symbol_ranges_for_file(file.id)?;
+
     for reference in &parse_result.references {
         let candidates = db.find_symbol_by_name(&reference.symbol_name)?;
         let symbol_ids = resolve_reference_candidates(reference.from_scope.as_deref(), &candidates);
+        let container_symbol_id = innermost_enclosing_symbol(&ranges, reference.line);
         db.insert_references(
             &symbol_ids,
             file.id,
             reference.line,
             reference.column,
             reference.qualified,
+            container_symbol_id,
         )?;
     }
     Ok(())
@@ -424,6 +473,15 @@ pub fn index_incremental(
 ///    docids (framework/NuGet) are dropped silently (P3-M5). The wire is
 ///    1-based columns, storage is 0-based — convert at insert.
 ///
+/// Each inserted row also carries the calling symbol, resolved from the
+/// wire's `container_docid`: a reference's container is necessarily a symbol
+/// in the same file as the reference (unlike the target, a container is never
+/// linked to "all candidates" — a call site has exactly one caller), so the
+/// docid is narrowed to the stamped candidates in `reference.file` first.
+/// Anything other than exactly one same-file candidate — no `container_docid`
+/// on the wire, an unstamped docid, or (partial types, multi-targeting) more
+/// than one candidate in that file — resolves to `None` rather than guessing.
+///
 /// Either way, record which resolver produced the current `.cs` references
 /// in the `csharp_resolver` metadata row (P3-M7).
 pub fn ingest_semantic(db: &Database, semantic: Option<&AnalyzeOutput>) -> Result<()> {
@@ -440,6 +498,7 @@ pub fn ingest_semantic(db: &Database, semantic: Option<&AnalyzeOutput>) -> Resul
     }
 
     let docid_map = db.docid_symbol_map()?;
+    let container_map = db.docid_symbol_file_map()?;
     db.delete_references_from_language("csharp")?;
     // XAML holds no symbols of its own, only binding references the sidecar
     // resolved; they are replaced wholesale like the `.cs` set.
@@ -455,6 +514,11 @@ pub fn ingest_semantic(db: &Database, semantic: Option<&AnalyzeOutput>) -> Resul
         let Some(file) = db.get_file_by_path(&reference.file)? else {
             continue;
         };
+        let container_symbol_id = resolve_semantic_container(
+            &container_map,
+            reference.container_docid.as_deref(),
+            file.id,
+        );
         // Semantic rows resolve exactly by DocId, so the bare/qualified
         // distinction the import filter needs does not apply to them.
         db.insert_references(
@@ -463,6 +527,7 @@ pub fn ingest_semantic(db: &Database, semantic: Option<&AnalyzeOutput>) -> Resul
             reference.line,
             reference.col - 1,
             false,
+            container_symbol_id,
         )?;
     }
 
@@ -539,6 +604,44 @@ mod tests {
     use crate::db::ParsedSymbol;
     use crate::sidecar::{Definition, Reference};
 
+    /// A reference inside a method inside a class resolves to the method
+    /// (the innermost range), not the enclosing class.
+    #[test]
+    fn innermost_enclosing_symbol_picks_the_nested_range() {
+        let ranges = vec![(1, 1, 20), (2, 3, 8)]; // class 1-20, method 3-8
+        assert_eq!(innermost_enclosing_symbol(&ranges, 5), Some(2));
+    }
+
+    /// A reference outside every symbol's range has no container.
+    #[test]
+    fn innermost_enclosing_symbol_none_outside_every_range() {
+        let ranges = vec![(1, 3, 8)];
+        assert_eq!(innermost_enclosing_symbol(&ranges, 20), None);
+    }
+
+    /// `end_line == 0` is the legacy "unknown" marker, not literally line 0 —
+    /// such a symbol never claims a reference, even one on its own start line.
+    #[test]
+    fn innermost_enclosing_symbol_skips_unknown_end_line() {
+        let ranges = vec![(1, 3, 0)];
+        assert_eq!(innermost_enclosing_symbol(&ranges, 3), None);
+    }
+
+    /// Two candidates starting on the same line: the one with the smaller
+    /// (tighter) end_line is innermost and wins.
+    #[test]
+    fn innermost_enclosing_symbol_ties_on_line_prefer_smaller_end_line() {
+        let ranges = vec![(1, 5, 10), (2, 5, 6)];
+        assert_eq!(innermost_enclosing_symbol(&ranges, 5), Some(2));
+    }
+
+    /// Identical ranges: the greatest id wins, for a deterministic result.
+    #[test]
+    fn innermost_enclosing_symbol_ties_on_range_prefer_greatest_id() {
+        let ranges = vec![(3, 5, 10), (7, 5, 10)];
+        assert_eq!(innermost_enclosing_symbol(&ranges, 5), Some(7));
+    }
+
     fn add_file(db: &Database, path: &str, language: &str) -> i64 {
         db.upsert_file(path, "hash", language).unwrap()
     }
@@ -575,6 +678,23 @@ mod tests {
             line,
             col,
             is_definition,
+            container_docid: None,
+        }
+    }
+
+    /// Like `wire_ref`, but with a `container_docid` set — for tests of
+    /// semantic-mode container resolution.
+    fn wire_ref_with_container(
+        docid: &str,
+        file: &str,
+        line: i64,
+        col: i64,
+        is_definition: bool,
+        container_docid: &str,
+    ) -> Reference {
+        Reference {
+            container_docid: Some(container_docid.to_string()),
+            ..wire_ref(docid, file, line, col, is_definition)
         }
     }
 
@@ -634,6 +754,112 @@ mod tests {
         );
     }
 
+    /// A semantic reference whose `container_docid` names a stamped symbol in
+    /// the reference's own file gets that symbol's id as its container.
+    #[test]
+    fn semantic_container_resolves_to_stamped_symbol() {
+        let db = Database::open_in_memory().unwrap();
+        let file = add_file(&db, "Program.cs", "csharp");
+        add_symbol(&db, file, "Main", 3, "Program");
+        add_symbol(&db, file, "Helper", 10, "Program");
+
+        let output = AnalyzeOutput {
+            definitions: vec![
+                def("M:App.Program.Main", "Main", "Program.cs", 3),
+                def("M:App.Program.Helper", "Helper", "Program.cs", 10),
+            ],
+            references: vec![wire_ref_with_container(
+                "M:App.Program.Helper",
+                "Program.cs",
+                5,
+                9,
+                false,
+                "M:App.Program.Main",
+            )],
+        };
+        ingest_semantic(&db, Some(&output)).unwrap();
+
+        assert_eq!(
+            reference_containers(&db, "Helper"),
+            vec![Some("Main".to_string())]
+        );
+    }
+
+    /// A reference with no `container_docid` on the wire gets a NULL container.
+    #[test]
+    fn semantic_container_none_when_wire_omits_it() {
+        let db = Database::open_in_memory().unwrap();
+        let file = add_file(&db, "Program.cs", "csharp");
+        add_symbol(&db, file, "Helper", 10, "Program");
+
+        let output = AnalyzeOutput {
+            definitions: vec![def("M:App.Program.Helper", "Helper", "Program.cs", 10)],
+            references: vec![wire_ref("M:App.Program.Helper", "Program.cs", 5, 9, false)],
+        };
+        ingest_semantic(&db, Some(&output)).unwrap();
+
+        assert_eq!(reference_containers(&db, "Helper"), vec![None]);
+    }
+
+    /// A `container_docid` that was never stamped (e.g. it names a framework
+    /// symbol or a kind the sidecar does not emit) resolves to NULL, silently.
+    #[test]
+    fn semantic_container_none_when_container_docid_unstamped() {
+        let db = Database::open_in_memory().unwrap();
+        let file = add_file(&db, "Program.cs", "csharp");
+        add_symbol(&db, file, "Helper", 10, "Program");
+
+        let output = AnalyzeOutput {
+            definitions: vec![def("M:App.Program.Helper", "Helper", "Program.cs", 10)],
+            references: vec![wire_ref_with_container(
+                "M:App.Program.Helper",
+                "Program.cs",
+                5,
+                9,
+                false,
+                "M:App.Other.Nope",
+            )],
+        };
+        ingest_semantic(&db, Some(&output)).unwrap();
+
+        assert_eq!(reference_containers(&db, "Helper"), vec![None]);
+    }
+
+    /// A docid stamped onto symbol rows in two different files (partial
+    /// types, multi-targeting) resolves to the one in the reference's own
+    /// file, not the other one — a container is never linked ambiguously.
+    #[test]
+    fn semantic_container_narrows_to_the_referencing_file() {
+        let db = Database::open_in_memory().unwrap();
+        let file_a = add_file(&db, "A.cs", "csharp");
+        let file_b = add_file(&db, "B.cs", "csharp");
+        add_symbol(&db, file_a, "Init", 1, "App");
+        add_symbol(&db, file_b, "Init", 1, "App");
+        add_symbol(&db, file_a, "Helper", 5, "App");
+
+        let output = AnalyzeOutput {
+            definitions: vec![
+                def("M:App.Init", "Init", "A.cs", 1),
+                def("M:App.Init", "Init", "B.cs", 1),
+                def("M:App.Helper", "Helper", "A.cs", 5),
+            ],
+            references: vec![wire_ref_with_container(
+                "M:App.Helper",
+                "A.cs",
+                6,
+                9,
+                false,
+                "M:App.Init",
+            )],
+        };
+        ingest_semantic(&db, Some(&output)).unwrap();
+
+        assert_eq!(
+            reference_containers(&db, "Helper"),
+            vec![Some("Init".to_string())]
+        );
+    }
+
     /// References to docids that were never stamped (framework/NuGet, e.g.
     /// Console.WriteLine) are dropped silently — zero dangling rows (P3-M5).
     /// Definitions that match no indexed symbol row are skipped silently.
@@ -687,8 +913,10 @@ mod tests {
         let helper = add_symbol(&db, py_file, "helper", 2, "util");
 
         // Stale tree-sitter rows: one sourced from a .cs file, one from .py
-        db.insert_reference(save, cs_file, 20, 3, false).unwrap();
-        db.insert_reference(helper, py_file, 9, 0, false).unwrap();
+        db.insert_reference(save, cs_file, 20, 3, false, None)
+            .unwrap();
+        db.insert_reference(helper, py_file, 9, 0, false, None)
+            .unwrap();
 
         let output = AnalyzeOutput {
             definitions: vec![def("M:App.A.Save", "Save", "A.cs", 5)],
@@ -892,7 +1120,7 @@ mod tests {
             .symbol_references(&ids)
             .unwrap()
             .into_iter()
-            .map(|(path, _, _)| path)
+            .map(|(path, _, _, _)| path)
             .collect();
         paths.sort();
         paths.dedup();
@@ -959,6 +1187,95 @@ mod tests {
                 "src/reports/audit.ts".to_string(),
                 "src/reports/globals.ts".to_string()
             ]
+        );
+    }
+
+    /// Container names of every reference to `referenced_name`, in insertion
+    /// order.
+    fn reference_containers(db: &Database, referenced_name: &str) -> Vec<Option<String>> {
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT c.name FROM references_ r
+                 JOIN symbols s ON s.id = r.symbol_id
+                 LEFT JOIN symbols c ON c.id = r.container_symbol_id
+                 WHERE s.name = ?1
+                 ORDER BY r.line, r.column",
+            )
+            .unwrap();
+        stmt.query_map([referenced_name], |row| row.get::<_, Option<String>>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// A reference inside a method inside a class resolves to the method, not
+    /// the enclosing class — full-index path (`index_full`).
+    #[test]
+    fn index_full_sets_container_to_innermost_enclosing_method() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("wallet.ts"),
+            "export class Wallet {\n    format() {\n        return helper();\n    }\n}\nfunction helper() { return 1; }\n",
+        )
+        .unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        index_full(&db, dir.path(), None).unwrap();
+
+        assert_eq!(
+            reference_containers(&db, "helper"),
+            vec![Some("format".to_string())]
+        );
+    }
+
+    /// A reference at file/module scope — outside every symbol's range — gets
+    /// no container.
+    #[test]
+    fn index_full_leaves_file_scope_reference_container_null() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("helper.ts"),
+            "export function helper() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("main.ts"),
+            "import { helper } from './helper';\nhelper();\n",
+        )
+        .unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        index_full(&db, dir.path(), None).unwrap();
+
+        assert_eq!(reference_containers(&db, "helper"), vec![None]);
+    }
+
+    /// Incremental path (`index_file`): a newly-added file's own symbols are
+    /// inserted before its references are resolved, so a reference to a
+    /// symbol defined in an *earlier* incremental run still finds its
+    /// (same-file) container.
+    #[test]
+    fn index_incremental_sets_container_for_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("helper.ts"),
+            "export function helper() { return 1; }\n",
+        )
+        .unwrap();
+        let db = Database::open_in_memory().unwrap();
+        index_full(&db, dir.path(), None).unwrap();
+
+        std::fs::write(
+            dir.path().join("wallet.ts"),
+            "export class Wallet {\n    format() {\n        return helper();\n    }\n}\n",
+        )
+        .unwrap();
+        index_incremental(&db, dir.path(), &["wallet.ts".to_string()], &[]).unwrap();
+
+        assert_eq!(
+            reference_containers(&db, "helper"),
+            vec![Some("format".to_string())]
         );
     }
 

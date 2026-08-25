@@ -59,6 +59,12 @@ pub struct Reference {
     pub line: i64,
     pub col: i64,
     pub is_definition: bool,
+    /// DocumentationCommentId of the symbol enclosing this reference site, or
+    /// `None` when the reference has no enclosing symbol the helper tracks.
+    /// Absent entirely on an older helper binary — a missing field on this
+    /// `Option<T>` deserializes to `None` per the forward-compat rule, so an
+    /// old helper against a new helios still parses.
+    pub container_docid: Option<String>,
 }
 
 /// A detected, ping-verified helper. Constructed only by `detect()`.
@@ -549,6 +555,17 @@ mod tests {
         assert_eq!(output.references.len(), 1);
         assert!(!output.references[0].is_definition);
         assert_eq!(warnings, vec!["could not load obj/Gen.cs".to_string()]);
+    }
+
+    /// An old-format `reference` record with no `container_docid` key at all —
+    /// the wire an older helper binary sends against a new helios — still
+    /// parses, with the field read as `None`.
+    #[test]
+    fn parse_analyze_old_reference_without_container_docid_still_parses() {
+        let stdout = "{\"type\":\"reference\",\"docid\":\"M:App.Person.Greet\",\"file\":\"Program.cs\",\"line\":5,\"col\":13,\"is_definition\":false}\n";
+        let (output, _warnings) = parse_analyze(stdout).expect("parse");
+        assert_eq!(output.references.len(), 1);
+        assert!(output.references[0].container_docid.is_none());
     }
 
     #[test]
