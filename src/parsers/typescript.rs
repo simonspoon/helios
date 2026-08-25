@@ -269,10 +269,13 @@ impl LanguageParser for TypeScriptParser {
                 .find(|(n, _)| n.ends_with("_name"))
                 .map(|(_, n)| text_from(src, *n));
             let Some(sub_name) = sub_name else { continue };
+            // The sub is always the class/interface this heritage clause is
+            // attached to, so it's always declared right here -- `sub_line`
+            // is always `Some`.
             let sub_line = captures
                 .iter()
                 .find(|(n, _)| n.ends_with("_name"))
-                .map(|(_, n)| n.start_position().row as i64 + 1)
+                .map(|(_, n)| Some(n.start_position().row as i64 + 1))
                 .unwrap();
 
             for &(name, node) in &captures {
@@ -585,7 +588,7 @@ export class Registry {
 
     /// `ParsedTypeRelation` has no `PartialEq`, so tests compare this plain
     /// tuple projection instead.
-    fn relation_tuples(relations: &[ParsedTypeRelation]) -> Vec<(&str, i64, &str, &str)> {
+    fn relation_tuples(relations: &[ParsedTypeRelation]) -> Vec<(&str, Option<i64>, &str, &str)> {
         relations
             .iter()
             .map(|r| {
@@ -605,7 +608,7 @@ export class Registry {
         let result = parser.parse("class C extends B {}").unwrap();
         assert_eq!(
             relation_tuples(&result.type_relations),
-            vec![("C", 1, "B", "extends")]
+            vec![("C", Some(1), "B", "extends")]
         );
     }
 
@@ -615,7 +618,7 @@ export class Registry {
         let result = parser.parse("class C implements I, J {}").unwrap();
         assert_eq!(
             relation_tuples(&result.type_relations),
-            vec![("C", 1, "I", "implements"), ("C", 1, "J", "implements")]
+            vec![("C", Some(1), "I", "implements"), ("C", Some(1), "J", "implements")]
         );
     }
 
@@ -627,7 +630,7 @@ export class Registry {
             .unwrap();
         assert_eq!(
             relation_tuples(&result.type_relations),
-            vec![("C", 1, "B", "extends"), ("C", 1, "I", "implements")]
+            vec![("C", Some(1), "B", "extends"), ("C", Some(1), "I", "implements")]
         );
     }
 
@@ -637,7 +640,7 @@ export class Registry {
         let result = parser.parse("interface I extends K, L {}").unwrap();
         assert_eq!(
             relation_tuples(&result.type_relations),
-            vec![("I", 1, "K", "extends"), ("I", 1, "L", "extends")]
+            vec![("I", Some(1), "K", "extends"), ("I", Some(1), "L", "extends")]
         );
     }
 
@@ -654,7 +657,7 @@ export class Registry {
         let result = parser.parse("class C extends Base<T> {}").unwrap();
         assert_eq!(
             relation_tuples(&result.type_relations),
-            vec![("C", 1, "Base<T>", "extends")]
+            vec![("C", Some(1), "Base<T>", "extends")]
         );
     }
 
@@ -664,7 +667,7 @@ export class Registry {
         let result = parser.parse("class C extends B {}").unwrap();
         assert_eq!(
             relation_tuples(&result.type_relations),
-            vec![("C", 1, "B", "extends")]
+            vec![("C", Some(1), "B", "extends")]
         );
     }
 }

@@ -149,11 +149,19 @@ pub struct ParsedReference {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ParsedTypeRelation {
-    /// The declared type's name, matched at index time to the symbol just
-    /// inserted for this file.
+    /// The declared type's name. Matched at index time to the symbol just
+    /// inserted for this file when `sub_line` is `Some` (the common case: the
+    /// type is declared right here, so its line disambiguates same-named
+    /// symbols in this one file). `sub_line` is `None` when the parser knows
+    /// the relation but not a local declaration line for `sub_name` — e.g.
+    /// Rust's `impl Trait for Type`, where `Type` may be declared in another
+    /// file entirely. Such a relation is still emitted rather than dropped:
+    /// `sub_name` alone is enough for `index_file_definitions` (and later
+    /// `resolve_type_relations`, if the type isn't indexed yet) to resolve it
+    /// by name against the whole index, the same way an unresolved
+    /// `super_name` already does.
     pub sub_name: String,
-    /// Declaration line, to disambiguate same-named symbols in one file.
-    pub sub_line: i64,
+    pub sub_line: Option<i64>,
     pub super_name: String,
     /// "extends" | "implements".
     pub kind: String,
@@ -230,15 +238,24 @@ impl Database {
                 value TEXT NOT NULL
             );
 
-            -- sub extends/implements super. super_symbol_id is NULL when the
-            -- supertype resolves to nothing indexed (an external base type) —
-            -- the row still exists, with super_name carrying the raw source
-            -- text, so external supertypes are not silently dropped. A new
-            -- table rather than a column, so it needs no migrate() ALTER: the
-            -- CREATE TABLE/INDEX IF NOT EXISTS below already covers old DBs.
+            -- sub extends/implements super. Both ends can be NULL: super_symbol_id
+            -- is NULL when the supertype resolves to nothing indexed (an
+            -- external base type), and sub_symbol_id is NULL when the type
+            -- declaring this relation hasn't been indexed yet at insert time
+            -- (e.g. a Rust `impl Trait for Type` where `Type` lives in a file
+            -- the walk reaches later — see resolve_type_relations). Either way
+            -- the row still exists, with sub_name/super_name carrying the raw
+            -- source text, so nothing is silently dropped. A new table rather
+            -- than a column, so it needs no migrate() ALTER for the columns
+            -- that were here from the start: the CREATE TABLE/INDEX IF NOT
+            -- EXISTS below already covers old DBs for those. sub_symbol_id's
+            -- NOT NULL -> nullable relaxation and the sub_name addition are
+            -- schema changes SQLite's ALTER TABLE cannot express in place, so
+            -- those two DO need a migrate() step (see has_sub_name below).
             CREATE TABLE IF NOT EXISTS type_relations (
                 id INTEGER PRIMARY KEY,
-                sub_symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+                sub_symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
+                sub_name TEXT NOT NULL,
                 super_symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
                 super_name TEXT NOT NULL,
                 kind TEXT NOT NULL,
@@ -337,6 +354,59 @@ impl Database {
         // column does not exist until the ALTER TABLE above runs.
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_refs_container ON references_(container_symbol_id)",
+        )?;
+
+        // Check if sub_name exists on type_relations. Its absence marks the
+        // original schema, where sub_symbol_id is still `NOT NULL` — and
+        // unlike every other migration above, that can't be fixed with an
+        // ADD COLUMN: SQLite's ALTER TABLE has no way to relax a column's
+        // NOT NULL constraint in place, only to add columns, rename things,
+        // or drop columns. Loosening it requires rebuilding the table:
+        // rename the old one aside, create the new shape, copy the old rows
+        // across, drop the old one. sub_name is backfilled empty rather than
+        // joined from `symbols` here, because that join can't reproduce it
+        // for rows whose sub was never resolved (there is no symbol to read
+        // the name from) — and it doesn't need to: the CURRENT_INDEX_FORMAT_VERSION
+        // bump that comes with this change forces a full re-parse right
+        // after `migrate()` returns, which clears and re-inserts every row
+        // with real data anyway (see index_file_definitions / ingest_semantic).
+        let has_sub_name: bool = self
+            .conn
+            .prepare("SELECT sub_name FROM type_relations LIMIT 0")
+            .is_ok();
+
+        if !has_sub_name {
+            self.conn.execute_batch(
+                "ALTER TABLE type_relations RENAME TO type_relations_old;
+
+                CREATE TABLE type_relations (
+                    id INTEGER PRIMARY KEY,
+                    sub_symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
+                    sub_name TEXT NOT NULL,
+                    super_symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
+                    super_name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE
+                );
+
+                INSERT INTO type_relations
+                    (id, sub_symbol_id, sub_name, super_symbol_id, super_name, kind, file_id)
+                SELECT id, sub_symbol_id, '', super_symbol_id, super_name, kind, file_id
+                FROM type_relations_old;
+
+                DROP TABLE type_relations_old;",
+            )?;
+        }
+
+        // Indexes must be (re)created here, not relied upon from create_tables:
+        // dropping type_relations_old above drops the indexes that were bound
+        // to it (SQLite indexes go with their table), so a rebuilt table starts
+        // with none. Harmless IF NOT EXISTS no-op on a DB that didn't rebuild.
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_type_rel_sub ON type_relations(sub_symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_type_rel_super ON type_relations(super_symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_type_rel_super_name ON type_relations(super_name);
+            CREATE INDEX IF NOT EXISTS idx_type_rel_file ON type_relations(file_id);",
         )?;
 
         Ok(())
@@ -934,19 +1004,26 @@ impl Database {
 
     // --- Type-relation operations ---
 
+    /// `sub_symbol_id` is `Option` for the same reason `super_symbol_id` is:
+    /// the type this relation is declared on may not be indexed yet (a Rust
+    /// `impl Trait for Type` where `Type` lives in a file the walk hasn't
+    /// reached), so `sub_name` is stored either way and `resolve_type_relations`
+    /// fills in the id once that file is indexed. The row is always inserted,
+    /// never dropped, regardless of which end resolved.
     #[allow(dead_code)]
     pub fn insert_type_relation(
         &self,
-        sub_symbol_id: i64,
+        sub_symbol_id: Option<i64>,
+        sub_name: &str,
         super_symbol_id: Option<i64>,
         super_name: &str,
         kind: &str,
         file_id: i64,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO type_relations (sub_symbol_id, super_symbol_id, super_name, kind, file_id)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![sub_symbol_id, super_symbol_id, super_name, kind, file_id],
+            "INSERT INTO type_relations (sub_symbol_id, sub_name, super_symbol_id, super_name, kind, file_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![sub_symbol_id, sub_name, super_symbol_id, super_name, kind, file_id],
         )?;
         Ok(())
     }
@@ -1011,6 +1088,13 @@ impl Database {
     /// `symbol_ids` may legitimately be empty (an unresolved target still has
     /// a name to search by), so unlike `supertypes_of` this does not
     /// short-circuit on that.
+    ///
+    /// The `JOIN symbols s ON s.id = tr.sub_symbol_id` deliberately excludes
+    /// any row whose *sub* never resolved (`sub_symbol_id IS NULL`), even if
+    /// its super matched by name above — there is no symbol to read
+    /// `sub_name`/`sub_scope`/`file`/`line` from for such a row, so it has
+    /// nothing to report as an implementor and is correctly left out rather
+    /// than printed with placeholder fields.
     #[allow(dead_code)]
     pub fn implementors_of(&self, symbol_ids: &[i64], name: &str) -> Result<Vec<TypeEdge>> {
         let id_clause = if symbol_ids.is_empty() {
@@ -1091,7 +1175,7 @@ impl Database {
     /// after every file is in, so a forward reference resolves once the type
     /// it names shows up anywhere in the repo.
     #[allow(dead_code)]
-    pub fn unresolved_type_relations(&self) -> Result<Vec<(i64, String)>> {
+    pub fn unresolved_type_relation_supers(&self) -> Result<Vec<(i64, String)>> {
         let mut stmt = self
             .conn
             .prepare("SELECT id, super_name FROM type_relations WHERE super_symbol_id IS NULL")?;
@@ -1099,16 +1183,37 @@ impl Database {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
         rows.collect::<Result<Vec<_>, _>>()
-            .context("listing unresolved type relations")
+            .context("listing unresolved type relation supers")
     }
 
-    /// Write `(relation id, resolved symbol id)` pairs in one transaction, as
-    /// `apply_import_resolutions` does for imports. Unlike that method's
-    /// `Option<i64>`, a plain `i64` is right here: an unresolved relation is
-    /// simply absent from `updates` and its `super_symbol_id` stays NULL —
-    /// there is no resolved-to-then-un-resolved case to express.
+    /// `(type_relations.id, sub_name)` for every row still unresolved
+    /// (`sub_symbol_id IS NULL`) — mirrors `unresolved_type_relation_supers`
+    /// exactly, just for the other end of the edge. This is what makes a
+    /// `Rust` `impl Trait for Type` whose `Type` lives in a file the walk
+    /// hasn't reached yet (or reaches later in the same walk, since files are
+    /// processed in path order and nothing guarantees a type's own file sorts
+    /// before its impls) resolvable once that file is indexed, rather than
+    /// stuck unresolved forever the way a pre-second-pass insert would leave
+    /// it.
     #[allow(dead_code)]
-    pub fn apply_type_relation_resolutions(&self, updates: &[(i64, i64)]) -> Result<()> {
+    pub fn unresolved_type_relation_subs(&self) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, sub_name FROM type_relations WHERE sub_symbol_id IS NULL")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("listing unresolved type relation subs")
+    }
+
+    /// Write `(relation id, resolved symbol id)` pairs to `super_symbol_id` in
+    /// one transaction, as `apply_import_resolutions` does for imports. Unlike
+    /// that method's `Option<i64>`, a plain `i64` is right here: an unresolved
+    /// relation is simply absent from `updates` and its `super_symbol_id`
+    /// stays NULL — there is no resolved-to-then-un-resolved case to express.
+    #[allow(dead_code)]
+    pub fn apply_type_relation_super_resolutions(&self, updates: &[(i64, i64)]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut stmt =
@@ -1117,7 +1222,23 @@ impl Database {
                 stmt.execute(params![symbol_id, relation_id])?;
             }
         }
-        tx.commit().context("writing type relation resolutions")
+        tx.commit()
+            .context("writing type relation super resolutions")
+    }
+
+    /// Same as `apply_type_relation_super_resolutions`, writing `sub_symbol_id`
+    /// instead.
+    #[allow(dead_code)]
+    pub fn apply_type_relation_sub_resolutions(&self, updates: &[(i64, i64)]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt =
+                tx.prepare("UPDATE type_relations SET sub_symbol_id = ?1 WHERE id = ?2")?;
+            for (relation_id, symbol_id) in updates {
+                stmt.execute(params![symbol_id, relation_id])?;
+            }
+        }
+        tx.commit().context("writing type relation sub resolutions")
     }
 
     /// Stamp a sidecar DocId onto the symbol row(s) `index_file` inserted for
@@ -1195,10 +1316,16 @@ impl Database {
 
     /// Bump this when adding a table or pass that a full re-index must
     /// populate for every file, not just ones whose content changed.
-    /// Current: 2 — introduced to backfill `type_relations`, which the
-    /// content-hash cache was silently leaving empty on an unchanged file for
-    /// anyone upgrading into an existing index.
-    pub const CURRENT_INDEX_FORMAT_VERSION: &str = "2";
+    /// Current: 3 — a cross-file subtype (e.g. a Rust `impl Trait for Type`
+    /// where `Type` lives in another file) used to be dropped entirely by
+    /// `index_file_definitions`, since `sub_symbol_id` was `NOT NULL` and
+    /// only resolvable against symbols already inserted for the same file.
+    /// Now such a relation is stored unresolved (mirroring the existing
+    /// external-supertype handling) and picked up by `resolve_type_relations`.
+    /// An unchanged file's content hash gives no signal that helios now
+    /// extracts an edge from it that it silently missed before, so this bump
+    /// forces the same backfill-on-upgrade re-parse version 2 introduced.
+    pub const CURRENT_INDEX_FORMAT_VERSION: &str = "3";
 
     pub fn set_metadata(&self, key: &str, value: &str) -> Result<()> {
         self.conn.execute(

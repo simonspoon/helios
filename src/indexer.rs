@@ -111,18 +111,21 @@ fn base_type_identifier(name: &str) -> &str {
 /// ever reports class/struct/interface/enum.
 const TYPE_LIKE_KINDS: &[&str] = &["class", "struct", "interface", "enum", "trait", "type"];
 
-/// Resolve a type relation's `super_name` to a symbol id. Exactly one
-/// same-named, type-like candidate wins (see `TYPE_LIKE_KINDS`); zero or more
-/// than one leaves the supertype unresolved rather than guessing — the same
-/// rule `resolve_semantic_container` documents for reference containers. A
-/// `None` result is not a failure: the row is still inserted with
-/// `super_symbol_id` NULL, since an external base type (framework, unindexed
-/// dependency) must not be silently dropped. Shared by both resolution
-/// passes (`index_file_definitions` and `resolve_type_relations`) so they
-/// cannot disagree on what counts as a match.
-fn resolve_type_relation_super(db: &Database, super_name: &str) -> Result<Option<i64>> {
+/// Resolve a type relation's endpoint name — `super_name`, or `sub_name` when
+/// the parser couldn't supply a local declaration line for it — to a symbol
+/// id. Exactly one same-named, type-like candidate wins (see
+/// `TYPE_LIKE_KINDS`); zero or more than one leaves that end unresolved
+/// rather than guessing — the same rule `resolve_semantic_container`
+/// documents for reference containers. A `None` result is not a failure: the
+/// row is still inserted with that end's `*_symbol_id` NULL, since an
+/// external base type (framework, unindexed dependency) or a not-yet-indexed
+/// sub must not be silently dropped. Shared by both resolution passes
+/// (`index_file_definitions` and `resolve_type_relations`), and by both ends
+/// of the edge, so none of the four call sites can disagree on what counts as
+/// a match.
+fn resolve_type_name(db: &Database, name: &str) -> Result<Option<i64>> {
     let candidates: Vec<i64> = db
-        .find_symbol_by_name(base_type_identifier(super_name))?
+        .find_symbol_by_name(base_type_identifier(name))?
         .into_iter()
         .filter(|(sym, _)| TYPE_LIKE_KINDS.contains(&sym.kind.as_str()))
         .map(|(sym, _)| sym.id)
@@ -462,19 +465,33 @@ fn index_file_definitions(
     }
 
     // Insert type relations (`class C extends B implements I`, `impl Trait for
-    // Type`, ...). The sub side is always a symbol declared in this file, so
-    // it resolves against `inserted_symbol_ids` above rather than a query; a
-    // relation whose sub never matches an inserted symbol (parser/schema
-    // mismatch) is skipped rather than inserted with a dangling id, since
-    // `sub_symbol_id` is NOT NULL. The super side may resolve to nothing
-    // indexed (see `resolve_type_relation_super`) — the row is inserted
-    // either way, since the whole point is not to drop external base types.
+    // Type`, ...). When the parser supplied a local declaration line
+    // (`sub_line` is `Some` — the common case: the type is declared right
+    // here), the sub resolves against `inserted_symbol_ids` above rather than
+    // a query. `sub_line` is `None` when the parser knows the relation but not
+    // a local line for it — Rust's `impl Trait for Type` is the case this
+    // exists for: `Type` may be declared in a file the walk hasn't reached
+    // yet. That end is then resolved the same way the super side always has
+    // been, by name against whatever the index currently holds. Either way
+    // the row is inserted regardless of whether either end resolved — see
+    // `resolve_type_name` — so a still-unresolved sub or super is picked up
+    // later by `resolve_type_relations` rather than dropped.
     for rel in &parse_result.type_relations {
-        let Some(&sub_id) = inserted_symbol_ids.get(&(rel.sub_name.as_str(), rel.sub_line)) else {
-            continue;
+        let sub_symbol_id = match rel.sub_line {
+            Some(line) => inserted_symbol_ids
+                .get(&(rel.sub_name.as_str(), line))
+                .copied(),
+            None => resolve_type_name(db, &rel.sub_name)?,
         };
-        let super_symbol_id = resolve_type_relation_super(db, &rel.super_name)?;
-        db.insert_type_relation(sub_id, super_symbol_id, &rel.super_name, &rel.kind, file_id)?;
+        let super_symbol_id = resolve_type_name(db, &rel.super_name)?;
+        db.insert_type_relation(
+            sub_symbol_id,
+            &rel.sub_name,
+            super_symbol_id,
+            &rel.super_name,
+            &rel.kind,
+            file_id,
+        )?;
     }
 
     Ok(FileStats {
@@ -627,6 +644,19 @@ pub fn ingest_semantic(db: &Database, semantic: Option<&AnalyzeOutput>) -> Resul
 
     let docid_map = db.docid_symbol_map()?;
     let container_map = db.docid_symbol_file_map()?;
+    // `type_relations.sub_name` needs a name, not just an id, and
+    // `container_map`/`docid_symbol_map` only carry ids — so a small
+    // docid -> name map straight off the wire's own `definitions` list, which
+    // already has both. Roslyn always tells us which file a relation's sub is
+    // declared in (`relation.file`), so — unlike the tree-sitter path's Rust
+    // `impl` case — `sub_symbol_id` below always resolves and this name is
+    // never actually read back out; it's stored for the same reason every
+    // other `sub_name`/`super_name` is: so the row means something on its own.
+    let docid_names: HashMap<&str, &str> = output
+        .definitions
+        .iter()
+        .map(|d| (d.docid.as_str(), d.name.as_str()))
+        .collect();
     db.delete_references_from_language("csharp")?;
     // The C# tree-sitter leg (csharp.rs) already stores a syntactic
     // approximation of these edges from the `base_list` grammar, which cannot
@@ -679,9 +709,14 @@ pub fn ingest_semantic(db: &Database, semantic: Option<&AnalyzeOutput>) -> Resul
         else {
             continue;
         };
+        let sub_name = docid_names
+            .get(relation.sub_docid.as_str())
+            .copied()
+            .unwrap_or_default();
         let super_symbol_id = resolve_semantic_super(&docid_map, relation.super_docid.as_deref());
         db.insert_type_relation(
-            sub_symbol_id,
+            Some(sub_symbol_id),
+            sub_name,
             super_symbol_id,
             &relation.super_name,
             &relation.kind,
@@ -730,37 +765,51 @@ pub fn resolve_imports(db: &Database) -> Result<usize> {
     Ok(resolved_count)
 }
 
-/// Post-index pass: fill in `super_symbol_id` for `type_relations` rows left
-/// unresolved at insert time.
+/// Post-index pass: fill in `super_symbol_id` and `sub_symbol_id` for
+/// `type_relations` rows left unresolved at insert time.
 ///
 /// A supertype declared in a file the walk had not reached yet (or, on an
 /// incremental run, a file not yet re-indexed this pass) cannot resolve when
 /// its subtype's own file is indexed — `index_file_definitions` records
-/// `super_name` and leaves `super_symbol_id` NULL rather than guess. This
-/// mirrors `resolve_imports`: it runs once the whole file set is in, so a
-/// name that only now resolves uniquely gets its edge filled in. Unlike
+/// `super_name` and leaves `super_symbol_id` NULL rather than guess. The sub
+/// side has the identical problem in reverse: a Rust `impl Trait for Type`
+/// parsed in one file can name a `Type` declared in another file the walk
+/// hasn't reached yet (there is no guarantee a type's own file sorts before
+/// files that `impl` it — `display.rs` before `types.rs` is the ordering trap
+/// this whole second pass exists for), so `index_file_definitions` records
+/// `sub_name` and leaves `sub_symbol_id` NULL the same way. This mirrors
+/// `resolve_imports`: it runs once the whole file set is in, so a name that
+/// only now resolves uniquely gets its edge filled in on either end. Unlike
 /// `resolve_imports` it only ever fills NULLs — a `type_relations` row's
-/// resolved `super_symbol_id` is never taken away once set (same reasoning as
-/// the AMENDMENT 1 note on `symbol_references`: `super_name` keeps the edge
+/// resolved id is never taken away once set (same reasoning as the AMENDMENT 1
+/// note on `symbol_references`: `super_name`/`sub_name` keep the edge
 /// answerable, so there is nothing to gain by nulling out a stale-but-not-yet-
 /// wrong id, and every other resolution in this codebase treats "resolves to
 /// exactly one" as a one-way ratchet, not a live view).
 ///
 /// Mirrors `resolve_imports`' `all_imports_with_source` + `apply_import_resolutions`
-/// pairing: `unresolved_type_relations` lists the rows still NULL,
-/// `resolve_type_relation_super` re-runs the exact-one-match rule (the same
-/// helper `index_file_definitions` uses, so the two passes cannot disagree),
-/// and `apply_type_relation_resolutions` writes every resolved id back in one
-/// transaction rather than a commit per row.
+/// pairing, once per end: `unresolved_type_relation_supers`/`_subs` list the
+/// rows still NULL on that end, `resolve_type_name` re-runs the exact-one-match
+/// rule (the same helper `index_file_definitions` uses for both ends, so the
+/// passes cannot disagree), and `apply_type_relation_super_resolutions`/
+/// `_sub_resolutions` write every resolved id back in one transaction each
+/// rather than a commit per row.
 pub fn resolve_type_relations(db: &Database) -> Result<usize> {
-    let mut updates = Vec::new();
-    for (rel_id, super_name) in db.unresolved_type_relations()? {
-        if let Some(super_symbol_id) = resolve_type_relation_super(db, &super_name)? {
-            updates.push((rel_id, super_symbol_id));
+    let mut super_updates = Vec::new();
+    for (rel_id, super_name) in db.unresolved_type_relation_supers()? {
+        if let Some(super_symbol_id) = resolve_type_name(db, &super_name)? {
+            super_updates.push((rel_id, super_symbol_id));
         }
     }
-    let resolved_count = updates.len();
-    db.apply_type_relation_resolutions(&updates)?;
+    let mut sub_updates = Vec::new();
+    for (rel_id, sub_name) in db.unresolved_type_relation_subs()? {
+        if let Some(sub_symbol_id) = resolve_type_name(db, &sub_name)? {
+            sub_updates.push((rel_id, sub_symbol_id));
+        }
+    }
+    let resolved_count = super_updates.len() + sub_updates.len();
+    db.apply_type_relation_super_resolutions(&super_updates)?;
+    db.apply_type_relation_sub_resolutions(&sub_updates)?;
     Ok(resolved_count)
 }
 
@@ -860,13 +909,13 @@ mod tests {
     /// pointed at the wrong symbol); once an actual class named the same
     /// thing is added, resolution becomes unambiguous and picks it.
     #[test]
-    fn resolve_type_relation_super_ignores_non_type_kinds() {
+    fn resolve_type_name_ignores_non_type_kinds() {
         let db = Database::open_in_memory().unwrap();
         let file = add_file(&db, "app.ts", "typescript");
         // `add_symbol` inserts kind "fn" — not in TYPE_LIKE_KINDS.
         add_symbol(&db, file, "Base", 1, "");
 
-        assert_eq!(resolve_type_relation_super(&db, "Base").unwrap(), None);
+        assert_eq!(resolve_type_name(&db, "Base").unwrap(), None);
 
         let base_class = db
             .insert_symbol(
@@ -882,10 +931,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(
-            resolve_type_relation_super(&db, "Base").unwrap(),
-            Some(base_class)
-        );
+        assert_eq!(resolve_type_name(&db, "Base").unwrap(), Some(base_class));
     }
 
     fn def(docid: &str, name: &str, file: &str, start_line: i64) -> Definition {

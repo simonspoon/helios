@@ -485,8 +485,8 @@ fn test_deps_type_edge_external_cross_language_shows_declaring_file() {
             )
             .expect("finding Sub symbol row");
         conn.execute(
-            "INSERT INTO type_relations (sub_symbol_id, super_symbol_id, super_name, kind, file_id)
-             VALUES (?1, NULL, 'Base', 'implements', ?2)",
+            "INSERT INTO type_relations (sub_symbol_id, sub_name, super_symbol_id, super_name, kind, file_id)
+             VALUES (?1, 'Sub', NULL, 'Base', 'implements', ?2)",
             rusqlite::params![sub_symbol_id, sub_file_id],
         )
         .expect("seeding unresolved type relation");
@@ -5243,7 +5243,81 @@ fn test_init_backfills_type_relations_after_format_upgrade() {
     );
     assert_eq!(
         metadata_value(dir.path(), "index_format_version").as_deref(),
-        Some("2"),
+        Some("3"),
         "a successful full index must stamp the current format version"
+    );
+}
+
+/// A Rust `impl Trait for Type` whose `Type` is declared in a *different*
+/// file must still produce an edge — not be silently dropped. `display.rs`
+/// (the impl) sorts before `types.rs` (the struct + trait) in the walk, which
+/// is deliberate: it pins the ordering trap `resolve_type_relations` exists
+/// for, where the sub's own file hasn't been indexed yet when the impl is
+/// parsed. See `resolve_type_relations` in src/indexer.rs and the
+/// `sub_symbol_id`/`sub_name` columns in src/db.rs.
+#[test]
+fn test_cross_file_impl_resolves_sub_via_second_pass() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    // Sorts before types.rs, so the impl is parsed before Widget exists in
+    // the index — sub_symbol_id must come back NULL at insert time and only
+    // get filled in by the resolve_type_relations second pass.
+    std::fs::write(
+        dir.path().join("display.rs"),
+        "use crate::types::{Render, Widget};\n\nimpl Render for Widget {\n    fn render(&self) -> String {\n        String::new()\n    }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("types.rs"),
+        "pub struct Widget {\n    pub id: u32,\n}\n\npub trait Render {\n    fn render(&self) -> String;\n}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    let conn = index_db(dir.path());
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.name, s.file_id = (SELECT id FROM files WHERE path = 'display.rs')
+             FROM type_relations tr
+             JOIN symbols s ON s.id = tr.sub_symbol_id
+             WHERE tr.super_name = 'Render'",
+        )
+        .unwrap();
+    let rows: Vec<(String, bool)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![("Widget".to_string(), false)],
+        "expected the cross-file impl to resolve to Widget's own symbol row \
+         (declared in types.rs, not display.rs), got: {rows:?}"
+    );
+
+    let output = Command::new(&bin)
+        .args(["deps", "Render"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps Render");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Implementors (what extends/implements Render):"),
+        "expected an Implementors section, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Widget -> Render (implements)"),
+        "expected Widget -> Render (implements), got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("No dependencies found"),
+        "the cross-file edge must not be silently dropped, got: {stdout}"
     );
 }

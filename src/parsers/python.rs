@@ -173,7 +173,9 @@ impl LanguageParser for PythonParser {
             };
 
             let sub_name = text_from(src, name_node);
-            let sub_line = name_node.start_position().row as i64 + 1;
+            // The sub is always the class this bases clause is attached to,
+            // so it's always declared right here -- `sub_line` is always `Some`.
+            let sub_line = Some(name_node.start_position().row as i64 + 1);
 
             let mut bcursor = bases_node.walk();
             for base in bases_node.named_children(&mut bcursor) {
@@ -429,7 +431,7 @@ class Service:
 
     /// `ParsedTypeRelation` has no `PartialEq`, so tests compare this plain
     /// tuple projection instead.
-    fn relation_tuples(relations: &[ParsedTypeRelation]) -> Vec<(&str, i64, &str, &str)> {
+    fn relation_tuples(relations: &[ParsedTypeRelation]) -> Vec<(&str, Option<i64>, &str, &str)> {
         relations
             .iter()
             .map(|r| {
@@ -449,7 +451,7 @@ class Service:
         let result = parser.parse("class C(Base, Mixin):\n    pass\n").unwrap();
         assert_eq!(
             relation_tuples(&result.type_relations),
-            vec![("C", 1, "Base", "extends"), ("C", 1, "Mixin", "extends")]
+            vec![("C", Some(1), "Base", "extends"), ("C", Some(1), "Mixin", "extends")]
         );
     }
 
@@ -475,7 +477,7 @@ class Service:
             .unwrap();
         assert_eq!(
             relation_tuples(&result.type_relations),
-            vec![("C", 1, "Base", "extends")]
+            vec![("C", Some(1), "Base", "extends")]
         );
     }
 
@@ -488,8 +490,8 @@ class Service:
         assert_eq!(
             relation_tuples(&result.type_relations),
             vec![
-                ("C", 1, "abc.ABC", "extends"),
-                ("C", 1, "Generic[T]", "extends")
+                ("C", Some(1), "abc.ABC", "extends"),
+                ("C", Some(1), "Generic[T]", "extends")
             ]
         );
     }

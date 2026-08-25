@@ -185,11 +185,16 @@ impl LanguageParser for RustParser {
         // `sub_line` can't be the impl block's own line, since `Type` isn't
         // declared there, only used. It has to be the line of `Type`'s own
         // struct/enum/type declaration -- if that's in this file, it's
-        // already sitting in `result.symbols`. An impl whose Self type is
-        // declared elsewhere (a different file, a primitive, a tuple, ...)
-        // has no local declaration to join against and is skipped, same as
-        // any other relation whose sub never resolves (see
-        // `index_file_definitions`).
+        // already sitting in `result.symbols`, and `sub_line` is `Some` of
+        // that line. An impl whose Self type is declared elsewhere -- a
+        // different file (the common case for a trait impl in Rust; nothing
+        // requires a type and its impls to share a file, or even a walk
+        // order where the type's file is seen first), a primitive, a tuple,
+        // ... -- has no local declaration to give a line, so `sub_line` is
+        // `None`. The relation is still emitted either way: `index_file_definitions`
+        // resolves a `None` sub by name against the whole index instead of a
+        // local line lookup, the same way it already does for an unresolved
+        // `super_name`.
         //
         // `trait A: B + C {}` is simpler: the trait's own name is both the
         // declaration and the sub, so `sub_line` is just that node's line.
@@ -225,9 +230,7 @@ impl LanguageParser for RustParser {
                     continue;
                 };
                 let sub_name = base_type_name(src, type_node);
-                let Some(&sub_line) = type_decl_lines.get(sub_name.as_str()) else {
-                    continue;
-                };
+                let sub_line = type_decl_lines.get(sub_name.as_str()).copied();
                 result.type_relations.push(ParsedTypeRelation {
                     sub_name,
                     sub_line,
@@ -241,7 +244,7 @@ impl LanguageParser for RustParser {
                     continue;
                 };
                 let sub_name = text_from(src, name_node);
-                let sub_line = name_node.start_position().row as i64 + 1;
+                let sub_line = Some(name_node.start_position().row as i64 + 1);
                 let mut bcursor = bounds_node.walk();
                 for bound in bounds_node.named_children(&mut bcursor) {
                     if bound.kind() == "lifetime" {
@@ -469,7 +472,7 @@ impl S {
 
     /// `ParsedTypeRelation` has no `PartialEq`, so tests compare this plain
     /// tuple projection instead.
-    fn relation_tuples(relations: &[ParsedTypeRelation]) -> Vec<(&str, i64, &str, &str)> {
+    fn relation_tuples(relations: &[ParsedTypeRelation]) -> Vec<(&str, Option<i64>, &str, &str)> {
         relations
             .iter()
             .map(|r| {
@@ -490,7 +493,7 @@ impl S {
         let result = parser.parse(source).unwrap();
         assert_eq!(
             relation_tuples(&result.type_relations),
-            vec![("Foo", 1, "fmt::Display", "implements")]
+            vec![("Foo", Some(1), "fmt::Display", "implements")]
         );
     }
 
@@ -508,7 +511,10 @@ impl S {
         let result = parser.parse("trait A: B + C {}").unwrap();
         assert_eq!(
             relation_tuples(&result.type_relations),
-            vec![("A", 1, "B", "extends"), ("A", 1, "C", "extends")]
+            vec![
+                ("A", Some(1), "B", "extends"),
+                ("A", Some(1), "C", "extends"),
+            ]
         );
     }
 
@@ -519,7 +525,7 @@ impl S {
         let result = parser.parse(source).unwrap();
         assert_eq!(
             relation_tuples(&result.type_relations),
-            vec![("Foo", 1, "From<u8>", "implements")]
+            vec![("Foo", Some(1), "From<u8>", "implements")]
         );
     }
 
@@ -530,17 +536,22 @@ impl S {
         let result = parser.parse(source).unwrap();
         assert_eq!(
             relation_tuples(&result.type_relations),
-            vec![("Vec", 1, "Trait", "implements")]
+            vec![("Vec", Some(1), "Trait", "implements")]
         );
     }
 
     #[test]
-    fn test_impl_for_undeclared_type_is_skipped() {
-        // `Unknown` has no local declaration to join `sub_name`/`sub_line`
-        // against (e.g. it's declared in another file), so the relation
-        // can't be produced.
+    fn test_impl_for_undeclared_type_has_no_local_line() {
+        // `Unknown` has no local declaration to join a `sub_line` against
+        // (e.g. it's declared in another file, or is a primitive/tuple type),
+        // so the relation is still produced but with `sub_line: None` --
+        // `index_file_definitions` resolves it by name against the whole
+        // index instead of a local (name, line) lookup.
         let parser = RustParser::new();
         let result = parser.parse("impl Trait for Unknown {}").unwrap();
-        assert!(result.type_relations.is_empty());
+        assert_eq!(
+            relation_tuples(&result.type_relations),
+            vec![("Unknown", None, "Trait", "implements")]
+        );
     }
 }

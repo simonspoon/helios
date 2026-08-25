@@ -246,10 +246,12 @@ impl LanguageParser for CSharpParser {
                 .map(|(_, n)| text_from(src, *n));
             let Some(sub_name) = sub_name else { continue };
 
+            // The C# sub is always the type this base_list is attached to, so
+            // it's always declared right here -- `sub_line` is always `Some`.
             let sub_line = captures
                 .iter()
                 .find(|(n, _)| n.ends_with("_name"))
-                .map(|(_, n)| n.start_position().row as i64 + 1)
+                .map(|(_, n)| Some(n.start_position().row as i64 + 1))
                 .unwrap();
 
             // Structs and interfaces can't extend a class; every base_list
@@ -648,7 +650,7 @@ namespace MyApp.Models {
 
     /// `ParsedTypeRelation` has no `PartialEq`, so tests compare this plain
     /// tuple projection instead.
-    fn relation_tuples(relations: &[ParsedTypeRelation]) -> Vec<(&str, i64, &str, &str)> {
+    fn relation_tuples(relations: &[ParsedTypeRelation]) -> Vec<(&str, Option<i64>, &str, &str)> {
         relations
             .iter()
             .map(|r| {
@@ -671,8 +673,8 @@ namespace MyApp.Models {
         assert_eq!(
             relation_tuples(&result.type_relations),
             vec![
-                ("Circle", 1, "ShapeBase", "extends"),
-                ("Circle", 1, "IShape", "implements")
+                ("Circle", Some(1), "ShapeBase", "extends"),
+                ("Circle", Some(1), "IShape", "implements")
             ]
         );
     }
@@ -684,8 +686,8 @@ namespace MyApp.Models {
         assert_eq!(
             relation_tuples(&result.type_relations),
             vec![
-                ("IA", 1, "IB", "implements"),
-                ("IA", 1, "IC", "implements")
+                ("IA", Some(1), "IB", "implements"),
+                ("IA", Some(1), "IC", "implements")
             ]
         );
     }
@@ -696,7 +698,7 @@ namespace MyApp.Models {
         let result = parser.parse("struct S : IFoo { }").unwrap();
         assert_eq!(
             relation_tuples(&result.type_relations),
-            vec![("S", 1, "IFoo", "implements")]
+            vec![("S", Some(1), "IFoo", "implements")]
         );
     }
 
@@ -709,8 +711,8 @@ namespace MyApp.Models {
         assert_eq!(
             relation_tuples(&result.type_relations),
             vec![
-                ("R", 1, "BaseRecord", "extends"),
-                ("R", 1, "IBar", "implements")
+                ("R", Some(1), "BaseRecord", "extends"),
+                ("R", Some(1), "IBar", "implements")
             ]
         );
     }
@@ -731,9 +733,9 @@ namespace MyApp.Models {
         assert_eq!(
             relation_tuples(&result.type_relations),
             vec![
-                ("Circle", 1, "ShapeBase", "extends"),
-                ("Circle", 1, "System.IDisposable", "implements"),
-                ("Circle", 1, "List<T>", "implements")
+                ("Circle", Some(1), "ShapeBase", "extends"),
+                ("Circle", Some(1), "System.IDisposable", "implements"),
+                ("Circle", Some(1), "List<T>", "implements")
             ]
         );
     }
