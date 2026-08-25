@@ -70,6 +70,27 @@ pub struct SymbolDefinition {
     pub scope: Option<String>,
 }
 
+/// One `type_relations` edge, joined with enough of the declaring symbol and
+/// file to print without a further lookup — what `deps` needs for its
+/// Supertypes/Implementors/Overrides sections.
+#[derive(Debug, Clone, serde::Serialize)]
+#[allow(dead_code)]
+pub struct TypeEdge {
+    pub sub_name: String,
+    pub sub_scope: Option<String>,
+    pub super_name: String,
+    /// "extends" | "implements" | "overrides".
+    pub kind: String,
+    /// Path of the file declaring `sub_name`.
+    pub file: String,
+    /// Language of the file declaring `sub_name`.
+    pub language: String,
+    /// `sub_name`'s declaration line.
+    pub line: i64,
+    /// True when `super_name` did not resolve to an indexed symbol.
+    pub external: bool,
+}
+
 /// Per-file metadata with aggregated symbol/import counts.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FileWithCounts {
@@ -121,6 +142,21 @@ pub struct ParsedReference {
     /// import binds a bare name only, so qualified usages are exempt from
     /// import-based attribution in `symbol_references`.
     pub qualified: bool,
+}
+
+/// Parsed type-relation data before insertion (`class C extends B`, `impl
+/// Trait for Type`, ...).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ParsedTypeRelation {
+    /// The declared type's name, matched at index time to the symbol just
+    /// inserted for this file.
+    pub sub_name: String,
+    /// Declaration line, to disambiguate same-named symbols in one file.
+    pub sub_line: i64,
+    pub super_name: String,
+    /// "extends" | "implements".
+    pub kind: String,
 }
 
 impl Database {
@@ -194,6 +230,21 @@ impl Database {
                 value TEXT NOT NULL
             );
 
+            -- sub extends/implements super. super_symbol_id is NULL when the
+            -- supertype resolves to nothing indexed (an external base type) —
+            -- the row still exists, with super_name carrying the raw source
+            -- text, so external supertypes are not silently dropped. A new
+            -- table rather than a column, so it needs no migrate() ALTER: the
+            -- CREATE TABLE/INDEX IF NOT EXISTS below already covers old DBs.
+            CREATE TABLE IF NOT EXISTS type_relations (
+                id INTEGER PRIMARY KEY,
+                sub_symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+                super_symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
+                super_name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
             CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
             CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
@@ -202,7 +253,11 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_import_names_name ON import_names(name);
             CREATE INDEX IF NOT EXISTS idx_refs_symbol ON references_(symbol_id);
             CREATE INDEX IF NOT EXISTS idx_refs_file ON references_(file_id);
-            CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);",
+            CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
+            CREATE INDEX IF NOT EXISTS idx_type_rel_sub ON type_relations(sub_symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_type_rel_super ON type_relations(super_symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_type_rel_super_name ON type_relations(super_name);
+            CREATE INDEX IF NOT EXISTS idx_type_rel_file ON type_relations(file_id);",
         )?;
         Ok(())
     }
@@ -877,6 +932,194 @@ impl Database {
         Ok(())
     }
 
+    // --- Type-relation operations ---
+
+    #[allow(dead_code)]
+    pub fn insert_type_relation(
+        &self,
+        sub_symbol_id: i64,
+        super_symbol_id: Option<i64>,
+        super_name: &str,
+        kind: &str,
+        file_id: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO type_relations (sub_symbol_id, super_symbol_id, super_name, kind, file_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![sub_symbol_id, super_symbol_id, super_name, kind, file_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_type_relations_for_file(&self, file_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM type_relations WHERE file_id = ?1",
+            params![file_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete every type relation whose *declaring* file has the given
+    /// language. Mirrors `delete_references_from_language`: used by the
+    /// semantic ingest, where the sidecar output is the entire `.cs` relation
+    /// set and stale rows on hash-unchanged files must still be cleared.
+    #[allow(dead_code)]
+    pub fn delete_type_relations_from_language(&self, language: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM type_relations WHERE file_id IN (SELECT id FROM files WHERE language = ?1)",
+            params![language],
+        )?;
+        Ok(())
+    }
+
+    /// What the given symbols extend/implement.
+    #[allow(dead_code)]
+    pub fn supertypes_of(&self, symbol_ids: &[i64]) -> Result<Vec<TypeEdge>> {
+        if symbol_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT s.name, s.scope, tr.super_name, tr.kind, f.path, f.language, s.line,
+                    tr.super_symbol_id IS NULL AS external
+             FROM type_relations tr
+             JOIN symbols s ON s.id = tr.sub_symbol_id
+             JOIN files f ON f.id = tr.file_id
+             WHERE tr.sub_symbol_id IN ({})
+             ORDER BY f.path, s.line",
+            placeholders(symbol_ids.len())
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(symbol_ids), |row| {
+            Ok(TypeEdge {
+                sub_name: row.get(0)?,
+                sub_scope: row.get(1)?,
+                super_name: row.get(2)?,
+                kind: row.get(3)?,
+                file: row.get(4)?,
+                language: row.get(5)?,
+                line: row.get(6)?,
+                external: row.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("querying supertypes")
+    }
+
+    /// What extends/implements the given symbols. A row also matches by
+    /// `name` when its supertype never resolved (`super_symbol_id IS NULL`),
+    /// so an external base class recorded only as raw text is still findable
+    /// by name — mirrors the `super_name` matching in `symbol_references`.
+    /// `symbol_ids` may legitimately be empty (an unresolved target still has
+    /// a name to search by), so unlike `supertypes_of` this does not
+    /// short-circuit on that.
+    #[allow(dead_code)]
+    pub fn implementors_of(&self, symbol_ids: &[i64], name: &str) -> Result<Vec<TypeEdge>> {
+        let id_clause = if symbol_ids.is_empty() {
+            "0".to_string()
+        } else {
+            format!("tr.super_symbol_id IN ({})", placeholders(symbol_ids.len()))
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT DISTINCT s.name, s.scope, tr.super_name, tr.kind, f.path, f.language, s.line,
+                    tr.super_symbol_id IS NULL AS external
+             FROM type_relations tr
+             JOIN symbols s ON s.id = tr.sub_symbol_id
+             JOIN files f ON f.id = tr.file_id
+             WHERE {id_clause}
+                OR (tr.super_symbol_id IS NULL
+                    AND (tr.super_name = ?{n} OR tr.super_name LIKE '%.' || ?{n}))
+             ORDER BY f.path, s.line",
+            n = symbol_ids.len() + 1
+        ))?;
+        let mut params_vec: Vec<&dyn rusqlite::types::ToSql> = symbol_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        params_vec.push(&name);
+        let rows = stmt.query_map(params_vec.as_slice(), |row| {
+            Ok(TypeEdge {
+                sub_name: row.get(0)?,
+                sub_scope: row.get(1)?,
+                super_name: row.get(2)?,
+                kind: row.get(3)?,
+                file: row.get(4)?,
+                language: row.get(5)?,
+                line: row.get(6)?,
+                external: row.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("querying implementors")
+    }
+
+    /// Members named `name` whose scope is a subtype (one level) of `scope`,
+    /// per `type_relations`. Derived, not stored: overriding is implied by
+    /// same-name-in-a-subtype, so there is no second edge kind to maintain.
+    #[allow(dead_code)]
+    pub fn overrides_of(&self, name: &str, scope: &str) -> Result<Vec<TypeEdge>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.name, s.scope, f.path, f.language, s.line
+             FROM symbols s
+             JOIN files f ON f.id = s.file_id
+             WHERE s.name = ?1
+               AND s.scope IN (
+                   SELECT sub.name FROM symbols sub
+                   JOIN type_relations tr ON tr.sub_symbol_id = sub.id
+                   WHERE tr.super_name = ?2 OR tr.super_name LIKE '%.' || ?2
+               )
+             ORDER BY f.path, s.line",
+        )?;
+        let rows = stmt.query_map(params![name, scope], |row| {
+            Ok(TypeEdge {
+                sub_name: row.get(0)?,
+                sub_scope: row.get(1)?,
+                super_name: scope.to_string(),
+                kind: "overrides".to_string(),
+                file: row.get(2)?,
+                language: row.get(3)?,
+                line: row.get(4)?,
+                external: false,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("querying overrides")
+    }
+
+    /// `(type_relations.id, super_name)` for every row still unresolved
+    /// (`super_symbol_id IS NULL`) — the file declaring the supertype may not
+    /// have been indexed yet when its subtype was. Mirrors
+    /// `all_imports_with_source`: resolution is a whole-index second pass, run
+    /// after every file is in, so a forward reference resolves once the type
+    /// it names shows up anywhere in the repo.
+    #[allow(dead_code)]
+    pub fn unresolved_type_relations(&self) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, super_name FROM type_relations WHERE super_symbol_id IS NULL")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("listing unresolved type relations")
+    }
+
+    /// Write `(relation id, resolved symbol id)` pairs in one transaction, as
+    /// `apply_import_resolutions` does for imports. Unlike that method's
+    /// `Option<i64>`, a plain `i64` is right here: an unresolved relation is
+    /// simply absent from `updates` and its `super_symbol_id` stays NULL —
+    /// there is no resolved-to-then-un-resolved case to express.
+    #[allow(dead_code)]
+    pub fn apply_type_relation_resolutions(&self, updates: &[(i64, i64)]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt =
+                tx.prepare("UPDATE type_relations SET super_symbol_id = ?1 WHERE id = ?2")?;
+            for (relation_id, symbol_id) in updates {
+                stmt.execute(params![symbol_id, relation_id])?;
+            }
+        }
+        tx.commit().context("writing type relation resolutions")
+    }
+
     /// Stamp a sidecar DocId onto the symbol row(s) `index_file` inserted for
     /// this `(file_id, line, name)` (P3-M3). Returns the number of rows
     /// updated; 0 means no match (e.g. a symbol kind the tree-sitter path does
@@ -940,6 +1183,23 @@ impl Database {
 
     // --- Metadata operations ---
 
+    /// `metadata` key holding the index-format version an on-disk index was
+    /// built with. Bumped whenever a change to what indexing populates (a new
+    /// table, a new pass over already-parsed files) needs every file
+    /// re-parsed to take effect — the content-hash short-circuit in
+    /// `index_file_definitions` has no way to know that on its own, since the
+    /// file's *content* didn't change, only what helios extracts from it.
+    /// Absent (pre-versioning index) or lower than `CURRENT_INDEX_FORMAT_VERSION`
+    /// means a full re-parse is owed; see `indexer::index_full`.
+    pub const INDEX_FORMAT_VERSION_KEY: &str = "index_format_version";
+
+    /// Bump this when adding a table or pass that a full re-index must
+    /// populate for every file, not just ones whose content changed.
+    /// Current: 2 — introduced to backfill `type_relations`, which the
+    /// content-hash cache was silently leaving empty on an unchanged file for
+    /// anyone upgrading into an existing index.
+    pub const CURRENT_INDEX_FORMAT_VERSION: &str = "2";
+
     pub fn set_metadata(&self, key: &str, value: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO metadata (key, value) VALUES (?1, ?2)
@@ -963,6 +1223,7 @@ impl Database {
     // --- Cleanup for re-indexing a file ---
 
     pub fn clear_file_data(&self, file_id: i64) -> Result<()> {
+        self.delete_type_relations_for_file(file_id)?;
         self.delete_references_for_file(file_id)?;
         self.delete_symbols_for_file(file_id)?;
         self.delete_imports_for_file(file_id)?;

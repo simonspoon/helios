@@ -2,7 +2,7 @@ use std::collections::{HashSet, VecDeque};
 
 use anyhow::{Context, Result};
 
-use crate::db::{Database, SymbolDefinition};
+use crate::db::{Database, SymbolDefinition, TypeEdge};
 use crate::errors::NoIndexError;
 use crate::parsers::detect_language;
 
@@ -144,6 +144,37 @@ pub fn run(
     };
     let symbol_ids: Vec<i64> = defs.iter().map(|d| d.id).collect();
 
+    // Type edges (supertypes/implementors/overrides) — symbol mode only, a
+    // file target has no type relations of its own. Gathered once and shared
+    // between the human and `--json` branches below.
+    let (supertypes, implementors, overrides, edge_languages) = if is_file {
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+    } else {
+        let target_name = symbol.as_ref().map(|t| t.name.as_str()).unwrap_or(target);
+        let supertypes = db.supertypes_of(&symbol_ids)?;
+        let implementors = db.implementors_of(&symbol_ids, target_name)?;
+        // Overrides only make sense for a member (a definition with a scope)
+        // — a bare type has nothing to override. Query once per distinct
+        // scope among the resolved definitions, since an ambiguous name can
+        // resolve to definitions in more than one scope.
+        let scopes: HashSet<&str> = defs.iter().filter_map(|d| d.scope.as_deref()).collect();
+        let mut overrides = Vec::new();
+        for scope in scopes {
+            overrides.extend(db.overrides_of(target_name, scope)?);
+        }
+        // Provenance: which languages' files actually contributed an edge to
+        // THIS answer, so a partial-coverage answer never reads as complete.
+        let mut edge_languages: Vec<String> = supertypes
+            .iter()
+            .chain(&implementors)
+            .chain(&overrides)
+            .map(|e| e.language.clone())
+            .collect();
+        edge_languages.sort();
+        edge_languages.dedup();
+        (supertypes, implementors, overrides, edge_languages)
+    };
+
     if json {
         if is_file {
             let deps_result =
@@ -194,6 +225,10 @@ pub fn run(
             let output = serde_json::json!({
                 "target": target,
                 "definitions": defs,
+                "supertypes": supertypes,
+                "implementors": implementors,
+                "overrides": overrides,
+                "edge_languages": edge_languages,
                 "dependencies": deps,
                 "dependents": refs.iter()
                     .map(|(path, line, col, container)| {
@@ -250,6 +285,27 @@ pub fn run(
                 }
             }
 
+            if !supertypes.is_empty() {
+                println!("Supertypes (what {} extends/implements):", target);
+                for edge in &supertypes {
+                    println!("  {}", format_type_edge(edge));
+                }
+            }
+
+            if !implementors.is_empty() {
+                println!("Implementors (what extends/implements {}):", target);
+                for edge in &implementors {
+                    println!("  {}", format_type_edge(edge));
+                }
+            }
+
+            if !overrides.is_empty() {
+                println!("Overrides (what overrides {}):", target);
+                for edge in &overrides {
+                    println!("  {}", format_override_edge(edge));
+                }
+            }
+
             if !deps.is_empty() {
                 println!("Dependencies (imports in files defining {}):", target);
                 for dep in &deps {
@@ -270,11 +326,63 @@ pub fn run(
                 }
             }
 
-            if deps.is_empty() && refs.is_empty() {
+            if deps.is_empty()
+                && refs.is_empty()
+                && supertypes.is_empty()
+                && implementors.is_empty()
+                && overrides.is_empty()
+            {
                 println!("No dependencies found for {}", target);
+            }
+
+            // Ends the answer, not just this section — a reader who sees only
+            // "csharp" here knows a same-named Python edge could exist but was
+            // not part of what was actually returned (see the raw-name
+            // fallback in `implementors_of`).
+            if !edge_languages.is_empty() {
+                println!("Type edges from: {}", edge_languages.join(", "));
             }
         }
     }
 
     Ok(())
+}
+
+/// One `Supertypes`/`Implementors` line: `<file>:<line> <sub> -> <super>
+/// (<kind>[, external])`. The leading `file:line` matches the convention
+/// every other `deps` section already uses (Definitions' `path:line`,
+/// References' `path:line:col`) — it names the symbol's declaring location,
+/// not merely its name, and it is the load-bearing half of the mitigation for
+/// `implementors_of`'s raw-name fallback: that query has no language or file
+/// scoping, so an `external` hit can come from a same-named type in a wholly
+/// different language. Printing the declaring file on every row (together
+/// with the `Type edges from:` provenance line) is what lets a reader notice.
+fn format_type_edge(edge: &TypeEdge) -> String {
+    if edge.external {
+        format!(
+            "{}:{} {} -> {} ({}, external)",
+            edge.file, edge.line, edge.sub_name, edge.super_name, edge.kind
+        )
+    } else {
+        format!(
+            "{}:{} {} -> {} ({})",
+            edge.file, edge.line, edge.sub_name, edge.super_name, edge.kind
+        )
+    }
+}
+
+/// One `Overrides` line: the overriding member's own file:line, scope and
+/// name, against the base scope it overrides — `overrides_of` always returns
+/// kind "overrides", so unlike `format_type_edge` there is no external case.
+fn format_override_edge(edge: &TypeEdge) -> String {
+    match &edge.sub_scope {
+        Some(scope) => format!(
+            "{}:{} {}.{} overrides {}.{}",
+            edge.file, edge.line, scope, edge.sub_name, edge.super_name, edge.sub_name
+        ),
+        None => format!(
+            "{}:{} {} overrides {}.{}",
+            edge.file, edge.line, edge.sub_name, edge.super_name, edge.sub_name
+        ),
+    }
 }

@@ -38,6 +38,7 @@ const PING_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct AnalyzeOutput {
     pub definitions: Vec<Definition>,
     pub references: Vec<Reference>,
+    pub relations: Vec<Relation>,
 }
 
 /// A `definition` record. Only the fields the semantic ingest needs are kept;
@@ -65,6 +66,18 @@ pub struct Reference {
     /// `Option<T>` deserializes to `None` per the forward-compat rule, so an
     /// old helper against a new helios still parses.
     pub container_docid: Option<String>,
+}
+
+/// A `relation` record: one declared supertype edge (`extends` or `implements`).
+#[derive(Debug, Deserialize)]
+pub struct Relation {
+    pub sub_docid: String,
+    /// DocumentationCommentId of the supertype, or `None` when it is metadata
+    /// helios never indexed — the row is still emitted, keyed on `super_name`.
+    pub super_docid: Option<String>,
+    pub super_name: String,
+    pub kind: String,
+    pub file: String,
 }
 
 /// A detected, ping-verified helper. Constructed only by `detect()`.
@@ -335,6 +348,12 @@ fn parse_analyze(stdout: &str) -> Result<(AnalyzeOutput, Vec<String>)> {
             Some("reference") => output
                 .references
                 .push(serde_json::from_value(value).context("malformed reference record")?),
+            // A new helios against an OLD helper binary that never emits this
+            // type simply sees an empty `relations` Vec — the same unknown-type
+            // skip below that already makes an old helper forward-compatible.
+            Some("relation") => output
+                .relations
+                .push(serde_json::from_value(value).context("malformed relation record")?),
             Some("warning") => {
                 if let Some(message) = value.get("message").and_then(|m| m.as_str()) {
                     warnings.push(message.to_string());
@@ -555,6 +574,24 @@ mod tests {
         assert_eq!(output.references.len(), 1);
         assert!(!output.references[0].is_definition);
         assert_eq!(warnings, vec!["could not load obj/Gen.cs".to_string()]);
+    }
+
+    #[test]
+    fn parse_analyze_reads_relation_record() {
+        let stdout = concat!(
+            "{\"type\":\"relation\",\"sub_docid\":\"T:App.Foo\",\"super_docid\":\"T:App.IBar\",\"super_name\":\"App.IBar\",\"kind\":\"implements\",\"file\":\"Foo.cs\"}\n",
+            "{\"type\":\"relation\",\"sub_docid\":\"T:App.ShapeError\",\"super_docid\":null,\"super_name\":\"System.Exception\",\"kind\":\"extends\",\"file\":\"Shapes.cs\"}\n",
+        );
+        let (output, _warnings) = parse_analyze(stdout).expect("parse");
+        assert_eq!(output.relations.len(), 2);
+        assert_eq!(output.relations[0].sub_docid, "T:App.Foo");
+        assert_eq!(
+            output.relations[0].super_docid.as_deref(),
+            Some("T:App.IBar")
+        );
+        assert_eq!(output.relations[0].kind, "implements");
+        assert!(output.relations[1].super_docid.is_none());
+        assert_eq!(output.relations[1].super_name, "System.Exception");
     }
 
     /// An old-format `reference` record with no `container_docid` key at all —

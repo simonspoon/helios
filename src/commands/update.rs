@@ -25,6 +25,7 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
         // `update` keeps the tree-sitter path for `.cs` (W1) — syntactic.
         let stats = indexer::index_full(&db, &cwd, None)?;
         indexer::resolve_imports(&db)?;
+        indexer::resolve_type_relations(&db)?;
         let elapsed = start.elapsed();
 
         warn_semantic_stale(&db, &stats)?;
@@ -45,6 +46,7 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
             // `update` keeps the tree-sitter path for `.cs` (W1) — syntactic.
             let stats = indexer::index_full(&db, &cwd, None)?;
             indexer::resolve_imports(&db)?;
+            indexer::resolve_type_relations(&db)?;
             let elapsed = start.elapsed();
 
             if let Some(commit) = git::head_commit()? {
@@ -89,6 +91,7 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
     // Re-resolved over the whole index: an added or deleted file changes which
     // specifiers in untouched files resolve.
     indexer::resolve_imports(&db)?;
+    indexer::resolve_type_relations(&db)?;
     let elapsed = start.elapsed();
 
     // Update stored commit
@@ -96,8 +99,26 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
         db.set_metadata("last_indexed_commit", &commit)?;
     }
 
+    warn_index_stale(&db)?;
     warn_semantic_stale(&db, &stats)?;
     print_stats(&stats, elapsed, json, compact, quiet)?;
+    Ok(())
+}
+
+/// `update` is hash/git-driven by design (see module doc below) and must
+/// stay that way — it never re-parses a file whose content hasn't changed,
+/// even when the on-disk index predates the current `INDEX_FORMAT_VERSION`.
+/// Only `helios init`'s full index can catch such a file up. So when the
+/// stamp is missing or stale, warn rather than silently leaving whatever the
+/// old format left out (e.g. empty `type_relations`) looking complete.
+fn warn_index_stale(db: &Database) -> Result<()> {
+    if db.get_metadata(Database::INDEX_FORMAT_VERSION_KEY)?.as_deref()
+        != Some(Database::CURRENT_INDEX_FORMAT_VERSION)
+    {
+        eprintln!(
+            "warning: this index predates the current index format; some data (e.g. type relations) may be missing for unchanged files — run 'helios init' to rebuild it"
+        );
+    }
     Ok(())
 }
 
@@ -109,12 +130,18 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
 /// tree-sitter resolution (changed `.xaml` files to no bindings at all, having
 /// no parser) and semantic references into their symbols are cascade-deleted —
 /// one warning tells the user `helios init` refreshes them.
+///
+/// Type relations degrade the same way: the tree-sitter C# parser cannot tell a
+/// base class from an interface in a `base_list`, so a re-indexed `.cs` file's
+/// edges come back with the first-entry-is-`extends` approximation rather than
+/// Roslyn's accurate kinds. The edge itself survives — only its kind may be
+/// wrong — so the warning names them alongside references.
 fn warn_semantic_stale(db: &Database, stats: &indexer::IndexStats) -> Result<()> {
     if stats.semantic_changed > 0
         && db.get_metadata("csharp_resolver")?.as_deref() == Some("roslyn")
     {
         eprintln!(
-            "warning: {} C#/XAML file(s) changed since the semantic (Roslyn) index was built; their references no longer use Roslyn resolution — run 'helios init' to refresh",
+            "warning: {} C#/XAML file(s) changed since the semantic (Roslyn) index was built; their references and type edges no longer use Roslyn resolution — run 'helios init' to refresh",
             stats.semantic_changed
         );
     }

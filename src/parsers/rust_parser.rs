@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
 use super::{LanguageParser, ParseResult, is_function_local};
-use crate::db::{ParsedImport, ParsedReference, ParsedSymbol};
+use crate::db::{ParsedImport, ParsedReference, ParsedSymbol, ParsedTypeRelation};
 
 /// Node kinds whose body holds function-local declarations.
 const CALLABLE_KINDS: &[&str] = &["function_item", "closure_expression"];
@@ -82,6 +82,18 @@ fn text_from(source: &[u8], node: tree_sitter::Node) -> String {
         .to_string()
 }
 
+/// The base identifier of an impl's Self type: `Foo` as-is, or `Vec` out of
+/// a generic `Vec<T>` -- the bare name a `ParsedSymbol` was recorded under.
+fn base_type_name(source: &[u8], node: tree_sitter::Node) -> String {
+    match node.kind() {
+        "generic_type" => node
+            .child_by_field_name("type")
+            .map(|n| text_from(source, n))
+            .unwrap_or_else(|| text_from(source, node)),
+        _ => text_from(source, node),
+    }
+}
+
 impl LanguageParser for RustParser {
     fn parse(&self, source: &str) -> Result<ParseResult> {
         let mut parser = Parser::new();
@@ -155,6 +167,93 @@ impl LanguageParser for RustParser {
                     visibility,
                     scope,
                 });
+            }
+        }
+
+        // --- Type relations (impl Trait for Type / trait supertraits) ---
+        //
+        // `impl_item` has an optional `trait` field: present only for `impl
+        // Trait for Type` (an inherent `impl Type { .. }` has no `trait`
+        // field, so the query below simply doesn't match it -- the required
+        // zero rows). Its `type` field is the impl's Self type: a bare
+        // `type_identifier` for `impl Trait for Foo`, or a `generic_type`
+        // for `impl Trait for Vec<T>`, whose own `type` field holds the
+        // base identifier "Vec". That base identifier, not the raw
+        // `Vec<T>` text, is what has to match a `ParsedSymbol` name for
+        // `index_file_definitions` to join this relation to its symbol.
+        //
+        // `sub_line` can't be the impl block's own line, since `Type` isn't
+        // declared there, only used. It has to be the line of `Type`'s own
+        // struct/enum/type declaration -- if that's in this file, it's
+        // already sitting in `result.symbols`. An impl whose Self type is
+        // declared elsewhere (a different file, a primitive, a tuple, ...)
+        // has no local declaration to join against and is skipped, same as
+        // any other relation whose sub never resolves (see
+        // `index_file_definitions`).
+        //
+        // `trait A: B + C {}` is simpler: the trait's own name is both the
+        // declaration and the sub, so `sub_line` is just that node's line.
+        let type_rel_query = Query::new(
+            &self.language,
+            r#"
+            (impl_item trait: (_) @impl_trait type: (_) @impl_type) @impl_def
+            (trait_item name: (type_identifier) @trait_name bounds: (trait_bounds) @trait_bounds) @trait_def
+            "#,
+        )
+        .context("compiling Rust type relation query")?;
+
+        let type_decl_lines: std::collections::HashMap<&str, i64> = result
+            .symbols
+            .iter()
+            .filter(|s| matches!(s.kind.as_str(), "struct" | "enum" | "type"))
+            .map(|s| (s.name.as_str(), s.line))
+            .collect();
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&type_rel_query, root, src);
+
+        while let Some(m) = matches.next() {
+            let captures: Vec<_> = m
+                .captures
+                .iter()
+                .map(|c| (type_rel_query.capture_names()[c.index as usize], c.node))
+                .collect();
+
+            if let Some(&(_, trait_node)) = captures.iter().find(|(n, _)| *n == "impl_trait") {
+                let Some(&(_, type_node)) = captures.iter().find(|(n, _)| *n == "impl_type")
+                else {
+                    continue;
+                };
+                let sub_name = base_type_name(src, type_node);
+                let Some(&sub_line) = type_decl_lines.get(sub_name.as_str()) else {
+                    continue;
+                };
+                result.type_relations.push(ParsedTypeRelation {
+                    sub_name,
+                    sub_line,
+                    super_name: text_from(src, trait_node),
+                    kind: "implements".to_string(),
+                });
+            } else if let Some(&(_, name_node)) = captures.iter().find(|(n, _)| *n == "trait_name")
+            {
+                let Some(&(_, bounds_node)) = captures.iter().find(|(n, _)| *n == "trait_bounds")
+                else {
+                    continue;
+                };
+                let sub_name = text_from(src, name_node);
+                let sub_line = name_node.start_position().row as i64 + 1;
+                let mut bcursor = bounds_node.walk();
+                for bound in bounds_node.named_children(&mut bcursor) {
+                    if bound.kind() == "lifetime" {
+                        continue;
+                    }
+                    result.type_relations.push(ParsedTypeRelation {
+                        sub_name: sub_name.clone(),
+                        sub_line,
+                        super_name: text_from(src, bound),
+                        kind: "extends".to_string(),
+                    });
+                }
             }
         }
 
@@ -366,5 +465,82 @@ impl S {
         for local in ["INNER", "LOCAL_STATIC", "helper"] {
             assert!(!names.contains(&local), "{local} is a function local");
         }
+    }
+
+    /// `ParsedTypeRelation` has no `PartialEq`, so tests compare this plain
+    /// tuple projection instead.
+    fn relation_tuples(relations: &[ParsedTypeRelation]) -> Vec<(&str, i64, &str, &str)> {
+        relations
+            .iter()
+            .map(|r| {
+                (
+                    r.sub_name.as_str(),
+                    r.sub_line,
+                    r.super_name.as_str(),
+                    r.kind.as_str(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_impl_trait_for_type() {
+        let parser = RustParser::new();
+        let source = "struct Foo;\nimpl fmt::Display for Foo {}\n";
+        let result = parser.parse(source).unwrap();
+        assert_eq!(
+            relation_tuples(&result.type_relations),
+            vec![("Foo", 1, "fmt::Display", "implements")]
+        );
+    }
+
+    #[test]
+    fn test_inherent_impl_has_no_relations() {
+        let parser = RustParser::new();
+        let source = "struct Foo;\nimpl Foo {\n    fn method(&self) {}\n}\n";
+        let result = parser.parse(source).unwrap();
+        assert!(result.type_relations.is_empty());
+    }
+
+    #[test]
+    fn test_trait_supertraits() {
+        let parser = RustParser::new();
+        let result = parser.parse("trait A: B + C {}").unwrap();
+        assert_eq!(
+            relation_tuples(&result.type_relations),
+            vec![("A", 1, "B", "extends"), ("A", 1, "C", "extends")]
+        );
+    }
+
+    #[test]
+    fn test_generic_supertype_keeps_raw_text() {
+        let parser = RustParser::new();
+        let source = "struct Foo;\nimpl From<u8> for Foo {}\n";
+        let result = parser.parse(source).unwrap();
+        assert_eq!(
+            relation_tuples(&result.type_relations),
+            vec![("Foo", 1, "From<u8>", "implements")]
+        );
+    }
+
+    #[test]
+    fn test_generic_self_type_uses_base_identifier() {
+        let parser = RustParser::new();
+        let source = "struct Vec<T> {\n    item: T,\n}\nimpl Trait for Vec<T> {}\n";
+        let result = parser.parse(source).unwrap();
+        assert_eq!(
+            relation_tuples(&result.type_relations),
+            vec![("Vec", 1, "Trait", "implements")]
+        );
+    }
+
+    #[test]
+    fn test_impl_for_undeclared_type_is_skipped() {
+        // `Unknown` has no local declaration to join `sub_name`/`sub_line`
+        // against (e.g. it's declared in another file), so the relation
+        // can't be produced.
+        let parser = RustParser::new();
+        let result = parser.parse("impl Trait for Unknown {}").unwrap();
+        assert!(result.type_relations.is_empty());
     }
 }

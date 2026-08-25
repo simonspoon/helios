@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
 use super::{LanguageParser, ParseResult, is_function_local};
-use crate::db::{ParsedImport, ParsedReference, ParsedSymbol};
+use crate::db::{ParsedImport, ParsedReference, ParsedSymbol, ParsedTypeRelation};
 
 /// Node kinds whose body holds function-local definitions.
 const CALLABLE_KINDS: &[&str] = &["function_definition", "lambda"];
@@ -124,6 +124,67 @@ impl LanguageParser for PythonParser {
                     end_line: def_node.end_position().row as i64 + 1,
                     visibility: visibility.to_string(),
                     scope,
+                });
+            }
+        }
+
+        // --- Type relations (base classes) ---
+        //
+        // A class's bases live in an optional `superclasses` field holding
+        // an `argument_list`. The field is absent entirely for `class C:`
+        // (no parens), so the query below simply doesn't match it. `class
+        // C():` does have the field, just with an empty `argument_list`, so
+        // it matches but contributes no relations. Either way that's the
+        // required zero rows.
+        //
+        // `argument_list` mixes positional bases with keyword arguments
+        // (`metaclass=Meta`) with no way to ask the query for "positional
+        // only", so keyword_argument children are filtered out by hand.
+        let type_rel_query = Query::new(
+            &self.language,
+            r#"
+            (class_definition name: (identifier) @class_name superclasses: (argument_list) @bases) @class_def
+            "#,
+        )
+        .context("compiling Python type relation query")?;
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&type_rel_query, root, src);
+
+        while let Some(m) = matches.next() {
+            let captures: Vec<_> = m
+                .captures
+                .iter()
+                .map(|c| (type_rel_query.capture_names()[c.index as usize], c.node))
+                .collect();
+
+            let Some(&(_, def_node)) = captures.iter().find(|(n, _)| *n == "class_def") else {
+                continue;
+            };
+            if is_function_local(def_node, CALLABLE_KINDS) {
+                continue;
+            }
+
+            let Some(&(_, name_node)) = captures.iter().find(|(n, _)| *n == "class_name") else {
+                continue;
+            };
+            let Some(&(_, bases_node)) = captures.iter().find(|(n, _)| *n == "bases") else {
+                continue;
+            };
+
+            let sub_name = text_from(src, name_node);
+            let sub_line = name_node.start_position().row as i64 + 1;
+
+            let mut bcursor = bases_node.walk();
+            for base in bases_node.named_children(&mut bcursor) {
+                if base.kind() == "keyword_argument" {
+                    continue;
+                }
+                result.type_relations.push(ParsedTypeRelation {
+                    sub_name: sub_name.clone(),
+                    sub_line,
+                    super_name: text_from(src, base),
+                    kind: "extends".to_string(),
                 });
             }
         }
@@ -364,5 +425,72 @@ class Service:
         assert!(names.contains(&"method"));
         assert!(!names.contains(&"inner"));
         assert!(!names.contains(&"Local"));
+    }
+
+    /// `ParsedTypeRelation` has no `PartialEq`, so tests compare this plain
+    /// tuple projection instead.
+    fn relation_tuples(relations: &[ParsedTypeRelation]) -> Vec<(&str, i64, &str, &str)> {
+        relations
+            .iter()
+            .map(|r| {
+                (
+                    r.sub_name.as_str(),
+                    r.sub_line,
+                    r.super_name.as_str(),
+                    r.kind.as_str(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_class_extends_multiple_bases() {
+        let parser = PythonParser::new();
+        let result = parser.parse("class C(Base, Mixin):\n    pass\n").unwrap();
+        assert_eq!(
+            relation_tuples(&result.type_relations),
+            vec![("C", 1, "Base", "extends"), ("C", 1, "Mixin", "extends")]
+        );
+    }
+
+    #[test]
+    fn test_class_with_no_bases_has_no_relations() {
+        let parser = PythonParser::new();
+        let result = parser.parse("class C:\n    pass\n").unwrap();
+        assert!(result.type_relations.is_empty());
+    }
+
+    #[test]
+    fn test_class_with_empty_parens_has_no_relations() {
+        let parser = PythonParser::new();
+        let result = parser.parse("class C():\n    pass\n").unwrap();
+        assert!(result.type_relations.is_empty());
+    }
+
+    #[test]
+    fn test_keyword_argument_is_not_a_base_class() {
+        let parser = PythonParser::new();
+        let result = parser
+            .parse("class C(Base, metaclass=Meta):\n    pass\n")
+            .unwrap();
+        assert_eq!(
+            relation_tuples(&result.type_relations),
+            vec![("C", 1, "Base", "extends")]
+        );
+    }
+
+    #[test]
+    fn test_qualified_and_generic_bases_keep_raw_text() {
+        let parser = PythonParser::new();
+        let result = parser
+            .parse("class C(abc.ABC, Generic[T]):\n    pass\n")
+            .unwrap();
+        assert_eq!(
+            relation_tuples(&result.type_relations),
+            vec![
+                ("C", 1, "abc.ABC", "extends"),
+                ("C", 1, "Generic[T]", "extends")
+            ]
+        );
     }
 }

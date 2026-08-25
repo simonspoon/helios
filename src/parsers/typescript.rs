@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
 use super::{LanguageParser, ParseResult, is_function_local};
-use crate::db::{ParsedImport, ParsedReference, ParsedSymbol};
+use crate::db::{ParsedImport, ParsedReference, ParsedSymbol, ParsedTypeRelation};
 
 /// Node kinds whose body holds function-local declarations.
 const CALLABLE_KINDS: &[&str] = &[
@@ -216,6 +216,124 @@ impl LanguageParser for TypeScriptParser {
                     visibility: visibility.to_string(),
                     scope,
                 });
+            }
+        }
+
+        // --- Type relations (extends/implements) ---
+        //
+        // `class_heritage` bundles an optional `extends_clause` (single
+        // supertype, field `value`) and an optional `implements_clause`
+        // (one or more supertypes as plain named children — the grammar
+        // gives `implements` no field name to hang them off). Interface
+        // heritage is a different shape again: `extends_type_clause` holds
+        // its supertypes as repeated `type` fields, which tree-sitter's API
+        // only lets us read back as named children, same as `implements`.
+        // JS has `class_heritage`/`extends_clause` but no `implements` or
+        // interfaces, so the query below only asks for `implements_clause`
+        // and `interface_declaration` in the TypeScript grammar.
+        let type_rel_query_str = if self.is_typescript {
+            r#"
+            (class_declaration name: (type_identifier) @class_name (class_heritage) @class_heritage) @class_def
+            (interface_declaration name: (type_identifier) @iface_name (extends_type_clause) @iface_extends) @iface_def
+            "#
+        } else {
+            r#"
+            (class_declaration name: (identifier) @class_name (class_heritage) @class_heritage) @class_def
+            "#
+        };
+
+        let type_rel_query = Query::new(&self.language, type_rel_query_str)
+            .context("compiling TS/JS type relation query")?;
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&type_rel_query, root, src);
+
+        while let Some(m) = matches.next() {
+            let captures: Vec<_> = m
+                .captures
+                .iter()
+                .map(|c| (type_rel_query.capture_names()[c.index as usize], c.node))
+                .collect();
+
+            let def_node = captures
+                .iter()
+                .find(|(n, _)| n.ends_with("_def"))
+                .map(|(_, n)| *n);
+            let Some(def_node) = def_node else { continue };
+            if is_function_local(def_node, CALLABLE_KINDS) {
+                continue;
+            }
+
+            let sub_name = captures
+                .iter()
+                .find(|(n, _)| n.ends_with("_name"))
+                .map(|(_, n)| text_from(src, *n));
+            let Some(sub_name) = sub_name else { continue };
+            let sub_line = captures
+                .iter()
+                .find(|(n, _)| n.ends_with("_name"))
+                .map(|(_, n)| n.start_position().row as i64 + 1)
+                .unwrap();
+
+            for &(name, node) in &captures {
+                match name {
+                    "class_heritage" => {
+                        let mut hcursor = node.walk();
+                        for clause in node.named_children(&mut hcursor) {
+                            match clause.kind() {
+                                "extends_clause" => {
+                                    if let Some(value) = clause.child_by_field_name("value") {
+                                        let super_name = std::str::from_utf8(
+                                            &src[value.start_byte()..clause.end_byte()],
+                                        )
+                                        .unwrap_or("")
+                                        .to_string();
+                                        result.type_relations.push(ParsedTypeRelation {
+                                            sub_name: sub_name.clone(),
+                                            sub_line,
+                                            super_name,
+                                            kind: "extends".to_string(),
+                                        });
+                                    }
+                                }
+                                "implements_clause" => {
+                                    let mut icursor = clause.walk();
+                                    for super_type in clause.named_children(&mut icursor) {
+                                        result.type_relations.push(ParsedTypeRelation {
+                                            sub_name: sub_name.clone(),
+                                            sub_line,
+                                            super_name: text_from(src, super_type),
+                                            kind: "implements".to_string(),
+                                        });
+                                    }
+                                }
+                                // The JavaScript grammar has no `extends_clause`
+                                // wrapper: `class_heritage` holds the supertype
+                                // expression directly (`class C extends B {}`).
+                                _ => {
+                                    result.type_relations.push(ParsedTypeRelation {
+                                        sub_name: sub_name.clone(),
+                                        sub_line,
+                                        super_name: text_from(src, clause),
+                                        kind: "extends".to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    "iface_extends" => {
+                        let mut ecursor = node.walk();
+                        for super_type in node.named_children(&mut ecursor) {
+                            result.type_relations.push(ParsedTypeRelation {
+                                sub_name: sub_name.clone(),
+                                sub_line,
+                                super_name: text_from(src, super_type),
+                                kind: "extends".to_string(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -463,5 +581,90 @@ export class Registry {
         for local in ["major", "helper", "next", "out", "yielded", "staticLocal"] {
             assert!(!names.contains(&local), "{local} is a function local");
         }
+    }
+
+    /// `ParsedTypeRelation` has no `PartialEq`, so tests compare this plain
+    /// tuple projection instead.
+    fn relation_tuples(relations: &[ParsedTypeRelation]) -> Vec<(&str, i64, &str, &str)> {
+        relations
+            .iter()
+            .map(|r| {
+                (
+                    r.sub_name.as_str(),
+                    r.sub_line,
+                    r.super_name.as_str(),
+                    r.kind.as_str(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_class_extends() {
+        let parser = TypeScriptParser::new("typescript");
+        let result = parser.parse("class C extends B {}").unwrap();
+        assert_eq!(
+            relation_tuples(&result.type_relations),
+            vec![("C", 1, "B", "extends")]
+        );
+    }
+
+    #[test]
+    fn test_class_implements_multiple() {
+        let parser = TypeScriptParser::new("typescript");
+        let result = parser.parse("class C implements I, J {}").unwrap();
+        assert_eq!(
+            relation_tuples(&result.type_relations),
+            vec![("C", 1, "I", "implements"), ("C", 1, "J", "implements")]
+        );
+    }
+
+    #[test]
+    fn test_class_extends_and_implements() {
+        let parser = TypeScriptParser::new("typescript");
+        let result = parser
+            .parse("class C extends B implements I {}")
+            .unwrap();
+        assert_eq!(
+            relation_tuples(&result.type_relations),
+            vec![("C", 1, "B", "extends"), ("C", 1, "I", "implements")]
+        );
+    }
+
+    #[test]
+    fn test_interface_extends_multiple() {
+        let parser = TypeScriptParser::new("typescript");
+        let result = parser.parse("interface I extends K, L {}").unwrap();
+        assert_eq!(
+            relation_tuples(&result.type_relations),
+            vec![("I", 1, "K", "extends"), ("I", 1, "L", "extends")]
+        );
+    }
+
+    #[test]
+    fn test_class_with_no_heritage_has_no_relations() {
+        let parser = TypeScriptParser::new("typescript");
+        let result = parser.parse("class C {}").unwrap();
+        assert!(result.type_relations.is_empty());
+    }
+
+    #[test]
+    fn test_generic_supertype_keeps_raw_text() {
+        let parser = TypeScriptParser::new("typescript");
+        let result = parser.parse("class C extends Base<T> {}").unwrap();
+        assert_eq!(
+            relation_tuples(&result.type_relations),
+            vec![("C", 1, "Base<T>", "extends")]
+        );
+    }
+
+    #[test]
+    fn test_javascript_class_extends() {
+        let parser = TypeScriptParser::new("javascript");
+        let result = parser.parse("class C extends B {}").unwrap();
+        assert_eq!(
+            relation_tuples(&result.type_relations),
+            vec![("C", 1, "B", "extends")]
+        );
     }
 }

@@ -22,7 +22,9 @@ internal static class HelperHarness
 
     public sealed record Reference(string Docid, string File, int Line, int Col, bool IsDefinition, string? ContainerDocid);
 
-    public sealed record Records(List<Definition> Definitions, List<Reference> References);
+    public sealed record Relation(string SubDocid, string? SuperDocid, string SuperName, string Kind, string File);
+
+    public sealed record Records(List<Definition> Definitions, List<Reference> References, List<Relation> Relations);
 
     /// <summary>Runs `dotnet helios-roslyn.dll &lt;args&gt;`; fails the test if it does not exit on its own (P2-M4).</summary>
     public static RunResult Run(params string[] args)
@@ -60,6 +62,7 @@ internal static class HelperHarness
 
         var definitions = new List<Definition>();
         var references = new List<Reference>();
+        var relations = new List<Relation>();
         foreach (var line in run.StdoutLines)
         {
             using var doc = JsonDocument.Parse(line); // every stdout line is one JSON object
@@ -86,9 +89,19 @@ internal static class HelperHarness
                             ? container.GetString()
                             : null));
                     break;
+                case "relation":
+                    relations.Add(new Relation(
+                        record.GetProperty("sub_docid").GetString()!,
+                        record.TryGetProperty("super_docid", out var superDocid) && superDocid.ValueKind != JsonValueKind.Null
+                            ? superDocid.GetString()
+                            : null,
+                        record.GetProperty("super_name").GetString()!,
+                        record.GetProperty("kind").GetString()!,
+                        record.GetProperty("file").GetString()!));
+                    break;
             }
         }
-        return new Records(definitions, references);
+        return new Records(definitions, references, relations);
     }
 
     /// <summary>1-based line number of the first fixture-source line containing <paramref name="marker"/>.</summary>

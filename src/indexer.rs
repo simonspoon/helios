@@ -81,6 +81,77 @@ fn resolve_semantic_container(
     }
 }
 
+/// Strip a supertype name down to the identifier `find_symbol_by_name` can
+/// look up. `super_name` (`List<T>`, `foo.Bar`, `System.Collections.IEnumerable`)
+/// is stored raw — this stripping is for the LOOKUP only. Qualification is
+/// peeled first (`foo.Bar<T>` -> `Bar<T>`) and generic arguments second
+/// (`Bar<T>` -> `Bar`), so a qualified generic reduces to its base name either
+/// way.
+fn base_type_identifier(name: &str) -> &str {
+    let unqualified = name.rsplit('.').next().unwrap_or(name);
+    unqualified.split('<').next().unwrap_or(unqualified)
+}
+
+/// Symbol kinds a supertype can legally be. `find_symbol_by_name` matches on
+/// name across every kind, so without this filter a same-named function or
+/// constant would win a supertype lookup just as validly as an actual type —
+/// silently pointing the edge at the wrong symbol, which is worse than the
+/// NULL the design deliberately prefers for a genuinely unresolved supertype.
+///
+/// Verified against every parser's emitted `ParsedSymbol::kind` values for a
+/// type declaration (grep `class_name\|struct_name\|interface_name\|
+/// enum_name\|trait_name\|protocol_name\|type_name` across src/parsers/*.rs):
+/// csharp.rs (class/struct/interface/enum — `record` maps to "class"),
+/// go.rs (struct/interface), python.rs (class), rust_parser.rs
+/// (struct/enum/trait/type), swift.rs (class/struct/enum/trait — a protocol
+/// maps to "trait" — /type), typescript.rs (class/interface/enum/type). The
+/// semantic C# leg reuses the symbol row csharp.rs already inserted (only
+/// `docid` is stamped onto it, see `ingest_semantic`), so its kind values are
+/// the same set — matching Roslyn's own `KindOf` (Program.cs), which only
+/// ever reports class/struct/interface/enum.
+const TYPE_LIKE_KINDS: &[&str] = &["class", "struct", "interface", "enum", "trait", "type"];
+
+/// Resolve a type relation's `super_name` to a symbol id. Exactly one
+/// same-named, type-like candidate wins (see `TYPE_LIKE_KINDS`); zero or more
+/// than one leaves the supertype unresolved rather than guessing — the same
+/// rule `resolve_semantic_container` documents for reference containers. A
+/// `None` result is not a failure: the row is still inserted with
+/// `super_symbol_id` NULL, since an external base type (framework, unindexed
+/// dependency) must not be silently dropped. Shared by both resolution
+/// passes (`index_file_definitions` and `resolve_type_relations`) so they
+/// cannot disagree on what counts as a match.
+fn resolve_type_relation_super(db: &Database, super_name: &str) -> Result<Option<i64>> {
+    let candidates: Vec<i64> = db
+        .find_symbol_by_name(base_type_identifier(super_name))?
+        .into_iter()
+        .filter(|(sym, _)| TYPE_LIKE_KINDS.contains(&sym.kind.as_str()))
+        .map(|(sym, _)| sym.id)
+        .collect();
+    Ok(match candidates.as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    })
+}
+
+/// Resolve a semantic type relation's `super_docid` to a symbol id.
+///
+/// Unlike a reference's container or a relation's own `sub_docid`, a
+/// supertype is not necessarily declared in the relation's file, so there is
+/// no file to narrow by — `docid_symbol_map` alone is the lookup. A docid
+/// stamped onto more than one row (partial types) is ambiguous here the same
+/// way it would be for any other single-valued column, so it resolves to
+/// `None` rather than guessing; `super_name` keeps the edge answerable either
+/// way.
+fn resolve_semantic_super(
+    docid_map: &HashMap<String, Vec<i64>>,
+    super_docid: Option<&str>,
+) -> Option<i64> {
+    match docid_map.get(super_docid?).map(Vec::as_slice) {
+        Some([only]) => Some(*only),
+        _ => None,
+    }
+}
+
 /// The walker every helios pass uses: hidden files and gitignored paths skipped.
 fn walk(root: &Path) -> ignore::Walk {
     WalkBuilder::new(root)
@@ -159,6 +230,18 @@ pub fn index_full(
     let snapshot: Option<HashSet<&str>> =
         sidecar_snapshot.map(|files| files.iter().map(String::as_str).collect());
 
+    // An index built before `INDEX_FORMAT_VERSION` existed, or before the
+    // stamped version, may hold files whose content hash is unchanged but
+    // whose extracted data (e.g. `type_relations`) is missing because the
+    // pass that populates it didn't exist yet when they were last parsed.
+    // The hash can't detect that — only the stamped version can — so a full
+    // index ignores every file's hash for this run and re-parses all of them
+    // whenever the stamp is absent or stale. Stamped again below only once
+    // the whole run has completed, so an interrupted run is retried next time
+    // rather than marked current.
+    let force_reparse = db.get_metadata(Database::INDEX_FORMAT_VERSION_KEY)?.as_deref()
+        != Some(Database::CURRENT_INDEX_FORMAT_VERSION);
+
     // Files this walk parsed, for the reference pass below. Only those: a file
     // whose content hash was unchanged keeps the reference rows it already has,
     // and re-inserting them would duplicate every one.
@@ -188,7 +271,7 @@ pub fn index_full(
             {
                 stats.missing_from_snapshot.push(rel_path.clone());
             }
-            match index_file_definitions(db, path, &rel_path, language) {
+            match index_file_definitions(db, path, &rel_path, language, force_reparse) {
                 Ok(file_stats) => {
                     stats.files_indexed += 1;
                     stats.symbols_found += file_stats.symbols;
@@ -213,6 +296,16 @@ pub fn index_full(
             eprintln!("warning: failed to index references in {}: {}", rel_path, e);
         }
     }
+
+    // The walk and reference pass above only ever warn on a per-file error
+    // (a bad parse, a bad reference) and keep going, so reaching here means
+    // the run as a whole succeeded — this is the "successful full index" that
+    // earns the stamp. An early `?` return above (a walk or context error)
+    // skips this, so a genuinely failed run is retried in full next time.
+    db.set_metadata(
+        Database::INDEX_FORMAT_VERSION_KEY,
+        Database::CURRENT_INDEX_FORMAT_VERSION,
+    )?;
 
     Ok(stats)
 }
@@ -284,7 +377,10 @@ pub fn index_file(
     language: &str,
     semantic: bool,
 ) -> Result<FileStats> {
-    let stats = index_file_definitions(db, abs_path, rel_path, language)?;
+    // `update` is the fast, hash-driven path (see `warn_index_stale` in
+    // `commands::update`) — never force a reparse here even when the stored
+    // index format is behind; that's `init`'s job.
+    let stats = index_file_definitions(db, abs_path, rel_path, language, false)?;
     // In semantic mode `.cs` and `.xaml` references come from the Roslyn
     // sidecar, ingested after the walk with exact DocId resolution (P3-M4).
     if stats.reparsed && !(semantic && is_sidecar_language(language)) {
@@ -295,12 +391,17 @@ pub fn index_file(
 
 /// Parse a file and insert its symbols and imports, replacing whatever the
 /// index held for that path. A file whose content hash is unchanged is left
-/// alone (`reparsed: false`).
+/// alone (`reparsed: false`) — unless `force_reparse` is set, in which case
+/// the file is re-parsed regardless of its hash. `index_full` sets that when
+/// the on-disk index predates the current `INDEX_FORMAT_VERSION`: the
+/// content hasn't changed, but what helios extracts from it has, and the
+/// hash alone can't tell the two apart.
 fn index_file_definitions(
     db: &Database,
     abs_path: &Path,
     rel_path: &str,
     language: &str,
+    force_reparse: bool,
 ) -> Result<FileStats> {
     let content =
         std::fs::read_to_string(abs_path).with_context(|| format!("reading {}", rel_path))?;
@@ -308,7 +409,8 @@ fn index_file_definitions(
     let content_hash = content_hash(&content);
 
     // Check if file has changed
-    if let Some(existing) = db.get_file_by_path(rel_path)?
+    if !force_reparse
+        && let Some(existing) = db.get_file_by_path(rel_path)?
         && existing.content_hash == content_hash
     {
         // Already indexed with same content
@@ -341,10 +443,14 @@ fn index_file_definitions(
         .parse(&content)
         .with_context(|| format!("parsing {}", rel_path))?;
 
-    // Insert symbols
+    // Insert symbols, keeping each one's id keyed by (name, line) so the type
+    // relations below can resolve their `sub_name`/`sub_line` against the
+    // symbols just inserted for this file without a re-query.
     let mut symbol_count = 0;
+    let mut inserted_symbol_ids: HashMap<(&str, i64), i64> = HashMap::new();
     for sym in &parse_result.symbols {
-        db.insert_symbol(file_id, sym)?;
+        let id = db.insert_symbol(file_id, sym)?;
+        inserted_symbol_ids.insert((sym.name.as_str(), sym.line), id);
         symbol_count += 1;
     }
 
@@ -353,6 +459,22 @@ fn index_file_definitions(
     for imp in &parse_result.imports {
         db.insert_import(file_id, imp)?;
         import_count += 1;
+    }
+
+    // Insert type relations (`class C extends B implements I`, `impl Trait for
+    // Type`, ...). The sub side is always a symbol declared in this file, so
+    // it resolves against `inserted_symbol_ids` above rather than a query; a
+    // relation whose sub never matches an inserted symbol (parser/schema
+    // mismatch) is skipped rather than inserted with a dangling id, since
+    // `sub_symbol_id` is NOT NULL. The super side may resolve to nothing
+    // indexed (see `resolve_type_relation_super`) — the row is inserted
+    // either way, since the whole point is not to drop external base types.
+    for rel in &parse_result.type_relations {
+        let Some(&sub_id) = inserted_symbol_ids.get(&(rel.sub_name.as_str(), rel.sub_line)) else {
+            continue;
+        };
+        let super_symbol_id = resolve_type_relation_super(db, &rel.super_name)?;
+        db.insert_type_relation(sub_id, super_symbol_id, &rel.super_name, &rel.kind, file_id)?;
     }
 
     Ok(FileStats {
@@ -418,7 +540,13 @@ pub fn index_incremental(
 ) -> Result<IndexStats> {
     let mut stats = IndexStats::default();
 
-    // Remove deleted files
+    // Remove deleted files. `type_relations` needs no explicit delete here:
+    // the bundled SQLite is built with `SQLITE_DEFAULT_FOREIGN_KEYS=1`
+    // (libsqlite3-sys), so the `ON DELETE CASCADE` on `file_id` drops the
+    // deleted file's own edges, and the `ON DELETE SET NULL` on
+    // `super_symbol_id` clears edges in *other* files that pointed at a
+    // symbol this file defined — leaving `super_name` behind, which is
+    // exactly the unresolved-supertype state the schema is built around.
     for path in deleted {
         db.delete_file(path)?;
         stats.files_deleted += 1;
@@ -500,6 +628,12 @@ pub fn ingest_semantic(db: &Database, semantic: Option<&AnalyzeOutput>) -> Resul
     let docid_map = db.docid_symbol_map()?;
     let container_map = db.docid_symbol_file_map()?;
     db.delete_references_from_language("csharp")?;
+    // The C# tree-sitter leg (csharp.rs) already stores a syntactic
+    // approximation of these edges from the `base_list` grammar, which cannot
+    // tell extends from implements. Roslyn's answer is exact, so it replaces
+    // that approximation wholesale here — exactly the reason the syntactic
+    // guess is an acceptable stopgap in the first place.
+    db.delete_type_relations_from_language("csharp")?;
     // XAML holds no symbols of its own, only binding references the sidecar
     // resolved; they are replaced wholesale like the `.cs` set.
     db.delete_references_from_language("xaml")?;
@@ -528,6 +662,30 @@ pub fn ingest_semantic(db: &Database, semantic: Option<&AnalyzeOutput>) -> Resul
             reference.col - 1,
             false,
             container_symbol_id,
+        )?;
+    }
+
+    for relation in &output.relations {
+        let Some(file) = db.get_file_by_path(&relation.file)? else {
+            continue;
+        };
+        // A declaration is always in the file it is declared in, so
+        // `sub_docid` narrows through `container_map` the same way a
+        // reference's `container_docid` does. No match (the subtype itself
+        // was never stamped) means there is no symbol to attach the edge to,
+        // so the row is skipped — `sub_symbol_id` is NOT NULL.
+        let Some(sub_symbol_id) =
+            resolve_semantic_container(&container_map, Some(&relation.sub_docid), file.id)
+        else {
+            continue;
+        };
+        let super_symbol_id = resolve_semantic_super(&docid_map, relation.super_docid.as_deref());
+        db.insert_type_relation(
+            sub_symbol_id,
+            super_symbol_id,
+            &relation.super_name,
+            &relation.kind,
+            file.id,
         )?;
     }
 
@@ -569,6 +727,40 @@ pub fn resolve_imports(db: &Database) -> Result<usize> {
     }
     db.apply_import_resolutions(&updates)?;
 
+    Ok(resolved_count)
+}
+
+/// Post-index pass: fill in `super_symbol_id` for `type_relations` rows left
+/// unresolved at insert time.
+///
+/// A supertype declared in a file the walk had not reached yet (or, on an
+/// incremental run, a file not yet re-indexed this pass) cannot resolve when
+/// its subtype's own file is indexed — `index_file_definitions` records
+/// `super_name` and leaves `super_symbol_id` NULL rather than guess. This
+/// mirrors `resolve_imports`: it runs once the whole file set is in, so a
+/// name that only now resolves uniquely gets its edge filled in. Unlike
+/// `resolve_imports` it only ever fills NULLs — a `type_relations` row's
+/// resolved `super_symbol_id` is never taken away once set (same reasoning as
+/// the AMENDMENT 1 note on `symbol_references`: `super_name` keeps the edge
+/// answerable, so there is nothing to gain by nulling out a stale-but-not-yet-
+/// wrong id, and every other resolution in this codebase treats "resolves to
+/// exactly one" as a one-way ratchet, not a live view).
+///
+/// Mirrors `resolve_imports`' `all_imports_with_source` + `apply_import_resolutions`
+/// pairing: `unresolved_type_relations` lists the rows still NULL,
+/// `resolve_type_relation_super` re-runs the exact-one-match rule (the same
+/// helper `index_file_definitions` uses, so the two passes cannot disagree),
+/// and `apply_type_relation_resolutions` writes every resolved id back in one
+/// transaction rather than a commit per row.
+pub fn resolve_type_relations(db: &Database) -> Result<usize> {
+    let mut updates = Vec::new();
+    for (rel_id, super_name) in db.unresolved_type_relations()? {
+        if let Some(super_symbol_id) = resolve_type_relation_super(db, &super_name)? {
+            updates.push((rel_id, super_symbol_id));
+        }
+    }
+    let resolved_count = updates.len();
+    db.apply_type_relation_resolutions(&updates)?;
     Ok(resolved_count)
 }
 
@@ -662,6 +854,40 @@ mod tests {
         .unwrap()
     }
 
+    /// A function sharing a supertype's name must never win the lookup —
+    /// only a type-like symbol (`TYPE_LIKE_KINDS`) counts. With only the
+    /// function in the index the supertype stays unresolved (not silently
+    /// pointed at the wrong symbol); once an actual class named the same
+    /// thing is added, resolution becomes unambiguous and picks it.
+    #[test]
+    fn resolve_type_relation_super_ignores_non_type_kinds() {
+        let db = Database::open_in_memory().unwrap();
+        let file = add_file(&db, "app.ts", "typescript");
+        // `add_symbol` inserts kind "fn" — not in TYPE_LIKE_KINDS.
+        add_symbol(&db, file, "Base", 1, "");
+
+        assert_eq!(resolve_type_relation_super(&db, "Base").unwrap(), None);
+
+        let base_class = db
+            .insert_symbol(
+                file,
+                &ParsedSymbol {
+                    name: "Base".to_string(),
+                    kind: "class".to_string(),
+                    line: 10,
+                    column: 0,
+                    end_line: 12,
+                    visibility: "pub".to_string(),
+                    scope: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            resolve_type_relation_super(&db, "Base").unwrap(),
+            Some(base_class)
+        );
+    }
+
     fn def(docid: &str, name: &str, file: &str, start_line: i64) -> Definition {
         Definition {
             docid: docid.to_string(),
@@ -727,6 +953,7 @@ mod tests {
         let save_b = add_symbol(&db, file_b, "Save", 7, "B");
 
         let output = AnalyzeOutput {
+            relations: Vec::new(),
             definitions: vec![
                 def("M:App.A.Save", "Save", "A.cs", 5),
                 def("M:App.B.Save", "Save", "B.cs", 7),
@@ -764,6 +991,7 @@ mod tests {
         add_symbol(&db, file, "Helper", 10, "Program");
 
         let output = AnalyzeOutput {
+            relations: Vec::new(),
             definitions: vec![
                 def("M:App.Program.Main", "Main", "Program.cs", 3),
                 def("M:App.Program.Helper", "Helper", "Program.cs", 10),
@@ -793,6 +1021,7 @@ mod tests {
         add_symbol(&db, file, "Helper", 10, "Program");
 
         let output = AnalyzeOutput {
+            relations: Vec::new(),
             definitions: vec![def("M:App.Program.Helper", "Helper", "Program.cs", 10)],
             references: vec![wire_ref("M:App.Program.Helper", "Program.cs", 5, 9, false)],
         };
@@ -810,6 +1039,7 @@ mod tests {
         add_symbol(&db, file, "Helper", 10, "Program");
 
         let output = AnalyzeOutput {
+            relations: Vec::new(),
             definitions: vec![def("M:App.Program.Helper", "Helper", "Program.cs", 10)],
             references: vec![wire_ref_with_container(
                 "M:App.Program.Helper",
@@ -838,6 +1068,7 @@ mod tests {
         add_symbol(&db, file_a, "Helper", 5, "App");
 
         let output = AnalyzeOutput {
+            relations: Vec::new(),
             definitions: vec![
                 def("M:App.Init", "Init", "A.cs", 1),
                 def("M:App.Init", "Init", "B.cs", 1),
@@ -870,6 +1101,7 @@ mod tests {
         add_symbol(&db, file, "Main", 3, "Program");
 
         let output = AnalyzeOutput {
+            relations: Vec::new(),
             // no symbol row at (Program.cs, 99, Nope) — stamp skips silently
             definitions: vec![def("M:App.Nope", "Nope", "Program.cs", 99)],
             references: vec![wire_ref(
@@ -894,6 +1126,7 @@ mod tests {
         add_symbol(&db, file, "Save", 5, "A");
 
         let output = AnalyzeOutput {
+            relations: Vec::new(),
             definitions: vec![def("M:App.A.Save", "Save", "A.cs", 5)],
             references: vec![wire_ref("M:App.A.Save", "A.cs", 5, 17, true)],
         };
@@ -919,6 +1152,7 @@ mod tests {
             .unwrap();
 
         let output = AnalyzeOutput {
+            relations: Vec::new(),
             definitions: vec![def("M:App.A.Save", "Save", "A.cs", 5)],
             references: vec![wire_ref("M:App.A.Save", "A.cs", 12, 9, false)],
         };
@@ -942,6 +1176,7 @@ mod tests {
         let part2 = add_symbol(&db, file_b, "A", 1, "App");
 
         let output = AnalyzeOutput {
+            relations: Vec::new(),
             definitions: vec![
                 def("T:App.A", "A", "A.Part1.cs", 1),
                 def("T:App.A", "A", "A.Part2.cs", 1),
@@ -1043,6 +1278,7 @@ mod tests {
         let query = add_symbol(&db, vm, "Query", 5, "MainViewModel");
 
         let output = AnalyzeOutput {
+            relations: Vec::new(),
             definitions: vec![def(
                 "P:App.MainViewModel.Query",
                 "Query",

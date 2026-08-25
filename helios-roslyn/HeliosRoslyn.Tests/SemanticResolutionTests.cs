@@ -121,4 +121,57 @@ public class SemanticResolutionTests
         Assert.NotEmpty(references); // the field type and `new Calculator()` both reference the type
         Assert.All(references, r => Assert.Equal(calculator.Docid, r.ContainerDocid));
     }
+
+    [Fact] // (e1) relation: a class extending a base and implementing an interface emits both edges
+    public void Relation_ClassExtendsAndImplements_EmitsBothEdges()
+    {
+        var shapeBase = DefinitionAt("Shapes.cs", "class ShapeBase");
+        var iShape = DefinitionAt("Shapes.cs", "interface IShape");
+        var circle = DefinitionAt("Shapes.cs", "class Circle");
+
+        var extends = Assert.Single(
+            Output.Value.Relations, r => r.SubDocid == circle.Docid && r.Kind == "extends");
+        Assert.Equal(shapeBase.Docid, extends.SuperDocid);
+        Assert.Equal("Shapes.cs", extends.File);
+
+        var implements = Assert.Single(
+            Output.Value.Relations, r => r.SubDocid == circle.Docid && r.Kind == "implements");
+        Assert.Equal(iShape.Docid, implements.SuperDocid);
+        Assert.Equal("Shapes.cs", implements.File);
+    }
+
+    [Fact] // (e2) relation: System.Object is the implicit base every class gets — never a relation row
+    public void Relation_ImplicitObjectBase_IsNotEmitted()
+    {
+        var shapeBase = DefinitionAt("Shapes.cs", "class ShapeBase");
+
+        Assert.DoesNotContain(Output.Value.Relations, r => r.SubDocid == shapeBase.Docid && r.Kind == "extends");
+    }
+
+    [Fact] // (e3) relation: an external (BCL) base type still gets a row with a populated super_name,
+           // whether or not helios indexed it well enough to resolve super_docid
+    public void Relation_ExternalBaseType_HasPopulatedSuperName()
+    {
+        var shapeError = DefinitionAt("Shapes.cs", "class ShapeError");
+
+        var extends = Assert.Single(
+            Output.Value.Relations, r => r.SubDocid == shapeError.Docid && r.Kind == "extends");
+        Assert.Equal("System.Exception", extends.SuperName);
+        Assert.Equal("Shapes.cs", extends.File);
+    }
+
+    [Fact] // (e4) relation: a partial type's Interfaces set is the union across parts — exactly
+           // one relation row per edge, never one per (edge, declaring part) combination
+    public void Relation_PartialType_UnionsInterfacesAcrossParts_NoDuplicates()
+    {
+        var fooPart1 = DefinitionAt("PartialType.cs", "partial class Foo : IAlpha");
+        var iAlpha = DefinitionAt("PartialType.cs", "interface IAlpha");
+        var iBeta = DefinitionAt("PartialType.cs", "interface IBeta");
+
+        // Both parts share one docid, so this captures the type's relations as a whole.
+        var fooRelations = Output.Value.Relations.Where(r => r.SubDocid == fooPart1.Docid).ToList();
+        Assert.Equal(2, fooRelations.Count);
+        Assert.Contains(fooRelations, r => r.Kind == "implements" && r.SuperDocid == iAlpha.Docid);
+        Assert.Contains(fooRelations, r => r.Kind == "implements" && r.SuperDocid == iBeta.Docid);
+    }
 }

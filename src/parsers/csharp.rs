@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
 use super::{LanguageParser, ParseResult};
-use crate::db::{ParsedImport, ParsedReference, ParsedSymbol};
+use crate::db::{ParsedImport, ParsedReference, ParsedSymbol, ParsedTypeRelation};
 
 pub struct CSharpParser {
     language: Language,
@@ -193,6 +193,89 @@ impl LanguageParser for CSharpParser {
                     end_line: def_node.end_position().row as i64 + 1,
                     visibility,
                     scope,
+                });
+            }
+        }
+
+        // --- Type relations (base_list: extends/implements) ---
+        //
+        // A class/struct/interface/record's base types (if any) live in a
+        // `base_list` child with no field name, so its entries can only be
+        // read back as named children (identifier / qualified_name /
+        // generic_name), same as the TS/JS parser does for its heritage
+        // clauses.
+        //
+        // C# syntax cannot distinguish a base class from an interface:
+        // `class Foo : Bar, IBaz` is ambiguous without semantic (type)
+        // information. We approximate with "first entry is the base class,
+        // the rest are interfaces" for class/record (which can have at most
+        // one base class, always listed first), and "every entry is an
+        // interface" for struct/interface (which cannot extend a class).
+        // This guess is wrong whenever a class implements an interface
+        // without an explicit base class (e.g. `class Foo : IDisposable`
+        // is recorded as "extends"). That's acceptable only because
+        // `helios init` also runs the Roslyn sidecar, which calls
+        // `delete_type_relations_from_language("csharp")` and replaces the
+        // whole C# set with the semantically accurate answer; this parser's
+        // output is only ever load-bearing for `helios update`, where no
+        // better source is available.
+        let type_rel_query = Query::new(
+            &self.language,
+            r#"
+            (class_declaration name: (identifier) @class_name (base_list) @base_list) @class_def
+            (struct_declaration name: (identifier) @struct_name (base_list) @base_list) @struct_def
+            (record_declaration name: (identifier) @record_name (base_list) @base_list) @record_def
+            (interface_declaration name: (identifier) @interface_name (base_list) @base_list) @interface_def
+            "#,
+        )
+        .context("compiling C# type relation query")?;
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&type_rel_query, root, src);
+
+        while let Some(m) = matches.next() {
+            let captures: Vec<_> = m
+                .captures
+                .iter()
+                .map(|c| (type_rel_query.capture_names()[c.index as usize], c.node))
+                .collect();
+
+            let sub_name = captures
+                .iter()
+                .find(|(n, _)| n.ends_with("_name"))
+                .map(|(_, n)| text_from(src, *n));
+            let Some(sub_name) = sub_name else { continue };
+
+            let sub_line = captures
+                .iter()
+                .find(|(n, _)| n.ends_with("_name"))
+                .map(|(_, n)| n.start_position().row as i64 + 1)
+                .unwrap();
+
+            // Structs and interfaces can't extend a class; every base_list
+            // entry there is an interface. Classes and records can have one
+            // base class, always listed first if present.
+            let struct_or_interface = captures
+                .iter()
+                .any(|(n, _)| *n == "struct_name" || *n == "interface_name");
+
+            let base_list = captures.iter().find(|(n, _)| *n == "base_list");
+            let Some((_, base_list_node)) = base_list else {
+                continue;
+            };
+
+            let mut bcursor = base_list_node.walk();
+            for (idx, super_type) in base_list_node.named_children(&mut bcursor).enumerate() {
+                let kind = if !struct_or_interface && idx == 0 {
+                    "extends"
+                } else {
+                    "implements"
+                };
+                result.type_relations.push(ParsedTypeRelation {
+                    sub_name: sub_name.clone(),
+                    sub_line,
+                    super_name: text_from(src, super_type),
+                    kind: kind.to_string(),
                 });
             }
         }
@@ -560,6 +643,98 @@ namespace MyApp.Models {
             ref_names.contains(&&"Person".to_string()),
             "Should find Person object creation reference, got: {:?}",
             ref_names
+        );
+    }
+
+    /// `ParsedTypeRelation` has no `PartialEq`, so tests compare this plain
+    /// tuple projection instead.
+    fn relation_tuples(relations: &[ParsedTypeRelation]) -> Vec<(&str, i64, &str, &str)> {
+        relations
+            .iter()
+            .map(|r| {
+                (
+                    r.sub_name.as_str(),
+                    r.sub_line,
+                    r.super_name.as_str(),
+                    r.kind.as_str(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_class_extends_and_implements() {
+        let parser = CSharpParser::new();
+        let result = parser
+            .parse("class Circle : ShapeBase, IShape { }")
+            .unwrap();
+        assert_eq!(
+            relation_tuples(&result.type_relations),
+            vec![
+                ("Circle", 1, "ShapeBase", "extends"),
+                ("Circle", 1, "IShape", "implements")
+            ]
+        );
+    }
+
+    #[test]
+    fn test_interface_extends_multiple_bases_all_implements() {
+        let parser = CSharpParser::new();
+        let result = parser.parse("interface IA : IB, IC { }").unwrap();
+        assert_eq!(
+            relation_tuples(&result.type_relations),
+            vec![
+                ("IA", 1, "IB", "implements"),
+                ("IA", 1, "IC", "implements")
+            ]
+        );
+    }
+
+    #[test]
+    fn test_struct_base_list_all_implements() {
+        let parser = CSharpParser::new();
+        let result = parser.parse("struct S : IFoo { }").unwrap();
+        assert_eq!(
+            relation_tuples(&result.type_relations),
+            vec![("S", 1, "IFoo", "implements")]
+        );
+    }
+
+    #[test]
+    fn test_record_can_extend() {
+        let parser = CSharpParser::new();
+        let result = parser
+            .parse("record R : BaseRecord, IBar { }")
+            .unwrap();
+        assert_eq!(
+            relation_tuples(&result.type_relations),
+            vec![
+                ("R", 1, "BaseRecord", "extends"),
+                ("R", 1, "IBar", "implements")
+            ]
+        );
+    }
+
+    #[test]
+    fn test_class_with_no_base_list_has_no_relations() {
+        let parser = CSharpParser::new();
+        let result = parser.parse("class C { }").unwrap();
+        assert!(result.type_relations.is_empty());
+    }
+
+    #[test]
+    fn test_generic_and_qualified_supertype_keep_raw_text() {
+        let parser = CSharpParser::new();
+        let result = parser
+            .parse("class Circle : ShapeBase, System.IDisposable, List<T> { }")
+            .unwrap();
+        assert_eq!(
+            relation_tuples(&result.type_relations),
+            vec![
+                ("Circle", 1, "ShapeBase", "extends"),
+                ("Circle", 1, "System.IDisposable", "implements"),
+                ("Circle", 1, "List<T>", "implements")
+            ]
         );
     }
 }

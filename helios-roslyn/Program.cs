@@ -136,10 +136,11 @@ internal static class Program
         // each TFM's tree keeps references inside `#if` regions.
         var emittedDefinitions = new HashSet<(string Docid, string File, int Line, int Col)>();
         var emittedReferences = new HashSet<(string Docid, string File, int Line, int Col)>();
+        var emittedRelations = new HashSet<(string SubDocid, string SuperKey, string Kind)>();
         var declarationSites = new HashSet<(string Path, int Line, int Col)>();
         foreach (var compilation in compilations)
         {
-            EmitDefinitions(compilation, root, stdout, indexedFiles, emittedDefinitions, declarationSites);
+            EmitDefinitions(compilation, root, stdout, indexedFiles, emittedDefinitions, declarationSites, emittedRelations);
         }
         var rootDocids = emittedDefinitions.Select(d => d.Docid).ToHashSet(StringComparer.Ordinal);
         // When a later compilation is provably bind-identical to one already
@@ -171,7 +172,8 @@ internal static class Program
         TextWriter stdout,
         HashSet<string>? indexedFiles,
         HashSet<(string Docid, string File, int Line, int Col)> emittedDefinitions,
-        HashSet<(string Path, int Line, int Col)> declarationSites)
+        HashSet<(string Path, int Line, int Col)> declarationSites,
+        HashSet<(string SubDocid, string SuperKey, string Kind)> emittedRelations)
     {
         foreach (var symbol in CollectIndexedSymbols(compilation))
         {
@@ -181,6 +183,11 @@ internal static class Program
                 continue; // contract: records with a null DocId are not emitted
             }
 
+            // The file the relation record (if any) below gets attributed to:
+            // the first declaring location in an indexed file, set once and
+            // left alone on every subsequent partial-declaration location.
+            string? relationFile = null;
+
             foreach (var location in symbol.Locations.Where(l => l.IsInSource))
             {
                 var span = location.GetLineSpan();
@@ -189,6 +196,7 @@ internal static class Program
                 {
                     continue; // contract: only symbols declared in indexed files are emitted
                 }
+                relationFile ??= file;
                 declarationSites.Add((span.Path, span.StartLinePosition.Line, span.StartLinePosition.Character));
                 if (!emittedDefinitions.Add((docid, file, span.StartLinePosition.Line + 1, span.StartLinePosition.Character + 1)))
                 {
@@ -213,7 +221,81 @@ internal static class Program
                 var declarationContainer = ContainerDocidAt(declarationModel, location.SourceSpan.Start);
                 WriteReference(stdout, docid, file, span, isDefinition: true, declarationContainer);
             }
+
+            // Once per type, not once per declaring location: BaseType and
+            // Interfaces are already the union across every part of a partial
+            // type, so the declared supertype set is a property of the type as
+            // a whole, not of any one part's syntax. Attributing it to the
+            // type's first declaring location is the honest answer — walking
+            // syntax to work out which part wrote which edge is more machinery
+            // than the question is worth.
+            if (relationFile is not null && symbol is INamedTypeSymbol namedType)
+            {
+                EmitTypeRelations(stdout, namedType, docid, relationFile, emittedRelations);
+            }
         }
+    }
+
+    /// <summary>
+    /// Declared supertype edges for <paramref name="type"/>: the written base class
+    /// (kind "extends") and the directly-declared interfaces (kind "implements").
+    /// Deliberately <see cref="INamedTypeSymbol.Interfaces"/>, not
+    /// <c>AllInterfaces</c> — this table records declared edges; transitive
+    /// closure is a query concern, not something to bake into the wire.
+    /// </summary>
+    private static void EmitTypeRelations(
+        TextWriter stdout,
+        INamedTypeSymbol type,
+        string docid,
+        string file,
+        HashSet<(string SubDocid, string SuperKey, string Kind)> emittedRelations)
+    {
+        // Only a class has a base class that was actually written in source.
+        // System.Object is the implicit default every class gets whether or not
+        // a base is written, so it is never a relation. Structs, enums, delegates
+        // and interfaces have their own implicit base (ValueType, Enum,
+        // MulticastDelegate, none) that Roslyn reports via BaseType/none of that
+        // is written either, so only TypeKind.Class is considered here.
+        if (type.TypeKind == TypeKind.Class && type.BaseType is { SpecialType: not SpecialType.System_Object } baseType)
+        {
+            WriteRelation(stdout, docid, baseType, "extends", file, emittedRelations);
+        }
+
+        foreach (var iface in type.Interfaces)
+        {
+            WriteRelation(stdout, docid, iface, "implements", file, emittedRelations);
+        }
+    }
+
+    /// <summary>One on-wire relation record for a single declared supertype edge.</summary>
+    private static void WriteRelation(
+        TextWriter stdout,
+        string subDocid,
+        INamedTypeSymbol super,
+        string kind,
+        string file,
+        HashSet<(string SubDocid, string SuperKey, string Kind)> emittedRelations)
+    {
+        var superDocid = super.GetDocumentationCommentId();
+        var superName = super.ToDisplayString();
+        // Dedupe key falls back to the display name when the supertype has no
+        // DocId (metadata helios never indexed) — same reasoning as emittedDefinitions,
+        // guarding against a multi-TFM project walking the same file more than once.
+        // No File component: one relation row per logical (sub, super, kind)
+        // edge, not one per declaring location.
+        if (!emittedRelations.Add((subDocid, superDocid ?? superName, kind)))
+        {
+            return;
+        }
+        WriteRecord(stdout, new
+        {
+            type = "relation",
+            sub_docid = subDocid,
+            super_docid = superDocid,
+            super_name = superName,
+            kind,
+            file,
+        });
     }
 
     private static void EmitReferences(

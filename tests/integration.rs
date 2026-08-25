@@ -435,6 +435,95 @@ fn test_deps_file_dependents_by_path() {
     );
 }
 
+/// `implementors_of`'s raw-name fallback matches purely on `super_name` text,
+/// with no language or file scoping (accepted by design — dropping an
+/// unresolved edge would defeat the point of the feature). So a TypeScript
+/// `Sub` whose supertype `Base` never resolved WILL surface when the user
+/// asks `deps Base` about an unrelated Python `class Base` in the same repo.
+/// The mitigation is disclosure: every such row is marked `external`, shows
+/// its own declaring file:line, and the answer ends with a provenance line
+/// naming which languages actually contributed an edge — so the reader can
+/// see the hit came from a `.ts` file, not the Python one they asked about.
+///
+/// Seeds the unresolved row directly rather than indexing a real Python
+/// `class Sub(Base)` alongside it: constructing a genuine cross-language
+/// collision would couple this test to two parsers' behaviour (does Python's
+/// leg resolve `Base` first and rob TypeScript's row of the case we want?)
+/// for no added value — the thing under test is `deps`'s handling of an
+/// unresolved row, not how one gets produced. The seeded shape matches what
+/// a tree-sitter leg emits for an unrecognized base type: `super_symbol_id`
+/// NULL, `super_name` raw.
+#[test]
+fn test_deps_type_edge_external_cross_language_shows_declaring_file() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    std::fs::write(dir.path().join("base.py"), "class Base:\n    pass\n").unwrap();
+    std::fs::write(dir.path().join("sub.ts"), "export class Sub {}\n").unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("init");
+    assert!(output.status.success());
+
+    {
+        let conn = rusqlite::Connection::open(dir.path().join(".helios").join("index.db"))
+            .expect("opening index.db");
+        let sub_file_id: i64 = conn
+            .query_row(
+                "SELECT id FROM files WHERE path = 'sub.ts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("finding sub.ts file row");
+        let sub_symbol_id: i64 = conn
+            .query_row(
+                "SELECT id FROM symbols WHERE name = 'Sub'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("finding Sub symbol row");
+        conn.execute(
+            "INSERT INTO type_relations (sub_symbol_id, super_symbol_id, super_name, kind, file_id)
+             VALUES (?1, NULL, 'Base', 'implements', ?2)",
+            rusqlite::params![sub_symbol_id, sub_file_id],
+        )
+        .expect("seeding unresolved type relation");
+    }
+
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "Base", "--file", "base.py"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps Base");
+    assert!(output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("parsing deps JSON");
+    let implementors = json["implementors"].as_array().unwrap();
+    assert_eq!(implementors.len(), 1);
+    assert_eq!(implementors[0]["sub_name"], "Sub");
+    assert_eq!(implementors[0]["file"], "sub.ts");
+    assert_eq!(implementors[0]["language"], "typescript");
+    assert_eq!(implementors[0]["external"], true);
+    assert_eq!(json["edge_languages"], serde_json::json!(["typescript"]));
+
+    let output = Command::new(&bin)
+        .args(["deps", "Base", "--file", "base.py"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps Base human");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("sub.ts:1 Sub -> Base (implements, external)"),
+        "expected the declaring file:line on the external row, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Type edges from: typescript"),
+        "expected the provenance line to name only typescript, got:\n{stdout}"
+    );
+}
+
 #[test]
 fn test_summary_command() {
     let dir = create_test_project();
@@ -4684,4 +4773,477 @@ fn test_xaml_without_sidecar_indexes_without_bindings() {
         )
         .unwrap();
     assert_eq!(bindings, 0, "no parser, so no references from markup");
+}
+
+// --- Type relations (extends/implements) tests ---
+//
+// `type_relations` records inheritance/implements edges and surfaces them
+// through `helios deps` as Supertypes/Implementors/Overrides sections. See
+// src/db.rs (`type_relations`, `supertypes_of`, `implementors_of`,
+// `overrides_of`, `TypeEdge`) and src/parsers/typescript.rs for the
+// TypeScript leg exercised here.
+
+/// `class Wallet extends Base implements Payable` records both edges: `deps
+/// Base` lists Wallet as an implementor, and `deps Wallet` lists both
+/// supertypes with the right kinds. Covers human output and `--json`.
+#[test]
+fn test_deps_reports_supertypes_and_implementors() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    std::fs::write(
+        dir.path().join("wallet.ts"),
+        "export class Base {}\nexport class Payable {}\nexport class Wallet extends Base implements Payable {}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    // deps Base -> Wallet shows up as an implementor.
+    let output = Command::new(&bin)
+        .args(["deps", "Base"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps Base");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Implementors (what extends/implements Base):"),
+        "expected an Implementors section, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Wallet -> Base (extends)"),
+        "expected Wallet -> Base (extends), got: {stdout}"
+    );
+
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "Base"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps --json Base");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+    let implementors = value["implementors"].as_array().expect("implementors array");
+    assert_eq!(
+        implementors.len(),
+        1,
+        "expected one implementor, got: {stdout}"
+    );
+    assert_eq!(implementors[0]["sub_name"].as_str(), Some("Wallet"));
+    assert_eq!(implementors[0]["kind"].as_str(), Some("extends"));
+    assert_eq!(
+        value["edge_languages"],
+        serde_json::json!(["typescript"]),
+        "got: {stdout}"
+    );
+
+    // deps Wallet -> both supertypes, right kinds.
+    let output = Command::new(&bin)
+        .args(["deps", "Wallet"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps Wallet");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Supertypes (what Wallet extends/implements):"),
+        "expected a Supertypes section, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Wallet -> Base (extends)"),
+        "expected Wallet -> Base (extends), got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Wallet -> Payable (implements)"),
+        "expected Wallet -> Payable (implements), got: {stdout}"
+    );
+
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "Wallet"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps --json Wallet");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+    let supertypes = value["supertypes"].as_array().expect("supertypes array");
+    assert_eq!(supertypes.len(), 2, "expected two supertypes, got: {stdout}");
+    let kinds: std::collections::BTreeSet<(String, String)> = supertypes
+        .iter()
+        .map(|e| {
+            (
+                e["super_name"].as_str().unwrap().to_string(),
+                e["kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        std::collections::BTreeSet::from([
+            ("Base".to_string(), "extends".to_string()),
+            ("Payable".to_string(), "implements".to_string()),
+        ]),
+        "got: {stdout}"
+    );
+}
+
+/// An unresolvable supertype (`class Ext extends SomeExternalThing {}` where
+/// nothing named SomeExternalThing is indexed) still gets a row: `super_name`
+/// keeps the raw text, `super_symbol_id` stays NULL, and `deps Ext` marks the
+/// edge `external`. This is the "external base types are not silently
+/// dropped" requirement.
+#[test]
+fn test_unresolvable_supertype_recorded_and_marked_external() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    std::fs::write(
+        dir.path().join("ext.ts"),
+        "export class Ext extends SomeExternalThing {}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    let conn = index_db(dir.path());
+    let mut stmt = conn
+        .prepare(
+            "SELECT tr.super_name, tr.super_symbol_id, tr.kind FROM type_relations tr
+             JOIN symbols s ON s.id = tr.sub_symbol_id
+             WHERE s.name = 'Ext'",
+        )
+        .unwrap();
+    let rows: Vec<(String, Option<i64>, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![("SomeExternalThing".to_string(), None, "extends".to_string())],
+        "an unresolvable supertype must still get a row, with super_symbol_id NULL, got: {rows:?}"
+    );
+
+    let output = Command::new(&bin)
+        .args(["deps", "Ext"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps Ext");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Ext -> SomeExternalThing (extends, external)"),
+        "expected the external marker on the unresolved edge, got: {stdout}"
+    );
+}
+
+/// A type relation survives `helios update`: editing a class's heritage
+/// clause and re-indexing removes the old edge and adds the new one, with no
+/// duplicate rows left behind.
+#[test]
+fn test_type_relations_survive_incremental_update() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    std::fs::write(
+        dir.path().join("payable.ts"),
+        "export class Payable {}\nexport class Refundable {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("wallet.ts"),
+        "import { Payable } from './payable';\nexport class Wallet implements Payable {}\n",
+    )
+    .unwrap();
+
+    git_repo_with_commit(dir.path());
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    let supers_of_wallet = |dir: &std::path::Path| -> Vec<String> {
+        let conn = index_db(dir);
+        let mut stmt = conn
+            .prepare(
+                "SELECT tr.super_name FROM type_relations tr
+                 JOIN symbols s ON s.id = tr.sub_symbol_id
+                 WHERE s.name = 'Wallet' ORDER BY tr.super_name",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        supers_of_wallet(dir.path()),
+        vec!["Payable".to_string()],
+        "before the edit, Wallet implements Payable"
+    );
+
+    std::fs::write(
+        dir.path().join("wallet.ts"),
+        "import { Refundable } from './payable';\nexport class Wallet implements Refundable {}\n",
+    )
+    .unwrap();
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-qm", "swap heritage"]);
+
+    update_stderr(dir.path());
+
+    assert_eq!(
+        supers_of_wallet(dir.path()),
+        vec!["Refundable".to_string()],
+        "after update, the old Payable edge must be gone and the new Refundable edge present, with no duplicate"
+    );
+}
+
+/// `interface I extends K, L` produces two `extends` edges, not one.
+#[test]
+fn test_interface_extends_multiple_produces_two_edges() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    std::fs::write(
+        dir.path().join("iface.ts"),
+        "export interface K {}\nexport interface L {}\nexport interface I extends K, L {}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    let conn = index_db(dir.path());
+    let mut stmt = conn
+        .prepare(
+            "SELECT tr.super_name, tr.kind FROM type_relations tr
+             JOIN symbols s ON s.id = tr.sub_symbol_id
+             WHERE s.name = 'I' ORDER BY tr.super_name",
+        )
+        .unwrap();
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("K".to_string(), "extends".to_string()),
+            ("L".to_string(), "extends".to_string()),
+        ],
+        "expected two extends edges for `interface I extends K, L`, got: {rows:?}"
+    );
+}
+
+/// A base class and a subclass both define the same method: `deps
+/// <method> --scope <BaseClass>` reports the subclass's method as an
+/// override.
+#[test]
+fn test_deps_reports_override_in_subclass() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    std::fs::write(
+        dir.path().join("shapes.ts"),
+        "export class Shape {\n    area(): number {\n        return 0;\n    }\n}\nexport class Circle extends Shape {\n    area(): number {\n        return 3;\n    }\n}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    let output = Command::new(&bin)
+        .args(["deps", "area", "--scope", "Shape"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps area --scope Shape");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Overrides (what overrides area):"),
+        "expected an Overrides section, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Circle.area overrides Shape.area"),
+        "expected Circle's area to be reported as overriding Shape's, got: {stdout}"
+    );
+}
+
+/// `deps` names which languages contributed the type edges in its answer,
+/// both in human output (`Type edges from: typescript`) and `--json`
+/// (`edge_languages`) — the "output states which languages contributed"
+/// acceptance requirement.
+#[test]
+fn test_deps_provenance_names_contributing_languages() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    std::fs::write(
+        dir.path().join("wallet.ts"),
+        "export class Base {}\nexport class Wallet extends Base {}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    let output = Command::new(&bin)
+        .args(["deps", "Wallet"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps Wallet");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Type edges from: typescript"),
+        "expected the provenance line naming typescript, got: {stdout}"
+    );
+
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "Wallet"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps --json Wallet");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+    assert_eq!(
+        value["edge_languages"],
+        serde_json::json!(["typescript"]),
+        "expected edge_languages to match the provenance line, got: {stdout}"
+    );
+}
+
+/// A class with no heritage clause produces zero `type_relations` rows.
+#[test]
+fn test_class_without_heritage_produces_no_type_relations() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    std::fs::write(
+        dir.path().join("plain.ts"),
+        "export class Plain {}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    let conn = index_db(dir.path());
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM type_relations tr
+             JOIN symbols s ON s.id = tr.sub_symbol_id
+             WHERE s.name = 'Plain'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "a class with no heritage clause must produce zero type_relations rows"
+    );
+}
+
+/// `helios init` reuses an existing `.helios/index.db` and skips re-parsing
+/// any file whose content hash is unchanged. That is right for a file that
+/// really hasn't changed since it was last indexed — but wrong for an index
+/// built before a feature (here: `type_relations`) existed, where "unchanged
+/// content" doesn't mean "nothing new to extract". Simulating that upgrade
+/// path — a stale `index_format_version` and an emptied `type_relations`,
+/// with the source file left untouched — pins that a second `init` must
+/// still re-parse and backfill the edges, not silently trust the hash.
+#[test]
+fn test_init_backfills_type_relations_after_format_upgrade() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    std::fs::write(
+        dir.path().join("wallet.ts"),
+        "export class Base {}\nexport class Wallet extends Base {}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    let edge_count = || -> i64 {
+        index_db(dir.path())
+            .query_row(
+                "SELECT COUNT(*) FROM type_relations tr
+                 JOIN symbols s ON s.id = tr.sub_symbol_id
+                 WHERE s.name = 'Wallet'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(edge_count(), 1, "the first init must record Wallet's edge");
+
+    // Simulate a pre-upgrade index: the edges a newer helios would have
+    // populated are gone, and the format stamp names an older version — both
+    // exactly what an index built before `type_relations` existed would look
+    // like once opened by a helios binary that knows about it.
+    {
+        let conn = index_db(dir.path());
+        conn.execute("DELETE FROM type_relations", [])
+            .expect("clearing type_relations");
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('index_format_version', '1')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .expect("resetting index_format_version");
+    }
+    assert_eq!(edge_count(), 0, "setup must have emptied type_relations");
+
+    // Re-run init with the source file untouched: its content hash still
+    // matches, so without the format-version check this would short-circuit
+    // and leave type_relations empty.
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init (second run)");
+    assert!(output.status.success(), "second helios init failed");
+
+    assert_eq!(
+        edge_count(),
+        1,
+        "an unchanged file must still be re-parsed to backfill type_relations \
+         when the index predates the current format"
+    );
+    assert_eq!(
+        metadata_value(dir.path(), "index_format_version").as_deref(),
+        Some("2"),
+        "a successful full index must stamp the current format version"
+    );
 }

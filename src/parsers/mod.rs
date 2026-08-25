@@ -5,7 +5,7 @@ pub mod rust_parser;
 pub mod swift;
 pub mod typescript;
 
-use crate::db::{ParsedImport, ParsedReference, ParsedSymbol};
+use crate::db::{ParsedImport, ParsedReference, ParsedSymbol, ParsedTypeRelation};
 use anyhow::Result;
 
 /// Result of parsing a single file
@@ -14,6 +14,8 @@ pub struct ParseResult {
     pub symbols: Vec<ParsedSymbol>,
     pub imports: Vec<ParsedImport>,
     pub references: Vec<ParsedReference>,
+    #[allow(dead_code)]
+    pub type_relations: Vec<ParsedTypeRelation>,
 }
 
 /// Trait that each language parser implements
