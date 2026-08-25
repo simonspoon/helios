@@ -1567,9 +1567,7 @@ impl Database {
              WHERE s.name = ?1
                AND (tr.super_name = ?2 OR tr.super_name LIKE '%.' || ?2)",
         )?;
-        let rows = stmt.query_map(params![name, scope], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
+        let rows = stmt.query_map(params![name, scope], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<Result<Vec<_>, _>>()
             .context("querying override implementations")
     }
@@ -1596,9 +1594,7 @@ impl Database {
              WHERE sub.name = ?2
                AND (tr.super_name = s.scope OR tr.super_name LIKE '%.' || s.scope)",
         )?;
-        let rows = stmt.query_map(params![name, scope], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
+        let rows = stmt.query_map(params![name, scope], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<Result<Vec<_>, _>>()
             .context("querying supertype members")
     }
@@ -2797,8 +2793,12 @@ mod tests {
     fn callees_of_reports_both_edges_of_a_direct_cycle() {
         let db = Database::open_in_memory().unwrap();
         let file = db.upsert_file("src/lib.rs", "hash", "rust").unwrap();
-        let a = db.insert_symbol(file, &test_fn_symbol("a", 1, None)).unwrap();
-        let b = db.insert_symbol(file, &test_fn_symbol("b", 10, None)).unwrap();
+        let a = db
+            .insert_symbol(file, &test_fn_symbol("a", 1, None))
+            .unwrap();
+        let b = db
+            .insert_symbol(file, &test_fn_symbol("b", 10, None))
+            .unwrap();
 
         db.insert_reference(b, file, 3, 0, false, Some(a), UsageKind::Read)
             .unwrap(); // a calls b

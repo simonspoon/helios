@@ -291,8 +291,7 @@ impl LanguageParser for RustParser {
                 .collect();
 
             if let Some(&(_, trait_node)) = captures.iter().find(|(n, _)| *n == "impl_trait") {
-                let Some(&(_, type_node)) = captures.iter().find(|(n, _)| *n == "impl_type")
-                else {
+                let Some(&(_, type_node)) = captures.iter().find(|(n, _)| *n == "impl_type") else {
                     continue;
                 };
                 let sub_name = base_type_name(src, type_node);

@@ -839,19 +839,23 @@ export class Registry {
         let result = parser.parse("class C implements I, J {}").unwrap();
         assert_eq!(
             relation_tuples(&result.type_relations),
-            vec![("C", Some(1), "I", "implements"), ("C", Some(1), "J", "implements")]
+            vec![
+                ("C", Some(1), "I", "implements"),
+                ("C", Some(1), "J", "implements")
+            ]
         );
     }
 
     #[test]
     fn test_class_extends_and_implements() {
         let parser = TypeScriptParser::new("typescript");
-        let result = parser
-            .parse("class C extends B implements I {}")
-            .unwrap();
+        let result = parser.parse("class C extends B implements I {}").unwrap();
         assert_eq!(
             relation_tuples(&result.type_relations),
-            vec![("C", Some(1), "B", "extends"), ("C", Some(1), "I", "implements")]
+            vec![
+                ("C", Some(1), "B", "extends"),
+                ("C", Some(1), "I", "implements")
+            ]
         );
     }
 
@@ -861,7 +865,10 @@ export class Registry {
         let result = parser.parse("interface I extends K, L {}").unwrap();
         assert_eq!(
             relation_tuples(&result.type_relations),
-            vec![("I", Some(1), "K", "extends"), ("I", Some(1), "L", "extends")]
+            vec![
+                ("I", Some(1), "K", "extends"),
+                ("I", Some(1), "L", "extends")
+            ]
         );
     }
 
@@ -1035,7 +1042,11 @@ class Wallet {
             .iter()
             .filter(|s| s.kind == "field")
             .collect();
-        assert_eq!(fields.len(), 2, "plain (non-property) parameters are not fields: {fields:?}");
+        assert_eq!(
+            fields.len(),
+            2,
+            "plain (non-property) parameters are not fields: {fields:?}"
+        );
 
         let balance = fields.iter().find(|s| s.name == "balance").unwrap();
         assert_eq!(balance.scope, Some("Wallet".to_string()));

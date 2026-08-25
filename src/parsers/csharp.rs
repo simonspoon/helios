@@ -891,9 +891,7 @@ namespace MyApp.Models {
     #[test]
     fn test_record_can_extend() {
         let parser = CSharpParser::new();
-        let result = parser
-            .parse("record R : BaseRecord, IBar { }")
-            .unwrap();
+        let result = parser.parse("record R : BaseRecord, IBar { }").unwrap();
         assert_eq!(
             relation_tuples(&result.type_relations),
             vec![
@@ -943,9 +941,7 @@ namespace MyApp.Models {
     #[test]
     fn test_bare_assignment_target_emits_no_reference() {
         let parser = CSharpParser::new();
-        let result = parser
-            .parse("class C { void f() { count = 1; } }")
-            .unwrap();
+        let result = parser.parse("class C { void f() { count = 1; } }").unwrap();
         assert!(
             !result.references.iter().any(|r| r.symbol_name == "count"),
             "a bare (unqualified) assignment target must not be captured: {:?}",
@@ -973,7 +969,9 @@ namespace MyApp.Models {
     #[test]
     fn test_multi_declarator_field_emits_one_symbol_per_name() {
         let parser = CSharpParser::new();
-        let result = parser.parse("class C {\n    public int a, b;\n}\n").unwrap();
+        let result = parser
+            .parse("class C {\n    public int a, b;\n}\n")
+            .unwrap();
         let a = result.symbols.iter().find(|s| s.name == "a").unwrap();
         let b = result.symbols.iter().find(|s| s.name == "b").unwrap();
         assert_eq!(a.kind, "field");

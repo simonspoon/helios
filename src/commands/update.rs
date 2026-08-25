@@ -112,7 +112,9 @@ pub fn run(json: bool, compact: bool, quiet: bool) -> Result<()> {
 /// stamp is missing or stale, warn rather than silently leaving whatever the
 /// old format left out (e.g. empty `type_relations`) looking complete.
 fn warn_index_stale(db: &Database) -> Result<()> {
-    if db.get_metadata(Database::INDEX_FORMAT_VERSION_KEY)?.as_deref()
+    if db
+        .get_metadata(Database::INDEX_FORMAT_VERSION_KEY)?
+        .as_deref()
         != Some(Database::CURRENT_INDEX_FORMAT_VERSION)
     {
         eprintln!(

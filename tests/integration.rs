@@ -471,18 +471,14 @@ fn test_deps_type_edge_external_cross_language_shows_declaring_file() {
         let conn = rusqlite::Connection::open(dir.path().join(".helios").join("index.db"))
             .expect("opening index.db");
         let sub_file_id: i64 = conn
-            .query_row(
-                "SELECT id FROM files WHERE path = 'sub.ts'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT id FROM files WHERE path = 'sub.ts'", [], |row| {
+                row.get(0)
+            })
             .expect("finding sub.ts file row");
         let sub_symbol_id: i64 = conn
-            .query_row(
-                "SELECT id FROM symbols WHERE name = 'Sub'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT id FROM symbols WHERE name = 'Sub'", [], |row| {
+                row.get(0)
+            })
             .expect("finding Sub symbol row");
         conn.execute(
             "INSERT INTO type_relations (sub_symbol_id, sub_name, super_symbol_id, super_name, kind, file_id)
@@ -748,9 +744,7 @@ fn test_csharp_indexing() {
     // A method (Greet) is "fn", a property (Name) is "property", and a plain
     // field (enum members, struct fields) is "field" -- pin the three-way split.
     assert!(
-        sym_info
-            .iter()
-            .any(|(n, k)| n == "Name" && k == "property"),
+        sym_info.iter().any(|(n, k)| n == "Name" && k == "property"),
         "Should find Name property with kind 'property', got: {:?}",
         sym_info
     );
@@ -4588,7 +4582,10 @@ fn test_deps_text_output_unchanged_for_read_reference() {
         .expect("deps helper");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    let expected_line = format!("  {}:{}:{} in format -> helper (reference)", path, line, col);
+    let expected_line = format!(
+        "  {}:{}:{} in format -> helper (reference)",
+        path, line, col
+    );
     assert!(
         stdout.lines().any(|l| l == expected_line),
         "expected the pre-existing reference line format exactly, got: {stdout}"
@@ -5936,7 +5933,9 @@ fn test_deps_reports_supertypes_and_implementors() {
         .expect("deps --json Base");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
-    let implementors = value["implementors"].as_array().expect("implementors array");
+    let implementors = value["implementors"]
+        .as_array()
+        .expect("implementors array");
     assert_eq!(
         implementors.len(),
         1,
@@ -5978,7 +5977,11 @@ fn test_deps_reports_supertypes_and_implementors() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
     let supertypes = value["supertypes"].as_array().expect("supertypes array");
-    assert_eq!(supertypes.len(), 2, "expected two supertypes, got: {stdout}");
+    assert_eq!(
+        supertypes.len(),
+        2,
+        "expected two supertypes, got: {stdout}"
+    );
     let kinds: std::collections::BTreeSet<(String, String)> = supertypes
         .iter()
         .map(|e| {
@@ -6249,11 +6252,7 @@ fn test_class_without_heritage_produces_no_type_relations() {
     let dir = tempfile::tempdir().expect("creating temp dir");
     let bin = helios_bin();
 
-    std::fs::write(
-        dir.path().join("plain.ts"),
-        "export class Plain {}\n",
-    )
-    .unwrap();
+    std::fs::write(dir.path().join("plain.ts"), "export class Plain {}\n").unwrap();
 
     let output = Command::new(&bin)
         .arg("init")
@@ -6468,7 +6467,10 @@ fn test_deps_depth1_symbol_json_has_no_new_keys() {
         .expect("helios init");
 
     // Depth defaults to 1 when omitted, so both spellings must agree.
-    for args in [vec!["--json", "deps", "a"], vec!["--json", "deps", "a", "--depth", "1"]] {
+    for args in [
+        vec!["--json", "deps", "a"],
+        vec!["--json", "deps", "a", "--depth", "1"],
+    ] {
         let output = Command::new(&bin)
             .args(&args)
             .current_dir(dir.path())
@@ -6477,8 +6479,12 @@ fn test_deps_depth1_symbol_json_has_no_new_keys() {
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
-        let keys: std::collections::BTreeSet<&str> =
-            value.as_object().unwrap().keys().map(String::as_str).collect();
+        let keys: std::collections::BTreeSet<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         let expected: std::collections::BTreeSet<&str> = [
             "target",
             "definitions",
@@ -6669,7 +6675,10 @@ fn test_deps_call_graph_cycles_terminate() {
         .current_dir(dir.path())
         .output()
         .expect("deps ping --depth 5");
-    assert!(output.status.success(), "must terminate and exit successfully");
+    assert!(
+        output.status.success(),
+        "must terminate and exit successfully"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
     let calls = value["calls"].as_array().expect("calls array");
@@ -6688,7 +6697,10 @@ fn test_deps_call_graph_cycles_terminate() {
         .current_dir(dir.path())
         .output()
         .expect("deps loopy --depth 5");
-    assert!(output.status.success(), "must terminate and exit successfully");
+    assert!(
+        output.status.success(),
+        "must terminate and exit successfully"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
     assert_eq!(
@@ -6704,7 +6716,10 @@ fn test_deps_call_graph_cycles_terminate() {
         .current_dir(dir.path())
         .output()
         .expect("deps ping --to loopy");
-    assert!(output.status.success(), "must terminate and exit successfully");
+    assert!(
+        output.status.success(),
+        "must terminate and exit successfully"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
     assert_eq!(value["found"], serde_json::json!(false), "got: {stdout}");
@@ -6781,7 +6796,8 @@ fn test_deps_to_distinguishes_truncated_from_no_path() {
         .expect("deps a --to unrelated (human)");
     let no_path_message = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
-        no_path_message.contains("was searched") && no_path_message.contains("no static call path exists"),
+        no_path_message.contains("was searched")
+            && no_path_message.contains("no static call path exists"),
         "got: {no_path_message}"
     );
     assert!(
@@ -6874,11 +6890,15 @@ fn test_deps_follow_impls_marks_inferred_edges() {
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
     let calls = value["calls"].as_array().expect("calls array");
     assert!(
-        calls.iter().all(|c| c["inferred"] == serde_json::json!(false)),
+        calls
+            .iter()
+            .all(|c| c["inferred"] == serde_json::json!(false)),
         "no edge should be marked inferred without --follow-impls, got: {stdout}"
     );
     assert!(
-        !calls.iter().any(|c| c["scope"] == serde_json::json!("Circle")),
+        !calls
+            .iter()
+            .any(|c| c["scope"] == serde_json::json!("Circle")),
         "Circle.area must not be reached without --follow-impls, got: {stdout}"
     );
 
@@ -6886,7 +6906,14 @@ fn test_deps_follow_impls_marks_inferred_edges() {
     // relation kind ("extends") as edge_kind.
     let output = Command::new(&bin)
         .args([
-            "--json", "deps", "area", "--scope", "Shape", "--depth", "2", "--follow-impls",
+            "--json",
+            "deps",
+            "area",
+            "--scope",
+            "Shape",
+            "--depth",
+            "2",
+            "--follow-impls",
         ])
         .current_dir(dir.path())
         .output()
@@ -6897,13 +6924,21 @@ fn test_deps_follow_impls_marks_inferred_edges() {
     let circle_area = calls
         .iter()
         .find(|c| c["scope"] == serde_json::json!("Circle"))
-        .unwrap_or_else(|| panic!("expected Circle.area reached via --follow-impls, got: {stdout}"));
+        .unwrap_or_else(|| {
+            panic!("expected Circle.area reached via --follow-impls, got: {stdout}")
+        });
     assert_eq!(circle_area["inferred"], serde_json::json!(true));
     assert_eq!(circle_area["edge_kind"], serde_json::json!("extends"));
 
     let output = Command::new(&bin)
         .args([
-            "deps", "area", "--scope", "Shape", "--depth", "2", "--follow-impls",
+            "deps",
+            "area",
+            "--scope",
+            "Shape",
+            "--depth",
+            "2",
+            "--follow-impls",
         ])
         .current_dir(dir.path())
         .output()
@@ -6955,7 +6990,11 @@ fn write_dispatch_fixture(dir: &std::path::Path) {
 /// anywhere in this fixture's graph.
 fn seed_run_calls_shape_foo(conn: &rusqlite::Connection) {
     let file_id: i64 = conn
-        .query_row("SELECT id FROM files WHERE path = 'shapes3.ts'", [], |row| row.get(0))
+        .query_row(
+            "SELECT id FROM files WHERE path = 'shapes3.ts'",
+            [],
+            |row| row.get(0),
+        )
         .expect("finding shapes3.ts file row");
     let shape_foo_id: i64 = conn
         .query_row(
@@ -6965,7 +7004,9 @@ fn seed_run_calls_shape_foo(conn: &rusqlite::Connection) {
         )
         .expect("finding Shape.foo symbol row");
     let run_id: i64 = conn
-        .query_row("SELECT id FROM symbols WHERE name = 'run'", [], |row| row.get(0))
+        .query_row("SELECT id FROM symbols WHERE name = 'run'", [], |row| {
+            row.get(0)
+        })
         .expect("finding run symbol row");
     conn.execute(
         "INSERT INTO references_ (symbol_id, file_id, line, column, qualified, container_symbol_id, usage_kind)
@@ -6999,7 +7040,16 @@ fn test_deps_follow_impls_callers_from_base_excludes_sibling_overrides() {
     }
 
     let output = Command::new(&bin)
-        .args(["--json", "deps", "foo", "--scope", "Shape", "--depth", "2", "--follow-impls"])
+        .args([
+            "--json",
+            "deps",
+            "foo",
+            "--scope",
+            "Shape",
+            "--depth",
+            "2",
+            "--follow-impls",
+        ])
         .current_dir(dir.path())
         .output()
         .expect("deps foo --scope Shape --depth 2 --follow-impls");
@@ -7009,25 +7059,43 @@ fn test_deps_follow_impls_callers_from_base_excludes_sibling_overrides() {
     let callers = value["callers"].as_array().expect("callers array");
 
     assert!(
-        !callers.iter().any(|c| c["scope"] == serde_json::json!("Circle")),
+        !callers
+            .iter()
+            .any(|c| c["scope"] == serde_json::json!("Circle")),
         "regression: Circle.foo (a sibling override) must not be reported as a caller of the base member, got: {stdout}"
     );
     assert!(
-        !callers.iter().any(|c| c["scope"] == serde_json::json!("Square")),
+        !callers
+            .iter()
+            .any(|c| c["scope"] == serde_json::json!("Square")),
         "regression: Square.foo (a sibling override) must not be reported as a caller of the base member, got: {stdout}"
     );
     assert!(
-        callers.iter().all(|c| c["inferred"] == serde_json::json!(false)),
+        callers
+            .iter()
+            .all(|c| c["inferred"] == serde_json::json!(false)),
         "the base member has no supertype of its own, so --follow-impls must add nothing here, got: {stdout}"
     );
-    let names: Vec<&str> = callers.iter().map(|c| c["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = callers
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
     assert_eq!(
-        names, vec!["run"],
+        names,
+        vec!["run"],
         "the only caller present must be the one genuine edge, got: {stdout}"
     );
 
     let output = Command::new(&bin)
-        .args(["deps", "foo", "--scope", "Shape", "--depth", "2", "--follow-impls"])
+        .args([
+            "deps",
+            "foo",
+            "--scope",
+            "Shape",
+            "--depth",
+            "2",
+            "--follow-impls",
+        ])
         .current_dir(dir.path())
         .output()
         .expect("deps foo --scope Shape --depth 2 --follow-impls (human)");
@@ -7078,7 +7146,16 @@ fn test_deps_follow_impls_callers_bridges_override_to_base_caller() {
     }
 
     let output = Command::new(&bin)
-        .args(["--json", "deps", "foo", "--scope", "Circle", "--depth", "2", "--follow-impls"])
+        .args([
+            "--json",
+            "deps",
+            "foo",
+            "--scope",
+            "Circle",
+            "--depth",
+            "2",
+            "--follow-impls",
+        ])
         .current_dir(dir.path())
         .output()
         .expect("deps foo --scope Circle --depth 2 --follow-impls");
@@ -7090,7 +7167,9 @@ fn test_deps_follow_impls_callers_bridges_override_to_base_caller() {
     let bridge = callers
         .iter()
         .find(|c| c["name"] == "foo" && c["scope"] == serde_json::json!("Shape"))
-        .unwrap_or_else(|| panic!("expected Shape.foo reached as an inferred bridge, got: {stdout}"));
+        .unwrap_or_else(|| {
+            panic!("expected Shape.foo reached as an inferred bridge, got: {stdout}")
+        });
     assert_eq!(bridge["inferred"], serde_json::json!(true), "got: {stdout}");
     assert_eq!(bridge["depth"], serde_json::json!(1), "got: {stdout}");
 
@@ -7110,7 +7189,15 @@ fn test_deps_follow_impls_callers_bridges_override_to_base_caller() {
     );
 
     let output = Command::new(&bin)
-        .args(["deps", "foo", "--scope", "Circle", "--depth", "2", "--follow-impls"])
+        .args([
+            "deps",
+            "foo",
+            "--scope",
+            "Circle",
+            "--depth",
+            "2",
+            "--follow-impls",
+        ])
         .current_dir(dir.path())
         .output()
         .expect("deps foo --scope Circle --depth 2 --follow-impls (human)");

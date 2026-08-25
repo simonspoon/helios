@@ -214,9 +214,7 @@ fn call_steps(
     };
     let mut steps: Vec<CallStep> = edges.into_iter().map(CallStep::from).collect();
 
-    if follow_impls
-        && let Some(scope) = scope
-    {
+    if follow_impls && let Some(scope) = scope {
         let via_supertype = matches!(direction, CallDirection::Callers);
         let inferred_targets = if via_supertype {
             db.supertype_member_ids(name, scope)?
@@ -371,7 +369,9 @@ fn inferred_label(step: &CallStep) -> Option<String> {
         let base = qualified_name(&step.name, step.scope.as_deref());
         Some(format!("[inferred: callers of {base} may dispatch here]"))
     } else {
-        step.edge_kind.as_deref().map(|kind| format!("[inferred: {kind}]"))
+        step.edge_kind
+            .as_deref()
+            .map(|kind| format!("[inferred: {kind}]"))
     }
 }
 
@@ -485,12 +485,21 @@ fn run_to_query(
     // reporting as found rather than walking straight past it.
     let trivial = from_defs.iter().find(|d| to_ids.contains(&d.id));
 
-    let walk = bfs_call_graph(db, from_defs, from_name, depth, follow_impls, CallDirection::Callees)?;
-    let by_id: HashMap<i64, &CallHop> =
-        walk.hops.iter().map(|h| (h.step.symbol_id, h)).collect();
+    let walk = bfs_call_graph(
+        db,
+        from_defs,
+        from_name,
+        depth,
+        follow_impls,
+        CallDirection::Callees,
+    )?;
+    let by_id: HashMap<i64, &CallHop> = walk.hops.iter().map(|h| (h.step.symbol_id, h)).collect();
     // Hops are appended in BFS (shortest-path-first) order, so the first
     // match by iteration order is already the shortest.
-    let found_hop = walk.hops.iter().find(|h| to_ids.contains(&h.step.symbol_id));
+    let found_hop = walk
+        .hops
+        .iter()
+        .find(|h| to_ids.contains(&h.step.symbol_id));
 
     let path: Option<Vec<&CallHop>> = if trivial.is_some() {
         Some(Vec::new())
@@ -545,13 +554,21 @@ fn run_to_query(
             depth
         );
         if let Some(def) = start_def {
-            println!("  {}:{} {}", def.path, def.line, qualified_name(from_name, def.scope.as_deref()));
+            println!(
+                "  {}:{} {}",
+                def.path,
+                def.line,
+                qualified_name(from_name, def.scope.as_deref())
+            );
         }
         for hop in chain {
             println!("  {}", format_path_hop(hop));
         }
     } else if walk.truncated {
-        println!("No path from {} to {} within depth {}.", from_target, to_target, depth);
+        println!(
+            "No path from {} to {} within depth {}.",
+            from_target, to_target, depth
+        );
         println!(
             "The search was cut off at depth {} with {} symbols still unexplored — a longer path may exist. Re-run with a larger --depth.",
             depth, walk.unexplored
@@ -629,7 +646,17 @@ pub fn run(
     // output shape (see `run_to_query`'s doc comment and the CLI-surface
     // spec), so it short-circuits everything below.
     if let Some(to_target) = to {
-        return run_to_query(&db, target, target_name, &defs, to_target, depth, follow_impls, json, compact);
+        return run_to_query(
+            &db,
+            target,
+            target_name,
+            &defs,
+            to_target,
+            depth,
+            follow_impls,
+            json,
+            compact,
+        );
     }
 
     // Type edges (supertypes/implementors/overrides) — symbol mode only, a
@@ -667,8 +694,22 @@ pub fn run(
     // human and JSON) is untouched: neither branch below even looks at
     // these unless `depth > 1`.
     let (calls_walk, callers_walk) = if !is_file && depth > 1 {
-        let calls = bfs_call_graph(&db, &defs, target_name, depth, follow_impls, CallDirection::Callees)?;
-        let callers = bfs_call_graph(&db, &defs, target_name, depth, follow_impls, CallDirection::Callers)?;
+        let calls = bfs_call_graph(
+            &db,
+            &defs,
+            target_name,
+            depth,
+            follow_impls,
+            CallDirection::Callees,
+        )?;
+        let callers = bfs_call_graph(
+            &db,
+            &defs,
+            target_name,
+            depth,
+            follow_impls,
+            CallDirection::Callers,
+        )?;
         (Some(calls), Some(callers))
     } else {
         (None, None)
@@ -751,12 +792,18 @@ pub fn run(
                     "calls".to_string(),
                     serde_json::Value::Array(calls.hops.iter().map(call_hop_json).collect()),
                 );
-                obj.insert("calls_truncated".to_string(), serde_json::json!(calls.truncated));
+                obj.insert(
+                    "calls_truncated".to_string(),
+                    serde_json::json!(calls.truncated),
+                );
                 obj.insert(
                     "callers".to_string(),
                     serde_json::Value::Array(callers.hops.iter().map(call_hop_json).collect()),
                 );
-                obj.insert("callers_truncated".to_string(), serde_json::json!(callers.truncated));
+                obj.insert(
+                    "callers_truncated".to_string(),
+                    serde_json::json!(callers.truncated),
+                );
             }
 
             let formatted = if compact {

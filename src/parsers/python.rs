@@ -331,12 +331,7 @@ impl LanguageParser for PythonParser {
             let captures: Vec<_> = m
                 .captures
                 .iter()
-                .map(|c| {
-                    (
-                        attr_assign_query.capture_names()[c.index as usize],
-                        c.node,
-                    )
-                })
+                .map(|c| (attr_assign_query.capture_names()[c.index as usize], c.node))
                 .collect();
             let Some(&(_, recv_node)) = captures.iter().find(|(n, _)| *n == "recv") else {
                 continue;
@@ -344,8 +339,7 @@ impl LanguageParser for PythonParser {
             let Some(&(_, name_node)) = captures.iter().find(|(n, _)| *n == "field_name") else {
                 continue;
             };
-            let Some(&(_, assign_node)) = captures.iter().find(|(n, _)| *n == "attr_assign")
-            else {
+            let Some(&(_, assign_node)) = captures.iter().find(|(n, _)| *n == "attr_assign") else {
                 continue;
             };
 
@@ -472,8 +466,8 @@ impl LanguageParser for PythonParser {
                     // calls, which the grammar has no separate node for),
                     // which read the callee/constructed type.
                     usage_kind: UsageKind::Read,
-                // Calls, not member writes.
-                member: false,
+                    // Calls, not member writes.
+                    member: false,
                 });
             }
         }
@@ -723,7 +717,10 @@ class Service:
         let result = parser.parse("class C(Base, Mixin):\n    pass\n").unwrap();
         assert_eq!(
             relation_tuples(&result.type_relations),
-            vec![("C", Some(1), "Base", "extends"), ("C", Some(1), "Mixin", "extends")]
+            vec![
+                ("C", Some(1), "Base", "extends"),
+                ("C", Some(1), "Mixin", "extends")
+            ]
         );
     }
 

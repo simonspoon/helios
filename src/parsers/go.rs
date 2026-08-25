@@ -229,8 +229,8 @@ impl LanguageParser for GoParser {
                     qualified: ref_query.capture_names()[c.index as usize] == "method_call",
                     // These captures are calls, which read the callee.
                     usage_kind: UsageKind::Read,
-                // Calls, not member writes.
-                member: false,
+                    // Calls, not member writes.
+                    member: false,
                 });
             }
         }
@@ -589,8 +589,16 @@ func Run() int {
         let result = parser
             .parse("package main\nfunc f() { x.a, y.b = 1, 2 }")
             .unwrap();
-        let a = result.references.iter().find(|r| r.symbol_name == "a").unwrap();
-        let b = result.references.iter().find(|r| r.symbol_name == "b").unwrap();
+        let a = result
+            .references
+            .iter()
+            .find(|r| r.symbol_name == "a")
+            .unwrap();
+        let b = result
+            .references
+            .iter()
+            .find(|r| r.symbol_name == "b")
+            .unwrap();
         assert_eq!(a.usage_kind, UsageKind::Write);
         assert_eq!(b.usage_kind, UsageKind::Write);
     }
@@ -620,7 +628,11 @@ type Server struct {
 }
 "#;
         let result = parser.parse(source).unwrap();
-        let fields: Vec<_> = result.symbols.iter().filter(|s| s.kind == "field").collect();
+        let fields: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == "field")
+            .collect();
         assert_eq!(fields.len(), 2, "{:?}", fields);
 
         let port = fields.iter().find(|s| s.name == "Port").unwrap();
@@ -645,7 +657,11 @@ type Point struct {
 }
 "#;
         let result = parser.parse(source).unwrap();
-        let fields: Vec<_> = result.symbols.iter().filter(|s| s.kind == "field").collect();
+        let fields: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == "field")
+            .collect();
         let names: Vec<_> = fields.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"a"));
         assert!(names.contains(&"b"));

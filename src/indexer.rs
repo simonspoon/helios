@@ -263,7 +263,9 @@ pub fn index_full(
     // whenever the stamp is absent or stale. Stamped again below only once
     // the whole run has completed, so an interrupted run is retried next time
     // rather than marked current.
-    let force_reparse = db.get_metadata(Database::INDEX_FORMAT_VERSION_KEY)?.as_deref()
+    let force_reparse = db
+        .get_metadata(Database::INDEX_FORMAT_VERSION_KEY)?
+        .as_deref()
         != Some(Database::CURRENT_INDEX_FORMAT_VERSION);
 
     // Files this walk parsed, for the reference pass below. Only those: a file
