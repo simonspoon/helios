@@ -523,13 +523,49 @@ helios summary src/parsers/
 
 Output is markdown by default, listing files and their exported symbols grouped by directory.
 
-### `helios diff`
+### `helios diff [--impact]`
 
 Show symbol changes (added, removed, modified) since the last indexed commit. Useful for surfacing what a working-tree change actually altered.
 
 ```bash
 helios diff
 ```
+
+- `--impact` — Also report who depends on the changed symbols: a single
+  batched query joins the removed/modified symbol set to their callers (the
+  index has no ids for `added` symbols, so they can't have recorded
+  dependents), then rolls the result up by dependent file and symbol — a
+  dependent touched by several changed symbols is reported once with a list
+  of triggers, not once per trigger. Each dependent's severity is the worst
+  of its triggers (`removed` > `signature` > `body`), and the report is
+  ordered worst-first so a reviewer reads breakage before moved-line noise.
+
+  ```bash
+  helios diff --impact
+  # - fn gone (src/lib.ts:1)
+  # ~ fn changed (src/lib.ts:5 -> 1) [signature]
+  #
+  # Impact: 2 dependents across 1 file
+  #
+  # src/caller.ts
+  #   fn callerOne (3) <- [removed] fn gone, [signature] fn changed
+  ```
+
+  Because an under-reporting impact report is worse than none, it also
+  surfaces what it *couldn't* attribute rather than silently dropping it:
+  - **Unattributed usages** — real references to a changed symbol whose
+    usage site has no recorded containing symbol (top-level/module-scope
+    code, or a legacy row), so they're invisible to the dependents rollup
+    above.
+  - **Unresolved imports** — imports the resolver couldn't tie to a file,
+    filtered to those whose final path segment names a changed file's stem
+    (a plain package import like `lodash` is deliberately left unresolved
+    and would just be noise; one that names a changed file's stem might hide
+    a real dependent the index couldn't confirm — though an aliased or
+    path-mapped import that doesn't literally name that stem is still
+    invisible to this check).
+  - **Added symbols without dependents** — symbols new since the last index
+    can't have recorded dependents; listed explicitly rather than omitted.
 
 ### `helios status`
 

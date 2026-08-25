@@ -292,6 +292,35 @@ pub struct CallEdge {
     pub call_column: i64,
 }
 
+/// One dependent (caller) of a changed symbol, attributed to *which* changed
+/// symbol it reaches — `callers_of` collapses to one row per (target,
+/// caller) pair without saying which target triggered it, but `diff
+/// --impact` needs that attribution to roll a caller touched by several
+/// changed symbols up into one dependent entry carrying every trigger. Same
+/// honesty caveats as `callers_of`: a call site with no container is
+/// invisible here too.
+#[derive(Debug, Clone)]
+pub struct CallerEdge {
+    /// Which of the queried (changed) symbols this row's caller reaches.
+    pub target_symbol_id: i64,
+    pub caller_id: i64,
+    pub caller_name: String,
+    pub caller_kind: String,
+    pub caller_path: String,
+    pub caller_line: i64,
+}
+
+/// A reference to a changed symbol whose usage site has no recorded
+/// container (`container_symbol_id IS NULL`), so it is invisible to
+/// `callers_of`/`callers_of_with_targets`'s inner join and would otherwise
+/// vanish from a `diff --impact` report instead of being reported honestly.
+#[derive(Debug, Clone)]
+pub struct UnattributedUsage {
+    pub file: String,
+    pub line: i64,
+    pub symbol_name: String,
+}
+
 impl Database {
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -1200,6 +1229,69 @@ impl Database {
         })?;
         rows.collect::<Result<Vec<_>, _>>()
             .context("querying callers")
+    }
+
+    /// Same edges as `callers_of`, plus which of the queried symbols each
+    /// row's caller reaches — `diff --impact` batches every removed/modified
+    /// symbol into one call here rather than one `callers_of` call per
+    /// symbol, then groups the rows by caller itself.
+    pub fn callers_of_with_targets(&self, symbol_ids: &[i64]) -> Result<Vec<CallerEdge>> {
+        if symbol_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT DISTINCT r.symbol_id, c.id, c.name, c.kind, cf.path, c.line
+             FROM references_ r
+             JOIN symbols s ON s.id = r.symbol_id
+             JOIN symbols c ON c.id = r.container_symbol_id
+             JOIN files cf ON cf.id = c.file_id
+             WHERE r.symbol_id IN ({})
+               AND {REFERENCE_OWNERSHIP_FILTER}
+             ORDER BY cf.path, c.line",
+            placeholders(symbol_ids.len())
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(symbol_ids), |row| {
+            Ok(CallerEdge {
+                target_symbol_id: row.get(0)?,
+                caller_id: row.get(1)?,
+                caller_name: row.get(2)?,
+                caller_kind: row.get(3)?,
+                caller_path: row.get(4)?,
+                caller_line: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("querying callers with targets")
+    }
+
+    /// References to the given symbols whose usage site has no recorded
+    /// container — the rows `callers_of`/`callers_of_with_targets` drop via
+    /// their inner join on `container_symbol_id`, surfaced here instead so
+    /// `diff --impact` can report them rather than silently under-counting
+    /// dependents.
+    pub fn unattributed_usages(&self, symbol_ids: &[i64]) -> Result<Vec<UnattributedUsage>> {
+        if symbol_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT DISTINCT f.path, r.line, s.name
+             FROM references_ r
+             JOIN symbols s ON s.id = r.symbol_id
+             JOIN files f ON f.id = r.file_id
+             WHERE r.symbol_id IN ({})
+               AND r.container_symbol_id IS NULL
+             ORDER BY f.path, r.line",
+            placeholders(symbol_ids.len())
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(symbol_ids), |row| {
+            Ok(UnattributedUsage {
+                file: row.get(0)?,
+                line: row.get(1)?,
+                symbol_name: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("querying unattributed usages")
     }
 
     // --- Reference operations ---
@@ -2719,6 +2811,80 @@ mod tests {
             .map(|e| e.symbol_id)
             .collect();
         assert_eq!(b_callees, vec![a]);
+    }
+
+    /// `callers_of_with_targets` is `callers_of` plus which target symbol
+    /// each row's caller reaches, batched over several targets in one query
+    /// — `diff --impact`'s join from the changed symbol set to their
+    /// dependents.
+    #[test]
+    fn callers_of_with_targets_attributes_each_row_to_its_target() {
+        let db = Database::open_in_memory().unwrap();
+        let file = db.upsert_file("src/lib.rs", "hash", "rust").unwrap();
+        let a = db
+            .insert_symbol(file, &test_fn_symbol("a", 1, None))
+            .unwrap();
+        let b = db
+            .insert_symbol(file, &test_fn_symbol("b", 5, None))
+            .unwrap();
+        let caller = db
+            .insert_symbol(file, &test_fn_symbol("run", 10, None))
+            .unwrap();
+
+        db.insert_reference(a, file, 12, 0, false, Some(caller), UsageKind::Read)
+            .unwrap();
+        db.insert_reference(b, file, 13, 0, false, Some(caller), UsageKind::Read)
+            .unwrap();
+
+        let edges = db.callers_of_with_targets(&[a, b]).unwrap();
+        assert_eq!(edges.len(), 2);
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.target_symbol_id == a && e.caller_id == caller)
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.target_symbol_id == b && e.caller_id == caller)
+        );
+    }
+
+    /// `callers_of`'s inner join on `container_symbol_id` drops a reference
+    /// whose usage site has no container (module-scope code, or a legacy
+    /// row); `unattributed_usages` is how `diff --impact` recovers those
+    /// rows instead of letting them silently vanish from the dependents
+    /// rollup.
+    #[test]
+    fn unattributed_usages_reports_container_less_references() {
+        let db = Database::open_in_memory().unwrap();
+        let file = db.upsert_file("src/lib.rs", "hash", "rust").unwrap();
+        let target = db
+            .insert_symbol(file, &test_fn_symbol("gone", 1, None))
+            .unwrap();
+        let caller = db
+            .insert_symbol(file, &test_fn_symbol("run", 10, None))
+            .unwrap();
+
+        // A normal, attributed call: visible to callers_of.
+        db.insert_reference(target, file, 12, 4, false, Some(caller), UsageKind::Read)
+            .unwrap();
+        // A module-scope usage: no container, invisible to callers_of.
+        db.insert_reference(target, file, 30, 0, false, None, UsageKind::Read)
+            .unwrap();
+
+        let callers = db.callers_of(&[target]).unwrap();
+        assert_eq!(
+            callers.len(),
+            1,
+            "the container-less row must not appear here"
+        );
+
+        let unattributed = db.unattributed_usages(&[target]).unwrap();
+        assert_eq!(unattributed.len(), 1);
+        assert_eq!(unattributed[0].file, "src/lib.rs");
+        assert_eq!(unattributed[0].line, 30);
+        assert_eq!(unattributed[0].symbol_name, "gone");
     }
 
     /// `override_impl_ids` finds the same subtype member `overrides_of` finds

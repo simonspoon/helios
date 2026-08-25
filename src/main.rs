@@ -139,7 +139,11 @@ enum Command {
         path: Option<String>,
     },
     /// Show symbol changes since last index
-    Diff,
+    Diff {
+        /// Also report who depends on the changed symbols
+        #[arg(long)]
+        impact: bool,
+    },
     /// Show index status and staleness info
     Status,
     /// List indexed files with symbol/import counts
@@ -193,7 +197,7 @@ fn main() {
             *offset,
         ),
         Command::Files { language } => commands::files::run(language.as_deref(), cli.json, compact),
-        Command::Diff => commands::diff::run(cli.json, compact),
+        Command::Diff { impact } => commands::diff::run(*impact, cli.json, compact),
         Command::Deps {
             target,
             scope,

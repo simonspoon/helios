@@ -2326,6 +2326,373 @@ fn helper() -> i32 {
     );
 }
 
+// --- diff --impact tests ---
+
+/// Set up a small git-indexed TypeScript project for `diff --impact` tests:
+/// `src/lib.ts` defines `gone`/`changed`/`moved`, and `src/caller.ts` imports
+/// all three, calling `gone` and `changed` from one exported function
+/// (`callerOne`, so it is touched by two changed symbols) and `moved` from
+/// another (`callerTwo`, touched by one) — enough to exercise both the
+/// dedup/rollup and the severity ranking in one project.
+fn setup_impact_project() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git init");
+    Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git config email");
+    Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git config name");
+
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.ts"),
+        r#"export function gone(): number {
+  return 1;
+}
+
+export function changed(x: number): number {
+  return x;
+}
+
+export function moved(): number {
+  return 1;
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/caller.ts"),
+        r#"import { gone, changed, moved } from './lib';
+
+export function callerOne(): number {
+  return gone() + changed(1);
+}
+
+export function callerTwo(): number {
+  return moved();
+}
+"#,
+    )
+    .unwrap();
+
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(dir.path())
+        .output()
+        .expect("git add");
+    Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git commit");
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(
+        output.status.success(),
+        "helios init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    (dir, bin)
+}
+
+/// `gone` removed, `changed`'s return type edited (signature), `moved`'s
+/// body-only edited — applied to the project `setup_impact_project` indexed,
+/// so its callers (`callerOne`, `callerTwo`) are the pre-existing call graph
+/// `--impact` joins against.
+fn apply_impact_changes(dir: &std::path::Path) {
+    std::fs::write(
+        dir.join("src/lib.ts"),
+        r#"export function changed(x: number): string {
+  return String(x);
+}
+
+export function moved(): number {
+  return 2;
+}
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_diff_impact_rolls_up_dependents_and_severities() {
+    let (dir, bin) = setup_impact_project();
+    apply_impact_changes(dir.path());
+
+    // Seed an unresolved import naming the changed file's stem ("lib"), the
+    // way `all_imports_with_source` would see a real one that failed to
+    // resolve — done directly against the DB since driving the resolver to
+    // fail on a specific path (rather than a legitimate unresolved package
+    // import) isn't the point of this test.
+    {
+        let conn = rusqlite::Connection::open(dir.path().join(".helios").join("index.db"))
+            .expect("opening index.db");
+        conn.execute(
+            "INSERT INTO imports (source_file_id, import_path, resolved_file_id)
+             SELECT id, '../missing/lib', NULL FROM files WHERE path = 'src/caller.ts'",
+            [],
+        )
+        .expect("seeding unresolved import");
+    }
+
+    let output = Command::new(&bin)
+        .args(["--json", "diff", "--impact"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios --json diff --impact");
+    assert!(
+        output.status.success(),
+        "diff --impact failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parsing JSON output");
+
+    let impact = &json["impact"];
+    assert_eq!(impact["dependent_count"], 2, "impact: {}", impact);
+    assert_eq!(impact["file_count"], 1, "impact: {}", impact);
+
+    let files = impact["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["file"], "src/caller.ts");
+    let dependents = files[0]["dependents"].as_array().unwrap();
+    assert_eq!(
+        dependents.len(),
+        2,
+        "callerOne and callerTwo should each appear exactly once: {:?}",
+        dependents
+    );
+
+    // Dedup/rollup: callerOne calls both gone (removed) and changed
+    // (signature) but appears once, carrying both triggers.
+    let caller_one = dependents
+        .iter()
+        .find(|d| d["name"] == "callerOne")
+        .expect("callerOne in dependents");
+    assert_eq!(caller_one["severity"], "removed");
+    let triggers = caller_one["triggers"].as_array().unwrap();
+    assert_eq!(
+        triggers.len(),
+        2,
+        "callerOne should list both gone and changed as triggers: {:?}",
+        triggers
+    );
+    assert!(
+        triggers
+            .iter()
+            .any(|t| t["name"] == "gone" && t["change"] == "removed")
+    );
+    assert!(
+        triggers
+            .iter()
+            .any(|t| t["name"] == "changed" && t["change"] == "signature")
+    );
+
+    // A body-only change is reported distinctly from a signature/removed one.
+    let caller_two = dependents
+        .iter()
+        .find(|d| d["name"] == "callerTwo")
+        .expect("callerTwo in dependents");
+    assert_eq!(caller_two["severity"], "body");
+    let triggers_two = caller_two["triggers"].as_array().unwrap();
+    assert_eq!(triggers_two.len(), 1);
+    assert_eq!(triggers_two[0]["name"], "moved");
+    assert_eq!(triggers_two[0]["change"], "body");
+
+    // Ordered worst severity first.
+    assert_eq!(dependents[0]["name"], "callerOne");
+    assert_eq!(dependents[1]["name"], "callerTwo");
+
+    // Honesty gate: the unresolved import naming lib's stem is surfaced.
+    let unresolved = impact["unresolved_imports"].as_array().unwrap();
+    assert!(
+        unresolved
+            .iter()
+            .any(|u| u["file"] == "src/caller.ts" && u["import_path"] == "../missing/lib"),
+        "expected unresolved import surfaced: {:?}",
+        unresolved
+    );
+
+    // No added symbols in this diff.
+    assert!(
+        impact["added_symbols_without_dependents"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // Text output carries the same severities and the honesty sections.
+    let text_output = Command::new(&bin)
+        .args(["diff", "--impact"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios diff --impact");
+    assert!(text_output.status.success());
+    let stdout = String::from_utf8_lossy(&text_output.stdout);
+    assert!(
+        stdout.contains("callerOne") && stdout.contains("[removed] fn gone"),
+        "expected callerOne's removed trigger in text output: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Unresolved imports"),
+        "expected unresolved imports section: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_diff_without_impact_flag_omits_impact_key() {
+    let (dir, bin) = setup_impact_project();
+    apply_impact_changes(dir.path());
+
+    let output = Command::new(&bin)
+        .args(["--json", "diff"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios --json diff");
+    assert!(output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parsing JSON output");
+    assert!(
+        json.get("impact").is_none(),
+        "expected no impact key without --impact: {}",
+        json
+    );
+
+    let text_output = Command::new(&bin)
+        .arg("diff")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios diff");
+    assert!(text_output.status.success());
+    let stdout = String::from_utf8_lossy(&text_output.stdout);
+    assert!(
+        !stdout.contains("Impact:"),
+        "expected no impact section without --impact: {}",
+        stdout
+    );
+}
+
+/// Set up a project for the "no symbol changes but an outstanding honesty
+/// gate finding" regression: `src/lib.ts` (one function, `moved`) and
+/// `src/extra.ts` are committed and indexed together, with `src/extra.ts`
+/// carrying a bare-specifier import (`@app/lib`) the resolver genuinely
+/// cannot map (`resolve_ts` only resolves `./`-relative specifiers) — and
+/// whose final segment names `lib`'s stem.
+fn setup_no_symbol_change_impact_project() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git init");
+    Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git config email");
+    Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git config name");
+
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.ts"),
+        "export function moved(): number {\n  return 1;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/extra.ts"),
+        "import { helper } from '@app/lib';\n\nexport function useHelper(): void {}\n",
+    )
+    .unwrap();
+
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(dir.path())
+        .output()
+        .expect("git add");
+    Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git commit");
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(
+        output.status.success(),
+        "helios init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    (dir, bin)
+}
+
+/// Regression pin: text mode used to `return` out of `run` right after
+/// printing "No symbol changes detected." — before ever reaching the impact
+/// section — so an outstanding honesty-gate finding (here, an unresolved
+/// import naming a changed file's stem) was silently dropped from
+/// `--impact`'s text output even though the identical tree's `--json` output
+/// still reported it. The message and the impact section must both appear.
+#[test]
+fn test_diff_impact_text_mode_does_not_drop_impact_when_no_symbol_changes() {
+    let (dir, bin) = setup_no_symbol_change_impact_project();
+
+    // Same-line-only body edit: the file changes on disk and in git, but no
+    // symbol's line/end_line/kind/visibility/signature changes, so diff's
+    // symbol-level comparison classifies nothing as added/removed/modified
+    // (a known, separate limitation of diff's matching, not under test here).
+    std::fs::write(
+        dir.path().join("src/lib.ts"),
+        "export function moved(): number {\n  return 1 + 0;\n}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .args(["diff", "--impact"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios diff --impact");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("No symbol changes detected."),
+        "expected the accurate no-symbol-changes message, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Unresolved imports") && stdout.contains("@app/lib"),
+        "expected the outstanding unresolved import surfaced even with no symbol changes, got: {}",
+        stdout
+    );
+}
+
 // --- Pagination tests ---
 
 #[test]
