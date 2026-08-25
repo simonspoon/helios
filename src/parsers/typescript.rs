@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
 use super::{LanguageParser, ParseResult, is_function_local};
-use crate::db::{ParsedImport, ParsedReference, ParsedSymbol, ParsedTypeRelation};
+use crate::db::{ParsedImport, ParsedReference, ParsedSymbol, ParsedTypeRelation, UsageKind};
 
 /// Node kinds whose body holds function-local declarations.
 const CALLABLE_KINDS: &[&str] = &[
@@ -443,6 +443,13 @@ impl LanguageParser for TypeScriptParser {
         }
 
         // --- References ---
+        //
+        // Member/field write targets (`x.count = 1`, `x.count += 1`,
+        // `x.count++`) are deliberately not captured -- see the comment
+        // above the reference query in `rust_parser.rs` for why: no parser
+        // in this codebase indexes plain fields as symbols, so a write
+        // capture has no correct symbol to resolve to and can only produce
+        // a confidently wrong "who mutates this" answer.
         let ref_query = Query::new(
             &self.language,
             r#"
@@ -467,6 +474,9 @@ impl LanguageParser for TypeScriptParser {
                     // `money.formatMoney()` names a member of some receiver,
                     // not the bare name an import binds.
                     qualified: ref_query.capture_names()[c.index as usize] == "method_call",
+                    // These captures are calls / `new T()`, which read the
+                    // callee/constructed type.
+                    usage_kind: UsageKind::Read,
                 });
             }
         }
@@ -804,6 +814,31 @@ export class Registry {
         assert_eq!(
             relation_tuples(&result.type_relations),
             vec![("C", Some(1), "B", "extends")]
+        );
+    }
+
+    #[test]
+    fn test_ordinary_call_is_still_read() {
+        let parser = TypeScriptParser::new("typescript");
+        let result = parser.parse("x.method();").unwrap();
+        let r = result
+            .references
+            .iter()
+            .find(|r| r.symbol_name == "method")
+            .unwrap();
+        assert_eq!(r.usage_kind, UsageKind::Read);
+    }
+
+    #[test]
+    fn test_assignment_targets_emit_no_reference() {
+        let parser = TypeScriptParser::new("typescript");
+        let result = parser
+            .parse("count = 1; x.count = 1; x.count += 1; x.count++;")
+            .unwrap();
+        assert!(
+            result.references.is_empty(),
+            "assignment targets must not be captured as references: {:?}",
+            result.references
         );
     }
 }

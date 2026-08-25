@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::db::{Database, SymbolRecord};
+use crate::db::{Database, SymbolRecord, UsageKind};
 use crate::parsers;
 use crate::resolver;
 use crate::sidecar::AnalyzeOutput;
@@ -543,6 +543,7 @@ fn index_file_references(
             reference.column,
             reference.qualified,
             container_symbol_id,
+            reference.usage_kind,
         )?;
     }
     Ok(())
@@ -683,6 +684,15 @@ pub fn ingest_semantic(db: &Database, semantic: Option<&AnalyzeOutput>) -> Resul
             reference.container_docid.as_deref(),
             file.id,
         );
+        // The helper classifies from the syntactic/semantic parent; anything
+        // it does not recognise (including XAML bindings, which never carry
+        // this field) is absent on the wire and maps to Unknown rather than
+        // being guessed.
+        let usage_kind = reference
+            .usage_kind
+            .as_deref()
+            .map(UsageKind::from_str)
+            .unwrap_or_default();
         // Semantic rows resolve exactly by DocId, so the bare/qualified
         // distinction the import filter needs does not apply to them.
         db.insert_references(
@@ -692,6 +702,7 @@ pub fn ingest_semantic(db: &Database, semantic: Option<&AnalyzeOutput>) -> Resul
             reference.col - 1,
             false,
             container_symbol_id,
+            usage_kind,
         )?;
     }
 
@@ -955,6 +966,7 @@ mod tests {
             col,
             is_definition,
             container_docid: None,
+            usage_kind: None,
         }
     }
 
@@ -1196,9 +1208,9 @@ mod tests {
         let helper = add_symbol(&db, py_file, "helper", 2, "util");
 
         // Stale tree-sitter rows: one sourced from a .cs file, one from .py
-        db.insert_reference(save, cs_file, 20, 3, false, None)
+        db.insert_reference(save, cs_file, 20, 3, false, None, UsageKind::Read)
             .unwrap();
-        db.insert_reference(helper, py_file, 9, 0, false, None)
+        db.insert_reference(helper, py_file, 9, 0, false, None, UsageKind::Read)
             .unwrap();
 
         let output = AnalyzeOutput {
@@ -1403,10 +1415,10 @@ mod tests {
             .map(|(sym, _)| sym.id)
             .collect();
         let mut paths: Vec<String> = db
-            .symbol_references(&ids)
+            .symbol_references(&ids, None)
             .unwrap()
             .into_iter()
-            .map(|(path, _, _, _)| path)
+            .map(|site| site.path)
             .collect();
         paths.sort();
         paths.dedup();

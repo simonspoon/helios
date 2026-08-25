@@ -219,7 +219,10 @@ internal static class Program
                 // The declaration site itself, flagged so the consumer never inserts it.
                 var declarationModel = compilation.GetSemanticModel(location.SourceTree!);
                 var declarationContainer = ContainerDocidAt(declarationModel, location.SourceSpan.Start);
-                WriteReference(stdout, docid, file, span, isDefinition: true, declarationContainer);
+                // A declaration site is not a usage: `public string Name { get; set; }` neither
+                // reads nor writes Name, it *is* Name. Calling it a read would be evidence
+                // `deps --reads` could wrongly count, so it gets the honest Unknown instead.
+                WriteReference(stdout, docid, file, span, isDefinition: true, declarationContainer, UsageKind.Unknown);
             }
 
             // Once per type, not once per declaring location: BaseType and
@@ -325,6 +328,7 @@ internal static class Program
             {
                 ISymbol? symbol;
                 Location location;
+                UsageKind usageKind;
                 switch (node)
                 {
                     case IdentifierNameSyntax { IsVar: true }:
@@ -332,6 +336,7 @@ internal static class Program
                     case SimpleNameSyntax name:
                         symbol = ResolveReferencedSymbol(model, name);
                         location = name.GetLocation();
+                        usageKind = ClassifyUsage(name);
                         break;
                     // `class D() : B(5)` is NOT handled: its type name is already
                     // visited as a SimpleNameSyntax at the same position, and the
@@ -340,14 +345,17 @@ internal static class Program
                     case ConstructorInitializerSyntax init: // `: this(...)` / `: base(...)`
                         symbol = NormalizeConstructor(model.GetSymbolInfo(init).Symbol);
                         location = init.ThisOrBaseKeyword.GetLocation();
+                        usageKind = UsageKind.Read; // invoking a base/this ctor only reads it
                         break;
                     case ElementAccessExpressionSyntax element: // indexer usage `x[i]`
                         symbol = model.GetSymbolInfo(element).Symbol?.OriginalDefinition;
                         location = element.ArgumentList.OpenBracketToken.GetLocation();
+                        usageKind = ClassifyAssignmentTarget(element);
                         break;
                     case ElementBindingExpressionSyntax binding: // conditional indexer usage `x?[i]`
                         symbol = model.GetSymbolInfo(binding).Symbol?.OriginalDefinition;
                         location = binding.ArgumentList.OpenBracketToken.GetLocation();
+                        usageKind = ClassifyAssignmentTarget(binding);
                         break;
                     default:
                         continue;
@@ -369,7 +377,7 @@ internal static class Program
                     continue;
                 }
                 var containerDocid = ContainerDocidAt(model, location.SourceSpan.Start);
-                WriteReference(stdout, docid, file, span, isDefinition: false, containerDocid);
+                WriteReference(stdout, docid, file, span, isDefinition: false, containerDocid, usageKind);
             }
         }
     }
@@ -793,11 +801,11 @@ internal static class Program
         relativePath.Split('/').Any(part => part is "bin" or "obj" || part.StartsWith('.'));
 
     /// <summary>One on-wire reference record; the single place that converts 0-based spans to 1-based columns.</summary>
-    private static void WriteReference(TextWriter stdout, string docid, string file, FileLinePositionSpan span, bool isDefinition, string? containerDocid = null) =>
-        WriteReference(stdout, docid, file, span.StartLinePosition.Line + 1, span.StartLinePosition.Character + 1, isDefinition, containerDocid);
+    private static void WriteReference(TextWriter stdout, string docid, string file, FileLinePositionSpan span, bool isDefinition, string? containerDocid, UsageKind usageKind) =>
+        WriteReference(stdout, docid, file, span.StartLinePosition.Line + 1, span.StartLinePosition.Character + 1, isDefinition, containerDocid, usageKind);
 
     /// <summary>Same record from an already-1-based position (the XAML pass has no Roslyn span).</summary>
-    internal static void WriteReference(TextWriter stdout, string docid, string file, int line, int col, bool isDefinition, string? containerDocid = null) =>
+    internal static void WriteReference(TextWriter stdout, string docid, string file, int line, int col, bool isDefinition, string? containerDocid, UsageKind usageKind) =>
         WriteRecord(stdout, new
         {
             type = "reference",
@@ -807,7 +815,148 @@ internal static class Program
             col,
             is_definition = isDefinition,
             container_docid = containerDocid,
+            usage_kind = UsageKindString(usageKind),
         });
+
+    /// <summary>
+    /// Whether a reference reads, writes, or both, the symbol it resolved to — the on-wire
+    /// vocabulary described in design.md. <see cref="Unknown"/> is the explicit fallback for a
+    /// shape <see cref="ClassifyAssignmentTarget"/> recognises but cannot confidently place
+    /// (e.g. through a <c>ref</c> alias), and is also what every <c>is_definition:true</c> row
+    /// carries: a declaration site is not a usage of the symbol it declares, so it is neither a
+    /// read nor a write. <see cref="Unknown"/> is never used as a stand-in for "didn't check".
+    /// </summary>
+    internal enum UsageKind
+    {
+        Read,
+        Write,
+        ReadWrite,
+        Unknown,
+    }
+
+    private static string UsageKindString(UsageKind kind) => kind switch
+    {
+        UsageKind.Read => "read",
+        UsageKind.Write => "write",
+        UsageKind.ReadWrite => "readwrite",
+        UsageKind.Unknown => "unknown",
+        _ => "unknown",
+    };
+
+    /// <summary>
+    /// Read/write/readwrite/unknown for the resolved-symbol name node <paramref name="node"/>
+    /// (a <see cref="SimpleNameSyntax"/>): climb past every <see cref="MemberAccessExpressionSyntax"/>
+    /// / <see cref="ConditionalAccessExpressionSyntax"/> / <see cref="MemberBindingExpressionSyntax"/>
+    /// layer where <paramref name="node"/> is the *member being named*, not the receiver — in
+    /// `a.b.c = 1` the reference for `c` is a write, but `a` and `b` are each read to get there,
+    /// so the climb stops (and reports Read immediately) the moment `node` is used as someone
+    /// else's receiver. Once the outermost such expression is found, <see cref="ClassifyAssignmentTarget"/>
+    /// reads its immediate syntactic parent to decide.
+    /// </summary>
+    private static UsageKind ClassifyUsage(SyntaxNode node)
+    {
+        var current = node;
+        while (true)
+        {
+            switch (current.Parent)
+            {
+                case MemberAccessExpressionSyntax outer when outer.Expression == current:
+                    return UsageKind.Read; // receiver
+                case MemberAccessExpressionSyntax outer when outer.Name == current:
+                    current = outer;
+                    continue;
+                case ConditionalAccessExpressionSyntax conditional when conditional.Expression == current:
+                    return UsageKind.Read; // receiver
+                case ConditionalAccessExpressionSyntax conditional when conditional.WhenNotNull == current:
+                    current = conditional;
+                    continue;
+                case MemberBindingExpressionSyntax binding when binding.Name == current:
+                    current = binding;
+                    continue;
+            }
+            break;
+        }
+
+        return ClassifyAssignmentTarget(current);
+    }
+
+    /// <summary>
+    /// Read/write/readwrite/unknown from the immediate syntactic parent of
+    /// <paramref name="node"/> — the full usage-site expression, already climbed past any
+    /// receiver by <see cref="ClassifyUsage"/> for a name, or the element-access expression
+    /// itself for an indexer (`x[i] = 1` writes the indexer; `x[i]` used as someone else's
+    /// receiver falls through to the default arm below, which is a read — the same "receiver
+    /// is a read" outcome <see cref="ClassifyUsage"/> gives a name, without needing its own climb).
+    /// </summary>
+    private static UsageKind ClassifyAssignmentTarget(SyntaxNode node)
+    {
+        switch (node.Parent)
+        {
+            case AssignmentExpressionSyntax assignment when assignment.Left == node:
+                // Object/collection initializer member assignment (`new T { Prop = 1 }`) is
+                // itself a SimpleAssignmentExpression, so it falls out of this same arm.
+                return assignment.Kind() switch
+                {
+                    SyntaxKind.SimpleAssignmentExpression => UsageKind.Write,
+                    SyntaxKind.CoalesceAssignmentExpression => UsageKind.ReadWrite,
+                    _ => UsageKind.ReadWrite, // compound: += -= *= /= %= &= |= ^= <<= >>= >>>=
+                };
+            case AssignmentExpressionSyntax assignment when assignment.Right == node:
+                return UsageKind.Read;
+            case PrefixUnaryExpressionSyntax prefix when prefix.Operand == node
+                && prefix.Kind() is SyntaxKind.PreIncrementExpression or SyntaxKind.PreDecrementExpression:
+                return UsageKind.ReadWrite;
+            case PostfixUnaryExpressionSyntax postfix when postfix.Operand == node
+                && postfix.Kind() is SyntaxKind.PostIncrementExpression or SyntaxKind.PostDecrementExpression:
+                return UsageKind.ReadWrite;
+            case RefExpressionSyntax refExpression when refExpression.Expression == node:
+                // `ref x.Field` (a ref-local initializer, `return ref ...`, ...) aliases the
+                // storage rather than reading or writing it outright — whether the alias is
+                // later read, written, or both is beyond what this syntax node can say.
+                return UsageKind.Unknown;
+            // A tuple-deconstruction element (`(a.X, a.Y) = GetTuple();`) is syntactically an
+            // ArgumentSyntax inside a TupleExpressionSyntax, same as a method argument, but it
+            // is a write when the (possibly nested) tuple is itself the left side of `=` — never
+            // guess `read` here, since that would be a false claim of the same kind design.md
+            // warns against, just for deconstruction instead of plain assignment.
+            case ArgumentSyntax argument when argument.Expression == node && argument.Parent is TupleExpressionSyntax tuple:
+                return IsDeconstructionAssignmentTarget(tuple) ? UsageKind.Write : UsageKind.Read;
+            case ArgumentSyntax argument when argument.Expression == node:
+                return argument.RefKindKeyword.Kind() switch
+                {
+                    SyntaxKind.OutKeyword => UsageKind.Write,
+                    SyntaxKind.RefKeyword => UsageKind.ReadWrite,
+                    _ => UsageKind.Read, // plain or `in` argument
+                };
+            default:
+                // Every other syntactic position a resolved symbol can appear in (invocation
+                // target, return value, interpolation, plain expression statement, ...) only
+                // reads it — nothing else in this switch writes without going through one of
+                // the cases already handled above.
+                return UsageKind.Read;
+        }
+    }
+
+    /// <summary>
+    /// True when <paramref name="tuple"/> — an element's enclosing <see cref="TupleExpressionSyntax"/>
+    /// — is (transitively, through any nesting) the left side of a simple assignment, i.e. a
+    /// deconstruction target: `(a.X, (b.Y, c.Z)) = ...` climbs out through each enclosing tuple
+    /// via its wrapping <see cref="ArgumentSyntax"/> until it reaches something that is not itself
+    /// nested in another tuple, then checks that outermost tuple's own parent. A tuple used as an
+    /// ordinary expression (an argument, the right side of `=`, ...) climbs the same way but ends
+    /// on something other than an assignment's left side, so it returns false — a plain read.
+    /// </summary>
+    private static bool IsDeconstructionAssignmentTarget(SyntaxNode tuple)
+    {
+        var current = tuple;
+        while (current.Parent is ArgumentSyntax argument && argument.Parent is TupleExpressionSyntax outerTuple)
+        {
+            current = outerTuple;
+        }
+        return current.Parent is AssignmentExpressionSyntax assignment
+            && assignment.Left == current
+            && assignment.Kind() == SyntaxKind.SimpleAssignmentExpression;
+    }
 
     /// <summary>
     /// The DocumentationCommentId of the nearest enclosing symbol at <paramref name="position"/>

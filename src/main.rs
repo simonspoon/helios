@@ -97,6 +97,12 @@ enum Command {
         /// Transitive traversal depth (default: 1, file targets only)
         #[arg(long, default_value = "1")]
         depth: u32,
+        /// Only show references that read the target (symbol targets only; today every tree-sitter reference is a read)
+        #[arg(long)]
+        reads: bool,
+        /// Only show references that write the target (symbol targets only; writes are recorded for C# via Roslyn only)
+        #[arg(long)]
+        writes: bool,
     },
     /// Control-flow graph of one function body (Rust and C#)
     Flow {
@@ -181,6 +187,8 @@ fn main() {
             scope,
             file,
             depth,
+            reads,
+            writes,
         } => commands::deps::run(
             target,
             cli.json,
@@ -188,6 +196,8 @@ fn main() {
             *depth,
             scope.as_deref(),
             file.as_deref(),
+            *reads,
+            *writes,
         ),
         Command::Flow {
             target,

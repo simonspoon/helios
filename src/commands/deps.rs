@@ -2,7 +2,7 @@ use std::collections::{HashSet, VecDeque};
 
 use anyhow::{Context, Result};
 
-use crate::db::{Database, SymbolDefinition, TypeEdge};
+use crate::db::{Database, SymbolDefinition, TypeEdge, UsageKind};
 use crate::errors::NoIndexError;
 use crate::parsers::detect_language;
 
@@ -113,6 +113,7 @@ fn bfs_file_deps(
     Ok(BfsResult { entries })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     target: &str,
     json: bool,
@@ -120,6 +121,8 @@ pub fn run(
     depth: u32,
     scope: Option<&str>,
     file: Option<&str>,
+    reads: bool,
+    writes: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let db_path = cwd.join(".helios/index.db");
@@ -129,6 +132,15 @@ pub fn run(
     }
 
     let db = Database::open(&db_path).context("opening database")?;
+
+    // `--reads`/`--writes` narrow `symbol_references` to usage_kind — both
+    // together, or neither, means no filtering. `unknown` rows never satisfy
+    // either flag: an unclassified usage is not evidence of a read or a write.
+    let usage_kinds: Option<Vec<UsageKind>> = match (reads, writes) {
+        (true, false) => Some(vec![UsageKind::Read, UsageKind::ReadWrite]),
+        (false, true) => Some(vec![UsageKind::Write, UsageKind::ReadWrite]),
+        _ => None,
+    };
 
     // Resolve a symbol target to the definitions it selects. Only those
     // definitions' ids are queried, so `--scope`/`--file`/`Class.Method`
@@ -220,7 +232,7 @@ pub fn run(
         } else {
             // Symbol mode: ignore depth, keep depth=1 behavior
             let deps = db.symbol_dependencies(&symbol_ids)?;
-            let refs = db.symbol_references(&symbol_ids)?;
+            let refs = db.symbol_references(&symbol_ids, usage_kinds.as_deref())?;
 
             let output = serde_json::json!({
                 "target": target,
@@ -231,8 +243,14 @@ pub fn run(
                 "edge_languages": edge_languages,
                 "dependencies": deps,
                 "dependents": refs.iter()
-                    .map(|(path, line, col, container)| {
-                        serde_json::json!({"file": path, "line": line, "column": col, "container": container})
+                    .map(|site| {
+                        serde_json::json!({
+                            "file": site.path,
+                            "line": site.line,
+                            "column": site.column,
+                            "container": site.container,
+                            "usage_kind": site.usage_kind.as_str(),
+                        })
                     })
                     .collect::<Vec<_>>(),
             });
@@ -273,7 +291,7 @@ pub fn run(
         } else {
             // Symbol mode: ignore depth, keep depth=1 behavior
             let deps = db.symbol_dependencies(&symbol_ids)?;
-            let refs = db.symbol_references(&symbol_ids)?;
+            let refs = db.symbol_references(&symbol_ids, usage_kinds.as_deref())?;
 
             if !defs.is_empty() {
                 println!("Definitions of {}:", target);
@@ -315,13 +333,23 @@ pub fn run(
 
             if !refs.is_empty() {
                 println!("References (where {} is used):", target);
-                for (path, line, col, container) in &refs {
-                    match container {
+                for site in &refs {
+                    // `read` and `unknown` print nothing extra, so today's
+                    // output is unchanged for the common case.
+                    let suffix = match site.usage_kind {
+                        UsageKind::Write => " [write]",
+                        UsageKind::ReadWrite => " [readwrite]",
+                        UsageKind::Read | UsageKind::Unknown => "",
+                    };
+                    match &site.container {
                         Some(c) => println!(
-                            "  {}:{}:{} in {} -> {} (reference)",
-                            path, line, col, c, target
+                            "  {}:{}:{} in {} -> {} (reference){}",
+                            site.path, site.line, site.column, c, target, suffix
                         ),
-                        None => println!("  {}:{}:{} -> {} (reference)", path, line, col, target),
+                        None => println!(
+                            "  {}:{}:{} -> {} (reference){}",
+                            site.path, site.line, site.column, target, suffix
+                        ),
                     }
                 }
             }

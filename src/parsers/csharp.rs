@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
 use super::{LanguageParser, ParseResult};
-use crate::db::{ParsedImport, ParsedReference, ParsedSymbol, ParsedTypeRelation};
+use crate::db::{ParsedImport, ParsedReference, ParsedSymbol, ParsedTypeRelation, UsageKind};
 
 pub struct CSharpParser {
     language: Language,
@@ -385,6 +385,17 @@ impl LanguageParser for CSharpParser {
         }
 
         // --- References (invocations and object creation) ---
+        //
+        // This is the tree-sitter fallback path only: `helios init` also
+        // runs the Roslyn sidecar, which replaces this parser's whole C#
+        // reference set. Member write targets are not captured here: unlike
+        // the other tree-sitter parsers (see the comment above the
+        // reference query in `rust_parser.rs`), C# properties *are* indexed
+        // as symbols -- but as kind `"fn"` (see `prop_name` above),
+        // indistinguishable at resolution time from a method of the same
+        // name. A property write would carry the same false-attribution
+        // risk as an unindexed field, so it's excluded for the same reason,
+        // by a different mechanism.
         let ref_query = Query::new(
             &self.language,
             r#"
@@ -431,6 +442,9 @@ impl LanguageParser for CSharpParser {
                         column: c.node.start_position().column as i64,
                         from_scope: find_scope(src, c.node),
                         qualified: cap_name == "member_call",
+                        // These captures are calls / `new T()`, which read
+                        // the callee/constructed type.
+                        usage_kind: UsageKind::Read,
                     });
                 }
             }
@@ -846,6 +860,33 @@ namespace MyApp.Models {
                 ("Circle", Some(1), "System.IDisposable", "implements"),
                 ("Circle", Some(1), "List<T>", "implements")
             ]
+        );
+    }
+
+    #[test]
+    fn test_ordinary_call_is_still_read() {
+        let parser = CSharpParser::new();
+        let result = parser
+            .parse("class C { void f() { x.Method(); } }")
+            .unwrap();
+        let r = result
+            .references
+            .iter()
+            .find(|r| r.symbol_name == "Method")
+            .unwrap();
+        assert_eq!(r.usage_kind, UsageKind::Read);
+    }
+
+    #[test]
+    fn test_assignment_targets_emit_no_reference() {
+        let parser = CSharpParser::new();
+        let result = parser
+            .parse("class C { void f() { count = 1; x.count = 1; x.count += 1; x.count++; } }")
+            .unwrap();
+        assert!(
+            !result.references.iter().any(|r| r.symbol_name == "count"),
+            "assignment targets must not be captured as references: {:?}",
+            result.references
         );
     }
 }

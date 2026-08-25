@@ -20,7 +20,7 @@ internal static class HelperHarness
 
     public sealed record Definition(string Docid, string Name, string Kind, string File, int StartLine, int StartCol);
 
-    public sealed record Reference(string Docid, string File, int Line, int Col, bool IsDefinition, string? ContainerDocid);
+    public sealed record Reference(string Docid, string File, int Line, int Col, bool IsDefinition, string? ContainerDocid, string UsageKind);
 
     public sealed record Relation(string SubDocid, string? SuperDocid, string SuperName, string Kind, string File);
 
@@ -87,7 +87,8 @@ internal static class HelperHarness
                         record.GetProperty("is_definition").GetBoolean(),
                         record.TryGetProperty("container_docid", out var container) && container.ValueKind != JsonValueKind.Null
                             ? container.GetString()
-                            : null));
+                            : null,
+                        record.GetProperty("usage_kind").GetString()!));
                     break;
                 case "relation":
                     relations.Add(new Relation(

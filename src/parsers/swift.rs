@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
 use super::{LanguageParser, ParseResult, is_function_local};
-use crate::db::{ParsedImport, ParsedReference, ParsedSymbol};
+use crate::db::{ParsedImport, ParsedReference, ParsedSymbol, UsageKind};
 
 /// Node kinds whose body holds function-local declarations.
 const CALLABLE_KINDS: &[&str] = &[
@@ -233,6 +233,12 @@ impl LanguageParser for SwiftParser {
         }
 
         // --- References ---
+        //
+        // Member write targets (`x.count = 1`, `x.count += 1`) are
+        // deliberately not captured -- see the comment above the reference
+        // query in `rust_parser.rs` for why: no parser in this codebase
+        // indexes plain fields/properties as symbols, so a write capture
+        // has no correct symbol to resolve to.
         let ref_query = Query::new(
             &self.language,
             r#"
@@ -254,6 +260,8 @@ impl LanguageParser for SwiftParser {
                     from_scope: None,
                     // Only bare calls are captured.
                     qualified: false,
+                    // These captures are calls, which read the callee.
+                    usage_kind: UsageKind::Read,
                 });
             }
         }
@@ -393,5 +401,30 @@ class Service {
         for local in ["inner", "inInit", "inGetter"] {
             assert!(!names.contains(&local), "{local} is a function local");
         }
+    }
+
+    #[test]
+    fn test_ordinary_call_is_still_read() {
+        let parser = SwiftParser::new();
+        let result = parser.parse("func f() { doWork() }").unwrap();
+        let r = result
+            .references
+            .iter()
+            .find(|r| r.symbol_name == "doWork")
+            .unwrap();
+        assert_eq!(r.usage_kind, UsageKind::Read);
+    }
+
+    #[test]
+    fn test_assignment_targets_emit_no_reference() {
+        let parser = SwiftParser::new();
+        let result = parser
+            .parse("func f() { count = 1; x.count = 1; x.count += 1 }")
+            .unwrap();
+        assert!(
+            result.references.is_empty(),
+            "assignment targets must not be captured as references: {:?}",
+            result.references
+        );
     }
 }

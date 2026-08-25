@@ -4092,6 +4092,285 @@ fn test_deps_references_name_the_calling_function() {
     assert_eq!(dependents[0]["container"].as_str(), Some("format"));
 }
 
+/// A project with one call reference (`helper()` called from `Wallet.format`)
+/// — the same fixture `test_deps_references_name_the_calling_function` uses
+/// — for the `deps --reads`/`--writes` filtering tests below.
+fn setup_single_reference_project() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    std::fs::write(
+        dir.path().join("wallet.ts"),
+        "export function helper(): number { return 1; }\nexport class Wallet {\n    format(): number {\n        return helper();\n    }\n}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+    (dir, bin)
+}
+
+/// `--json` dependents entries carry a `usage_kind`, and for an ordinary
+/// tree-sitter call reference — the only kind today's parsers emit — it is
+/// `"read"`.
+#[test]
+fn test_deps_json_dependent_carries_usage_kind_read() {
+    let (dir, bin) = setup_single_reference_project();
+
+    let value = deps_json(&bin, dir.path(), &["helper"]);
+    let dependents = value["dependents"].as_array().expect("dependents array");
+    assert_eq!(dependents.len(), 1, "expected one dependent, got: {value}");
+    assert_eq!(
+        dependents[0]["usage_kind"].as_str(),
+        Some("read"),
+        "an ordinary call reference must be classified read: {value}"
+    );
+}
+
+/// `--reads` on a symbol whose only references are calls keeps them: asking
+/// for reads must not filter away a read.
+#[test]
+fn test_deps_reads_flag_keeps_read_references() {
+    let (dir, bin) = setup_single_reference_project();
+
+    let unfiltered = deps_json(&bin, dir.path(), &["helper"]);
+    let reads = deps_json(&bin, dir.path(), &["helper", "--reads"]);
+    assert!(
+        !reads["dependents"].as_array().unwrap().is_empty(),
+        "expected at least one dependent, got: {reads}"
+    );
+    assert_eq!(
+        reads["dependents"], unfiltered["dependents"],
+        "--reads must return the same set of read references unfiltered"
+    );
+}
+
+/// Passing both `--reads` and `--writes` applies no filter — same result as
+/// passing neither.
+#[test]
+fn test_deps_reads_and_writes_together_means_no_filter() {
+    let (dir, bin) = setup_single_reference_project();
+
+    let neither = deps_json(&bin, dir.path(), &["helper"]);
+    let both = deps_json(&bin, dir.path(), &["helper", "--reads", "--writes"]);
+    assert_eq!(
+        both["dependents"], neither["dependents"],
+        "both flags together must mean no filtering, the same as neither"
+    );
+}
+
+/// Default text output for a plain read reference is unchanged by
+/// `usage_kind`: no `[write]`/`[readwrite]` suffix, nothing appended to the
+/// line format everyone already reads.
+#[test]
+fn test_deps_text_output_unchanged_for_read_reference() {
+    let (dir, bin) = setup_single_reference_project();
+
+    let (path, line, col): (String, i64, i64) = index_db(dir.path())
+        .query_row(
+            "SELECT f.path, r.line, r.column FROM references_ r JOIN files f ON f.id = r.file_id",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("finding the seeded reference row");
+
+    let output = Command::new(&bin)
+        .args(["deps", "helper"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps helper");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let expected_line = format!("  {}:{}:{} in format -> helper (reference)", path, line, col);
+    assert!(
+        stdout.lines().any(|l| l == expected_line),
+        "expected the pre-existing reference line format exactly, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("[write]") && !stdout.contains("[readwrite]"),
+        "a read reference must never carry a write/readwrite suffix, got: {stdout}"
+    );
+}
+
+/// `--writes` on a symbol that is only ever called (never assigned) returns
+/// no reference lines.
+#[test]
+fn test_deps_writes_flag_excludes_call_only_symbol() {
+    let (dir, bin) = setup_single_reference_project();
+
+    let value = deps_json(&bin, dir.path(), &["helper", "--writes"]);
+    assert_eq!(
+        value["dependents"].as_array().unwrap().len(),
+        0,
+        "a call-only symbol has no writes: {value}"
+    );
+
+    let output = Command::new(&bin)
+        .args(["deps", "helper", "--writes"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps helper --writes");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("(reference)"),
+        "expected no reference lines, got: {stdout}"
+    );
+}
+
+/// The central claim of this feature: an `unknown`-kind reference is
+/// excluded by both `--reads` and `--writes`, while still appearing with
+/// neither flag — an unclassified usage is not evidence of a read or of a
+/// write.
+///
+/// No tree-sitter parser emits `unknown` today (every capture reads its
+/// target — see WP1/WP2), and the Roslyn sidecar path needs a real `dotnet`
+/// build (`built_roslyn_dll()`, gated and skipped when unavailable) to
+/// exercise end to end. So this seeds an `unknown` row directly into
+/// `references_` after a real `helios init`, the same seeding style
+/// `test_deps_type_edge_external_cross_language_shows_declaring_file`
+/// already uses for `type_relations`, and then drives the filtering purely
+/// through the CLI (`helios deps --reads`/`--writes`) against that real
+/// index — this is a CLI-level test of the filtering guarantee, not a
+/// restatement of the `Database::symbol_references` storage-layer unit test
+/// in src/db.rs.
+#[test]
+fn test_deps_unknown_kind_reference_excluded_by_both_flags() {
+    let (dir, bin) = setup_single_reference_project();
+
+    let (symbol_id, file_id): (i64, i64) = index_db(dir.path())
+        .query_row(
+            "SELECT r.symbol_id, r.file_id FROM references_ r LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("finding the seeded reference row");
+    index_db(dir.path())
+        .execute(
+            "INSERT INTO references_ (symbol_id, file_id, line, column, qualified, usage_kind)
+             VALUES (?1, ?2, 999, 0, 0, 'unknown')",
+            rusqlite::params![symbol_id, file_id],
+        )
+        .expect("seeding an unknown-kind reference");
+
+    let lines_of = |value: &serde_json::Value| -> Vec<i64> {
+        value["dependents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["line"].as_i64().unwrap())
+            .collect()
+    };
+
+    let unfiltered = deps_json(&bin, dir.path(), &["helper"]);
+    assert!(
+        lines_of(&unfiltered).contains(&999),
+        "the unknown-kind row must appear with no filter: {unfiltered}"
+    );
+
+    let reads = deps_json(&bin, dir.path(), &["helper", "--reads"]);
+    assert!(
+        !lines_of(&reads).contains(&999),
+        "an unknown-kind row is not evidence of a read: {reads}"
+    );
+
+    let writes = deps_json(&bin, dir.path(), &["helper", "--writes"]);
+    assert_eq!(
+        writes["dependents"].as_array().unwrap().len(),
+        0,
+        "an unknown-kind row is not evidence of a write, and the natural \
+         reference is a read, so --writes must return nothing: {writes}"
+    );
+}
+
+/// `--reads`/`--writes` sort `write` and `readwrite` rows correctly at the
+/// CLI level, the same way `test_deps_unknown_kind_reference_excluded_by_both_flags`
+/// covers `unknown`.
+///
+/// No tree-sitter parser can attach a correct `write`/`readwrite` reference
+/// to a real definition today: none of the six languages index struct/class
+/// fields as symbols, so a member write has no correct symbol to attach to
+/// and would land on whatever unrelated same-named symbol happens to exist
+/// instead — a confident false claim, which is why the tree-sitter write
+/// captures were pulled rather than shipped with that defect. The `write`/
+/// `readwrite` path is real end-to-end only via the Roslyn leg (C#
+/// properties, which are indexed symbols with exact docids), and exercising
+/// that here would need a live `dotnet` build (`built_roslyn_dll()`, gated
+/// and skipped when unavailable). So — exactly the seeding technique
+/// `test_deps_unknown_kind_reference_excluded_by_both_flags` uses for
+/// `unknown` — this seeds `write` and `readwrite` rows directly into a real
+/// index's `references_` table, then drives the filtering purely through
+/// the CLI. This keeps `--writes`/`--reads` covered at the CLI level for
+/// every kind the enum has, independent of which producer (Roslyn today,
+/// tree-sitter once fields are indexed) supplies the row.
+#[test]
+fn test_deps_write_and_readwrite_kinds_sorted_by_flags_at_cli_level() {
+    let (dir, bin) = setup_single_reference_project();
+
+    let (symbol_id, file_id): (i64, i64) = index_db(dir.path())
+        .query_row(
+            "SELECT r.symbol_id, r.file_id FROM references_ r LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("finding the seeded reference row");
+    {
+        let conn = index_db(dir.path());
+        conn.execute(
+            "INSERT INTO references_ (symbol_id, file_id, line, column, qualified, usage_kind)
+             VALUES (?1, ?2, 111, 0, 0, 'write')",
+            rusqlite::params![symbol_id, file_id],
+        )
+        .expect("seeding a write-kind reference");
+        conn.execute(
+            "INSERT INTO references_ (symbol_id, file_id, line, column, qualified, usage_kind)
+             VALUES (?1, ?2, 222, 0, 0, 'readwrite')",
+            rusqlite::params![symbol_id, file_id],
+        )
+        .expect("seeding a readwrite-kind reference");
+    }
+    // The fixture's own natural reference is a read (line unknown to this
+    // test, so identify the two seeded rows by their distinctive lines
+    // instead of asserting the natural row's absence/presence by exclusion).
+
+    let lines_of = |value: &serde_json::Value| -> Vec<i64> {
+        value["dependents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["line"].as_i64().unwrap())
+            .collect()
+    };
+
+    let unfiltered = deps_json(&bin, dir.path(), &["helper"]);
+    let unfiltered_lines = lines_of(&unfiltered);
+    assert!(
+        unfiltered_lines.contains(&111) && unfiltered_lines.contains(&222),
+        "both seeded rows must appear with no filter: {unfiltered}"
+    );
+
+    let writes = deps_json(&bin, dir.path(), &["helper", "--writes"]);
+    let write_lines = lines_of(&writes);
+    assert!(
+        write_lines.contains(&111) && write_lines.contains(&222),
+        "--writes must keep both the write and the readwrite row: {writes}"
+    );
+
+    let reads = deps_json(&bin, dir.path(), &["helper", "--reads"]);
+    let read_lines = lines_of(&reads);
+    assert!(
+        !read_lines.contains(&111),
+        "--reads must exclude the pure-write row: {reads}"
+    );
+    assert!(
+        read_lines.contains(&222),
+        "--reads must keep the readwrite row: {reads}"
+    );
+}
+
 /// A project with two `formatMoney` definitions whose defining files import
 /// different things, so a deps target that selects one is visibly different
 /// from one that selects the other.
@@ -5513,7 +5792,7 @@ fn test_init_backfills_type_relations_after_format_upgrade() {
     );
     assert_eq!(
         metadata_value(dir.path(), "index_format_version").as_deref(),
-        Some("3"),
+        Some("4"),
         "a successful full index must stamp the current format version"
     );
 }

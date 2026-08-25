@@ -66,6 +66,13 @@ pub struct Reference {
     /// `Option<T>` deserializes to `None` per the forward-compat rule, so an
     /// old helper against a new helios still parses.
     pub container_docid: Option<String>,
+    /// "read" | "write" | "readwrite", classified by the helper from the
+    /// reference's syntactic/semantic parent; `None` for a kind the helper
+    /// does not classify (e.g. a XAML binding) or a wire from an older helper
+    /// binary — a missing field on this `Option<T>` deserializes to `None`
+    /// per the forward-compat rule, so an old helper against a new helios
+    /// still parses. Mapped to `UsageKind::Unknown` at ingest either way.
+    pub usage_kind: Option<String>,
 }
 
 /// A `relation` record: one declared supertype edge (`extends` or `implements`).
@@ -603,6 +610,17 @@ mod tests {
         let (output, _warnings) = parse_analyze(stdout).expect("parse");
         assert_eq!(output.references.len(), 1);
         assert!(output.references[0].container_docid.is_none());
+    }
+
+    /// An old-format `reference` record with no `usage_kind` key at all —
+    /// the wire an older helper binary sends against a new helios — still
+    /// parses, with the field read as `None`.
+    #[test]
+    fn parse_analyze_old_reference_without_usage_kind_still_parses() {
+        let stdout = "{\"type\":\"reference\",\"docid\":\"M:App.Person.Greet\",\"file\":\"Program.cs\",\"line\":5,\"col\":13,\"is_definition\":false}\n";
+        let (output, _warnings) = parse_analyze(stdout).expect("parse");
+        assert_eq!(output.references.len(), 1);
+        assert!(output.references[0].usage_kind.is_none());
     }
 
     #[test]

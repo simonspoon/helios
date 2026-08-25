@@ -135,8 +135,10 @@ internal static class Xaml
             {
                 return;
             }
-            // No C# enclosing symbol for a binding expression in markup.
-            Program.WriteReference(context.Stdout, docid, context.File, info.LineNumber, column, isDefinition: false, containerDocid: null);
+            // No C# enclosing symbol for a binding expression in markup, and usage_kind is
+            // unknown too: whether a binding reads, writes, or both depends on its Mode
+            // (OneWay/TwoWay/OneWayToSource), which this XML-only pass does not model.
+            Program.WriteReference(context.Stdout, docid, context.File, info.LineNumber, column, isDefinition: false, containerDocid: null, usageKind: Program.UsageKind.Unknown);
         });
     }
 

@@ -152,6 +152,42 @@ pub struct ParsedImport {
     pub names: Vec<String>,
 }
 
+/// Whether a reference site reads, writes, or both reads and writes its
+/// target — `x.f`, `x.f = 1`, `x.f += 1`. `Unknown` is the fallback for a
+/// usage the indexer could not classify confidently, and the default: never
+/// guessed as `Read`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UsageKind {
+    Read,
+    Write,
+    ReadWrite,
+    #[default]
+    Unknown,
+}
+
+impl UsageKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UsageKind::Read => "read",
+            UsageKind::Write => "write",
+            UsageKind::ReadWrite => "readwrite",
+            UsageKind::Unknown => "unknown",
+        }
+    }
+
+    /// Unrecognised text (a value from a future helios, or DB corruption)
+    /// decodes to `Unknown` rather than erroring — same "don't guess" rule
+    /// as an unclassified usage at index time.
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "read" => UsageKind::Read,
+            "write" => UsageKind::Write,
+            "readwrite" => UsageKind::ReadWrite,
+            _ => UsageKind::Unknown,
+        }
+    }
+}
+
 /// Parsed reference data before insertion
 #[derive(Debug, Clone)]
 pub struct ParsedReference {
@@ -167,6 +203,8 @@ pub struct ParsedReference {
     /// import binds a bare name only, so qualified usages are exempt from
     /// import-based attribution in `symbol_references`.
     pub qualified: bool,
+    /// Whether this usage reads, writes, or both reads and writes the target.
+    pub usage_kind: UsageKind,
 }
 
 /// Parsed type-relation data before insertion (`class C extends B`, `impl
@@ -190,6 +228,17 @@ pub struct ParsedTypeRelation {
     pub super_name: String,
     /// "extends" | "implements".
     pub kind: String,
+}
+
+/// One usage site returned by `symbol_references` — a 5-tuple got unwieldy
+/// once `usage_kind` joined `path`/`line`/`column`/`container`.
+#[derive(Debug, Clone)]
+pub struct ReferenceSite {
+    pub path: String,
+    pub line: i64,
+    pub column: i64,
+    pub container: Option<String>,
+    pub usage_kind: UsageKind,
 }
 
 impl Database {
@@ -257,7 +306,8 @@ impl Database {
                 line INTEGER NOT NULL,
                 column INTEGER NOT NULL,
                 qualified INTEGER NOT NULL DEFAULT 0,
-                container_symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL
+                container_symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
+                usage_kind TEXT NOT NULL DEFAULT 'unknown'
             );
 
             CREATE TABLE IF NOT EXISTS metadata (
@@ -374,6 +424,18 @@ impl Database {
         if !has_container_symbol_id {
             self.conn.execute_batch(
                 "ALTER TABLE references_ ADD COLUMN container_symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL",
+            )?;
+        }
+
+        // Check if usage_kind column exists in references_ table
+        let has_usage_kind: bool = self
+            .conn
+            .prepare("SELECT usage_kind FROM references_ LIMIT 0")
+            .is_ok();
+
+        if !has_usage_kind {
+            self.conn.execute_batch(
+                "ALTER TABLE references_ ADD COLUMN usage_kind TEXT NOT NULL DEFAULT 'unknown'",
             )?;
         }
 
@@ -942,16 +1004,28 @@ impl Database {
     /// graph moves when *either* side of it changes, and an incremental update
     /// only re-indexes the files that changed. A pruned row could not be
     /// brought back when the file it pointed at was the one that moved.
-    #[allow(clippy::type_complexity)]
+    ///
+    /// `kinds`, when `Some`, additionally restricts rows to those whose
+    /// `usage_kind` is one of the given kinds (`deps --reads`/`--writes`);
+    /// `None` applies no such filter.
     pub fn symbol_references(
         &self,
         symbol_ids: &[i64],
-    ) -> Result<Vec<(String, i64, i64, Option<String>)>> {
+        kinds: Option<&[UsageKind]>,
+    ) -> Result<Vec<ReferenceSite>> {
         if symbol_ids.is_empty() {
             return Ok(Vec::new());
         }
+        let kind_strs: Vec<&str> = kinds
+            .map(|ks| ks.iter().map(UsageKind::as_str).collect())
+            .unwrap_or_default();
+        let kind_filter = if kind_strs.is_empty() {
+            String::new()
+        } else {
+            format!(" AND r.usage_kind IN ({})", placeholders(kind_strs.len()))
+        };
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT DISTINCT f.path, r.line, r.column, c.name
+            "SELECT DISTINCT f.path, r.line, r.column, c.name, r.usage_kind
              FROM references_ r
              JOIN files f ON r.file_id = f.id
              JOIN symbols s ON s.id = r.symbol_id
@@ -980,16 +1054,24 @@ impl Database {
                        )
                  )
                )
+               {}
              ORDER BY f.path, r.line, r.column",
-            placeholders(symbol_ids.len())
+            placeholders(symbol_ids.len()),
+            kind_filter
         ))?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(symbol_ids), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
+        let params: Vec<&dyn rusqlite::ToSql> = symbol_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .chain(kind_strs.iter().map(|k| k as &dyn rusqlite::ToSql))
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(ReferenceSite {
+                path: row.get(0)?,
+                line: row.get(1)?,
+                column: row.get(2)?,
+                container: row.get(3)?,
+                usage_kind: UsageKind::from_str(&row.get::<_, String>(4)?),
+            })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
             .context("querying symbol references")
@@ -1006,11 +1088,20 @@ impl Database {
         column: i64,
         qualified: bool,
         container_symbol_id: Option<i64>,
+        usage_kind: UsageKind,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO references_ (symbol_id, file_id, line, column, qualified, container_symbol_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![symbol_id, file_id, line, column, qualified, container_symbol_id],
+            "INSERT INTO references_ (symbol_id, file_id, line, column, qualified, container_symbol_id, usage_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                symbol_id,
+                file_id,
+                line,
+                column,
+                qualified,
+                container_symbol_id,
+                usage_kind.as_str()
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -1030,6 +1121,7 @@ impl Database {
         column: i64,
         qualified: bool,
         container_symbol_id: Option<i64>,
+        usage_kind: UsageKind,
     ) -> Result<usize> {
         for &symbol_id in symbol_ids {
             self.insert_reference(
@@ -1039,6 +1131,7 @@ impl Database {
                 column,
                 qualified,
                 container_symbol_id,
+                usage_kind,
             )?;
         }
         Ok(symbol_ids.len())
@@ -1381,16 +1474,15 @@ impl Database {
 
     /// Bump this when adding a table or pass that a full re-index must
     /// populate for every file, not just ones whose content changed.
-    /// Current: 3 — a cross-file subtype (e.g. a Rust `impl Trait for Type`
-    /// where `Type` lives in another file) used to be dropped entirely by
-    /// `index_file_definitions`, since `sub_symbol_id` was `NOT NULL` and
-    /// only resolvable against symbols already inserted for the same file.
-    /// Now such a relation is stored unresolved (mirroring the existing
-    /// external-supertype handling) and picked up by `resolve_type_relations`.
-    /// An unchanged file's content hash gives no signal that helios now
-    /// extracts an edge from it that it silently missed before, so this bump
-    /// forces the same backfill-on-upgrade re-parse version 2 introduced.
-    pub const CURRENT_INDEX_FORMAT_VERSION: &str = "3";
+    /// Current: 4 — every reference row now carries a `usage_kind`
+    /// (read/write/readwrite/unknown), classified from the reference site's
+    /// syntax. A pre-existing row's `usage_kind` was backfilled to
+    /// `'unknown'` by the additive `ALTER TABLE` migration alone, which is
+    /// correct as a placeholder but not as a final answer — the file's
+    /// content hash is unchanged, so nothing else would ever re-derive the
+    /// real kind for it. Same reasoning as version 3: this bump forces the
+    /// same backfill-on-upgrade re-parse.
+    pub const CURRENT_INDEX_FORMAT_VERSION: &str = "4";
 
     pub fn set_metadata(&self, key: &str, value: &str) -> Result<()> {
         self.conn.execute(
@@ -2186,7 +2278,8 @@ mod tests {
         assert!(container.is_none());
 
         // A new insert through the current API works
-        db.insert_reference(1, 1, 9, 0, false, None).unwrap();
+        db.insert_reference(1, 1, 9, 0, false, None, UsageKind::Read)
+            .unwrap();
         let ref_count: i64 = db
             .conn
             .query_row("SELECT COUNT(*) FROM references_", [], |row| row.get(0))
@@ -2204,5 +2297,145 @@ mod tests {
             names.iter().any(|n| n == "idx_refs_container"),
             "idx_refs_container missing from {names:?}"
         );
+    }
+
+    /// References of each of the four kinds round-trip through
+    /// `symbol_references`, and `--writes`-style filtering (`Write`,
+    /// `ReadWrite`) excludes both `Read` and `Unknown`.
+    #[test]
+    fn usage_kind_round_trips_and_filters() {
+        let db = Database::open_in_memory().unwrap();
+        let file = db.upsert_file("src/lib.rs", "hash", "rust").unwrap();
+        let target_file = db.upsert_file("src/target.rs", "hash", "rust").unwrap();
+        let target = db
+            .insert_symbol(
+                target_file,
+                &ParsedSymbol {
+                    name: "count".to_string(),
+                    kind: "field".to_string(),
+                    line: 1,
+                    column: 0,
+                    end_line: 1,
+                    visibility: "pub".to_string(),
+                    scope: None,
+                    params: None,
+                    returns: None,
+                },
+            )
+            .unwrap();
+
+        db.insert_reference(target, file, 10, 0, false, None, UsageKind::Read)
+            .unwrap();
+        db.insert_reference(target, file, 11, 0, false, None, UsageKind::Write)
+            .unwrap();
+        db.insert_reference(target, file, 12, 0, false, None, UsageKind::ReadWrite)
+            .unwrap();
+        db.insert_reference(target, file, 13, 0, false, None, UsageKind::Unknown)
+            .unwrap();
+
+        let all = db.symbol_references(&[target], None).unwrap();
+        assert_eq!(all.len(), 4);
+        let mut kinds: Vec<UsageKind> = all.iter().map(|s| s.usage_kind).collect();
+        kinds.sort_by_key(|k| k.as_str());
+        assert_eq!(
+            kinds,
+            vec![
+                UsageKind::Read,
+                UsageKind::ReadWrite,
+                UsageKind::Unknown,
+                UsageKind::Write,
+            ]
+        );
+
+        let writes = db
+            .symbol_references(&[target], Some(&[UsageKind::Write, UsageKind::ReadWrite]))
+            .unwrap();
+        let write_lines: Vec<i64> = writes.iter().map(|s| s.line).collect();
+        assert_eq!(write_lines, vec![11, 12]);
+    }
+
+    /// A pre-existing `references_` row from before `usage_kind` existed
+    /// migrates to `unknown`, not `read` — the migration cannot know what a
+    /// row it never classified actually did, so it must not guess the
+    /// common case as a default.
+    #[test]
+    fn test_legacy_db_migrates_usage_kind_to_unknown_not_read() {
+        // Hand-create a DB whose references_ table predates usage_kind, then
+        // reopen through Database::open to exercise the migration.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    id INTEGER PRIMARY KEY,
+                    path TEXT NOT NULL UNIQUE,
+                    content_hash TEXT NOT NULL,
+                    language TEXT NOT NULL,
+                    last_indexed_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE symbols (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    line INTEGER NOT NULL,
+                    column INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL DEFAULT 0,
+                    visibility TEXT NOT NULL DEFAULT 'private',
+                    scope TEXT,
+                    docid TEXT
+                );
+                CREATE TABLE imports (
+                    id INTEGER PRIMARY KEY,
+                    source_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    import_path TEXT NOT NULL,
+                    alias TEXT,
+                    resolved_file_id INTEGER REFERENCES files(id) ON DELETE SET NULL
+                );
+                CREATE TABLE references_ (
+                    id INTEGER PRIMARY KEY,
+                    symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+                    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    line INTEGER NOT NULL,
+                    column INTEGER NOT NULL,
+                    qualified INTEGER NOT NULL DEFAULT 0,
+                    container_symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL
+                );
+                CREATE TABLE metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO files (id, path, content_hash, language) VALUES (1, 'src/a.cs', 'h1', 'csharp');
+                INSERT INTO symbols (name, kind, file_id, line, column, end_line, visibility, scope)
+                    VALUES ('Greet', 'fn', 1, 3, 4, 5, 'pub', 'Person');
+                INSERT INTO references_ (symbol_id, file_id, line, column) VALUES (1, 1, 8, 2);",
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(&db_path).unwrap();
+
+        // No data loss
+        let ref_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM references_", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ref_count, 1);
+
+        // The pre-existing row reads back as Unknown, never guessed as Read.
+        let sites = db.symbol_references(&[1], None).unwrap();
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].usage_kind, UsageKind::Unknown);
+        assert_ne!(sites[0].usage_kind, UsageKind::Read);
+
+        // A new insert through the current API works
+        db.insert_reference(1, 1, 9, 0, false, None, UsageKind::Read)
+            .unwrap();
+        let ref_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM references_", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ref_count, 2);
     }
 }

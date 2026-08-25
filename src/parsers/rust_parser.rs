@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
 use super::{LanguageParser, ParseResult, is_function_local};
-use crate::db::{ParsedImport, ParsedReference, ParsedSymbol, ParsedTypeRelation};
+use crate::db::{ParsedImport, ParsedReference, ParsedSymbol, ParsedTypeRelation, UsageKind};
 
 /// Node kinds whose body holds function-local declarations.
 const CALLABLE_KINDS: &[&str] = &["function_item", "closure_expression"];
@@ -323,6 +323,24 @@ impl LanguageParser for RustParser {
         }
 
         // --- References (function calls) ---
+        //
+        // Member/field write targets (`x.count = 1`, `x.count += 1`, `&mut
+        // x.count`) are deliberately NOT captured here. Not because the
+        // node kinds are hard to find -- `assignment_expression left:
+        // (field_expression field: (field_identifier))` and friends are
+        // straightforward -- but because no parser in this codebase indexes
+        // plain fields as `ParsedSymbol`s, in any language. A captured
+        // field write therefore has no correct symbol to resolve to; it
+        // can only land on an unrelated same-named symbol elsewhere in the
+        // index (a function, a method, anything sharing that identifier),
+        // producing a confidently wrong "who mutates this" answer. That is
+        // worse than reporting no write at all, so these writes go
+        // uncaptured until field declarations become indexed symbols in
+        // their own right -- at which point a write capture would have
+        // something correct to resolve against, and revisiting this is
+        // worthwhile. Every other parser in `src/parsers/` follows this
+        // same rule for the same reason; this is the one comment that
+        // spells it out in full.
         let ref_query = Query::new(
             &self.language,
             r#"
@@ -345,6 +363,8 @@ impl LanguageParser for RustParser {
                     column: c.node.start_position().column as i64,
                     from_scope: None,
                     qualified: ref_query.capture_names()[c.index as usize] != "call_name",
+                    // These captures are calls, which read the callee.
+                    usage_kind: UsageKind::Read,
                 });
             }
         }
@@ -666,6 +686,34 @@ impl S {
         assert_eq!(
             relation_tuples(&result.type_relations),
             vec![("Unknown", None, "Trait", "implements")]
+        );
+    }
+
+    #[test]
+    fn test_ordinary_call_is_still_read() {
+        let parser = RustParser::new();
+        let result = parser.parse("fn f() { x.method(); }").unwrap();
+        let r = result
+            .references
+            .iter()
+            .find(|r| r.symbol_name == "method")
+            .unwrap();
+        assert_eq!(r.usage_kind, UsageKind::Read);
+    }
+
+    #[test]
+    fn test_assignment_targets_emit_no_reference() {
+        // Neither a bare local (`count = 1`) nor a field write (`x.count =
+        // 1`) is captured -- see the comment above the reference query for
+        // why field writes specifically are excluded.
+        let parser = RustParser::new();
+        let result = parser
+            .parse("fn f() { count = 1; x.count = 1; x.count += 1; }")
+            .unwrap();
+        assert!(
+            result.references.is_empty(),
+            "assignment targets must not be captured as references: {:?}",
+            result.references
         );
     }
 }
