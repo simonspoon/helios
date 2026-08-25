@@ -11,6 +11,38 @@ fn placeholders(n: usize) -> String {
     std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
 }
 
+/// The import-ownership filter shared by every query that walks a usage site
+/// in `references_` (aliased `r`) against the definition it names (aliased
+/// `s`): a bare usage belongs to the definition its file imports, not to
+/// every same-named definition elsewhere. First introduced in
+/// `symbol_references` (see its doc comment for the full rationale);
+/// `callees_of` and `callers_of` reuse it verbatim rather than duplicating it
+/// by hand, so the three queries can never drift apart on what counts as
+/// "this usage's" definition.
+const REFERENCE_OWNERSHIP_FILTER: &str = "(
+                 r.qualified = 1
+                 OR s.file_id = r.file_id
+                 OR EXISTS (
+                     SELECT 1 FROM imports i2
+                     JOIN import_names n2 ON n2.import_id = i2.id
+                     WHERE i2.source_file_id = r.file_id
+                       AND n2.name = s.name
+                       AND i2.resolved_file_id = s.file_id
+                 )
+                 OR NOT EXISTS (
+                     SELECT 1 FROM imports i
+                     JOIN import_names n ON n.import_id = i.id
+                     WHERE i.source_file_id = r.file_id
+                       AND n.name = s.name
+                       AND i.resolved_file_id IS NOT NULL
+                       AND i.resolved_file_id <> s.file_id
+                       AND EXISTS (
+                           SELECT 1 FROM symbols d
+                           WHERE d.file_id = i.resolved_file_id AND d.name = s.name
+                       )
+                 )
+               )";
+
 /// JSON-encode a symbol's parameter list for the `params` column. `None`
 /// (not callable) stores SQL NULL rather than the JSON string `"null"`, so
 /// `decode_params` can tell "no params column value" from "empty array".
@@ -239,6 +271,25 @@ pub struct ReferenceSite {
     pub column: i64,
     pub container: Option<String>,
     pub usage_kind: UsageKind,
+}
+
+/// One edge of the symbol-level call graph, as seen from either end:
+/// `callees_of` returns the callee's definition with the call site that
+/// reaches it, `callers_of` returns the caller's definition with that same
+/// call site. `path`/`line` are always the *far end's* definition — the
+/// callee's for `callees_of`, the caller's for `callers_of` — so `deps`'s
+/// traversal can print "definition reached" and "where it was called" as two
+/// separate, unambiguous things.
+#[derive(Debug, Clone)]
+pub struct CallEdge {
+    pub symbol_id: i64,
+    pub name: String,
+    pub scope: Option<String>,
+    pub path: String,      // definition file of the far end
+    pub line: i64,         // definition line of the far end
+    pub call_file: String, // where the call is written
+    pub call_line: i64,
+    pub call_column: i64,
 }
 
 impl Database {
@@ -1031,29 +1082,7 @@ impl Database {
              JOIN symbols s ON s.id = r.symbol_id
              LEFT JOIN symbols c ON c.id = r.container_symbol_id
              WHERE r.symbol_id IN ({})
-               AND (
-                 r.qualified = 1
-                 OR s.file_id = r.file_id
-                 OR EXISTS (
-                     SELECT 1 FROM imports i2
-                     JOIN import_names n2 ON n2.import_id = i2.id
-                     WHERE i2.source_file_id = r.file_id
-                       AND n2.name = s.name
-                       AND i2.resolved_file_id = s.file_id
-                 )
-                 OR NOT EXISTS (
-                     SELECT 1 FROM imports i
-                     JOIN import_names n ON n.import_id = i.id
-                     WHERE i.source_file_id = r.file_id
-                       AND n.name = s.name
-                       AND i.resolved_file_id IS NOT NULL
-                       AND i.resolved_file_id <> s.file_id
-                       AND EXISTS (
-                           SELECT 1 FROM symbols d
-                           WHERE d.file_id = i.resolved_file_id AND d.name = s.name
-                       )
-                 )
-               )
+               AND {REFERENCE_OWNERSHIP_FILTER}
                {}
              ORDER BY f.path, r.line, r.column",
             placeholders(symbol_ids.len()),
@@ -1075,6 +1104,102 @@ impl Database {
         })?;
         rows.collect::<Result<Vec<_>, _>>()
             .context("querying symbol references")
+    }
+
+    /// Callees: definitions referenced from inside the given symbols' bodies
+    /// — one step of `deps --to`'s call-graph walk, outward.
+    ///
+    /// A row's far end (`s`, the referenced definition) is what the same
+    /// `REFERENCE_OWNERSHIP_FILTER` `symbol_references` applies is scoped to
+    /// — an ambiguous callee name still fans out to one row per candidate
+    /// definition, so the caller of this method is walking a name-resolved
+    /// graph, not a type-resolved one, exactly as `symbol_references` already
+    /// is.
+    ///
+    /// "The call graph" is honest only up to what `references_` actually
+    /// records. On the tree-sitter path every row already is a call site —
+    /// each parser's reference query only captures `call_expression`/
+    /// `new_expression`/`call` nodes — so nothing here needs to filter for
+    /// "is this a call". The one exception is the C# semantic (Roslyn) path:
+    /// those rows can be a field read/write rather than a call (Roslyn sends
+    /// no is-call flag over the wire), so a semantic-indexed C# edge in this
+    /// graph may not be a call at all. `container_symbol_id IS NULL` rows
+    /// (a usage outside every symbol's line range — top-level/module-scope
+    /// code, a legacy row with `end_line = 0`, or, on the semantic path, an
+    /// unstamped/ambiguous container) never match `r.container_symbol_id IN
+    /// (...)`, so they are skipped without a special case — which also means
+    /// a call written at module scope is simply absent from this graph, not
+    /// walked with a missing far end.
+    pub fn callees_of(&self, symbol_ids: &[i64]) -> Result<Vec<CallEdge>> {
+        if symbol_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT DISTINCT s.id, s.name, s.scope, f.path, s.line, cf.path, r.line, r.column
+             FROM references_ r
+             JOIN symbols s ON s.id = r.symbol_id
+             JOIN files f ON f.id = s.file_id
+             JOIN files cf ON cf.id = r.file_id
+             WHERE r.container_symbol_id IN ({})
+               AND {REFERENCE_OWNERSHIP_FILTER}
+             ORDER BY f.path, s.line",
+            placeholders(symbol_ids.len())
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(symbol_ids), |row| {
+            Ok(CallEdge {
+                symbol_id: row.get(0)?,
+                name: row.get(1)?,
+                scope: row.get(2)?,
+                path: row.get(3)?,
+                line: row.get(4)?,
+                call_file: row.get(5)?,
+                call_line: row.get(6)?,
+                call_column: row.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("querying callees")
+    }
+
+    /// Callers: definitions whose body contains a reference to the given
+    /// symbols — the reverse of `callees_of`, one step of `deps --to`'s walk
+    /// inward. Same honesty caveats as `callees_of`: a call site written at
+    /// module scope has no container and so is invisible here (a caller
+    /// traversal can miss a top-level call site the same way `callees_of`
+    /// can), and a C# semantic-indexed row is not guaranteed to be a call at
+    /// all. The `JOIN symbols c ON c.id = r.container_symbol_id` is an inner
+    /// join on purpose: it is what skips rows whose container is NULL (the
+    /// far end, here) without a separate filter.
+    pub fn callers_of(&self, symbol_ids: &[i64]) -> Result<Vec<CallEdge>> {
+        if symbol_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT DISTINCT c.id, c.name, c.scope, cf.path, c.line, f.path, r.line, r.column
+             FROM references_ r
+             JOIN symbols s ON s.id = r.symbol_id
+             JOIN symbols c ON c.id = r.container_symbol_id
+             JOIN files cf ON cf.id = c.file_id
+             JOIN files f ON f.id = r.file_id
+             WHERE r.symbol_id IN ({})
+               AND {REFERENCE_OWNERSHIP_FILTER}
+             ORDER BY cf.path, c.line",
+            placeholders(symbol_ids.len())
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(symbol_ids), |row| {
+            Ok(CallEdge {
+                symbol_id: row.get(0)?,
+                name: row.get(1)?,
+                scope: row.get(2)?,
+                path: row.get(3)?,
+                line: row.get(4)?,
+                call_file: row.get(5)?,
+                call_line: row.get(6)?,
+                call_column: row.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("querying callers")
     }
 
     // --- Reference operations ---
@@ -1324,6 +1449,84 @@ impl Database {
         })?;
         rows.collect::<Result<Vec<_>, _>>()
             .context("querying overrides")
+    }
+
+    /// Symbol ids of members named `name` declared in a subtype of `scope` —
+    /// the possible dynamic-dispatch targets of a call to `scope.name`. Same
+    /// derivation as `overrides_of` (a member is an override purely by being
+    /// same-name-in-a-subtype), but returning ids rather than a printable
+    /// `TypeEdge` so `deps --to --follow-impls`'s traversal can continue
+    /// through them. The returned `String` is the `type_relations.kind`
+    /// (`"extends"`/`"implements"`) of the relation that made the subtype a
+    /// subtype — `deps` reports it as the edge's `edge_kind` so an inferred
+    /// hop says *why* it was inferred, not just that it was.
+    pub fn override_impl_ids(&self, name: &str, scope: &str) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT s.id, tr.kind
+             FROM symbols s
+             JOIN symbols sub ON sub.name = s.scope
+             JOIN type_relations tr ON tr.sub_symbol_id = sub.id
+             WHERE s.name = ?1
+               AND (tr.super_name = ?2 OR tr.super_name LIKE '%.' || ?2)",
+        )?;
+        let rows = stmt.query_map(params![name, scope], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("querying override implementations")
+    }
+
+    /// Symbol ids of members named `name` declared in a supertype of `scope`
+    /// — the mirror of `override_impl_ids`, walked the other way. Where
+    /// `override_impl_ids` answers "what might a call to `scope.name`
+    /// dispatch to?" (widening outward to overrides), this answers "what
+    /// base member might `scope.name` itself be reached *through*?"
+    /// (widening inward to the supertype it overrides) — a caller of
+    /// `Base.foo` may be a caller of `Sub.foo` precisely because it only
+    /// knows about `Base.foo`, so a `Callers` walk from `Sub.foo` has to
+    /// step to `Base.foo` to find those callers, not to some unrelated
+    /// sibling override. Derived, not stored, same as `overrides_of` and
+    /// `override_impl_ids`: a supertype member is implied by
+    /// same-name-in-a-supertype, so there is nothing new to maintain here
+    /// either.
+    pub fn supertype_member_ids(&self, name: &str, scope: &str) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT s.id, tr.kind
+             FROM symbols sub
+             JOIN type_relations tr ON tr.sub_symbol_id = sub.id
+             JOIN symbols s ON s.name = ?1
+             WHERE sub.name = ?2
+               AND (tr.super_name = s.scope OR tr.super_name LIKE '%.' || s.scope)",
+        )?;
+        let rows = stmt.query_map(params![name, scope], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("querying supertype members")
+    }
+
+    /// One symbol's own definition site and scope, keyed by id. `deps
+    /// --follow-impls` needs this: `override_impl_ids` hands back an id with
+    /// no further detail, and the traversal has to know the override's own
+    /// scope before it can look for its overrides in turn.
+    pub fn symbol_by_id(&self, id: i64) -> Result<Option<SymbolDefinition>> {
+        self.conn
+            .query_row(
+                "SELECT s.id, f.path, s.line, s.scope
+                 FROM symbols s JOIN files f ON f.id = s.file_id
+                 WHERE s.id = ?1",
+                params![id],
+                |row| {
+                    Ok(SymbolDefinition {
+                        id: row.get(0)?,
+                        path: row.get(1)?,
+                        line: row.get(2)?,
+                        scope: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .context("looking up symbol by id")
     }
 
     /// `(type_relations.id, super_name)` for every row still unresolved
@@ -2437,5 +2640,169 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM references_", [], |row| row.get(0))
             .unwrap();
         assert_eq!(ref_count, 2);
+    }
+
+    fn test_fn_symbol(name: &str, line: i64, scope: Option<&str>) -> ParsedSymbol {
+        ParsedSymbol {
+            name: name.to_string(),
+            kind: "function".to_string(),
+            line,
+            column: 0,
+            end_line: line + 5,
+            visibility: "pub".to_string(),
+            scope: scope.map(str::to_string),
+            params: None,
+            returns: None,
+        }
+    }
+
+    /// `callees_of`/`callers_of` are two views of the same `references_` row:
+    /// the same call from `run` to `parse_target` shows up as a callee of
+    /// `run`, and symmetrically as a caller of `parse_target`.
+    #[test]
+    fn callees_and_callers_of_are_symmetric() {
+        let db = Database::open_in_memory().unwrap();
+        let file = db.upsert_file("src/lib.rs", "hash", "rust").unwrap();
+        let caller = db
+            .insert_symbol(file, &test_fn_symbol("run", 10, None))
+            .unwrap();
+        let callee = db
+            .insert_symbol(file, &test_fn_symbol("parse_target", 30, None))
+            .unwrap();
+
+        db.insert_reference(callee, file, 15, 4, false, Some(caller), UsageKind::Read)
+            .unwrap();
+
+        let callees = db.callees_of(&[caller]).unwrap();
+        assert_eq!(callees.len(), 1);
+        assert_eq!(callees[0].symbol_id, callee);
+        assert_eq!(callees[0].name, "parse_target");
+        assert_eq!(callees[0].call_line, 15);
+        assert_eq!(callees[0].line, 30);
+
+        let callers = db.callers_of(&[callee]).unwrap();
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].symbol_id, caller);
+        assert_eq!(callers[0].name, "run");
+        assert_eq!(callers[0].call_line, 15);
+        assert_eq!(callers[0].line, 10);
+    }
+
+    /// A direct cycle (`a` calls `b`, `b` calls `a`) round-trips through both
+    /// queries as two ordinary edges — cycle termination is the traversal's
+    /// job (the `visited` set in `deps`'s call-graph BFS), not this query's;
+    /// `callees_of`/`callers_of` just report every edge that exists,
+    /// including ones that loop back.
+    #[test]
+    fn callees_of_reports_both_edges_of_a_direct_cycle() {
+        let db = Database::open_in_memory().unwrap();
+        let file = db.upsert_file("src/lib.rs", "hash", "rust").unwrap();
+        let a = db.insert_symbol(file, &test_fn_symbol("a", 1, None)).unwrap();
+        let b = db.insert_symbol(file, &test_fn_symbol("b", 10, None)).unwrap();
+
+        db.insert_reference(b, file, 3, 0, false, Some(a), UsageKind::Read)
+            .unwrap(); // a calls b
+        db.insert_reference(a, file, 12, 0, false, Some(b), UsageKind::Read)
+            .unwrap(); // b calls a
+
+        let a_callees: Vec<i64> = db
+            .callees_of(&[a])
+            .unwrap()
+            .iter()
+            .map(|e| e.symbol_id)
+            .collect();
+        assert_eq!(a_callees, vec![b]);
+        let b_callees: Vec<i64> = db
+            .callees_of(&[b])
+            .unwrap()
+            .iter()
+            .map(|e| e.symbol_id)
+            .collect();
+        assert_eq!(b_callees, vec![a]);
+    }
+
+    /// `override_impl_ids` finds the same subtype member `overrides_of` finds
+    /// for the same input, but returns its id (and the relation kind) so a
+    /// traversal can continue through it — and `symbol_by_id` then gives the
+    /// traversal that member's own scope, needed to look for *its* overrides
+    /// in turn.
+    #[test]
+    fn override_impl_ids_finds_subtype_members() {
+        let db = Database::open_in_memory().unwrap();
+        let sub_file = db.upsert_file("src/sub.rs", "hash", "rust").unwrap();
+
+        let sub = db
+            .insert_symbol(
+                sub_file,
+                &ParsedSymbol {
+                    name: "Sub".to_string(),
+                    kind: "struct".to_string(),
+                    line: 1,
+                    column: 0,
+                    end_line: 3,
+                    visibility: "pub".to_string(),
+                    scope: None,
+                    params: None,
+                    returns: None,
+                },
+            )
+            .unwrap();
+        let method = db
+            .insert_symbol(sub_file, &test_fn_symbol("foo", 5, Some("Sub")))
+            .unwrap();
+
+        db.insert_type_relation(Some(sub), "Sub", None, "Base", "implements", sub_file)
+            .unwrap();
+
+        let overrides = db.override_impl_ids("foo", "Base").unwrap();
+        assert_eq!(overrides, vec![(method, "implements".to_string())]);
+
+        let def = db.symbol_by_id(method).unwrap().unwrap();
+        assert_eq!(def.scope.as_deref(), Some("Sub"));
+        assert_eq!(def.line, 5);
+    }
+
+    /// `supertype_member_ids` is the mirror of `override_impl_ids`: given the
+    /// same override (`Sub.foo`, `Sub implements Base`), it walks the other
+    /// way and finds the *base* member (`Base.foo`) rather than a sibling
+    /// override — the two must never both point at the override, or a
+    /// `Callers` traversal would (as filed) treat the override as a caller
+    /// of itself.
+    #[test]
+    fn supertype_member_ids_finds_the_base_member() {
+        let db = Database::open_in_memory().unwrap();
+        let sub_file = db.upsert_file("src/sub.rs", "hash", "rust").unwrap();
+        let base_file = db.upsert_file("src/base.rs", "hash", "rust").unwrap();
+
+        let sub = db
+            .insert_symbol(
+                sub_file,
+                &ParsedSymbol {
+                    name: "Sub".to_string(),
+                    kind: "struct".to_string(),
+                    line: 1,
+                    column: 0,
+                    end_line: 3,
+                    visibility: "pub".to_string(),
+                    scope: None,
+                    params: None,
+                    returns: None,
+                },
+            )
+            .unwrap();
+        let override_method = db
+            .insert_symbol(sub_file, &test_fn_symbol("foo", 5, Some("Sub")))
+            .unwrap();
+        let base_method = db
+            .insert_symbol(base_file, &test_fn_symbol("foo", 2, Some("Base")))
+            .unwrap();
+
+        db.insert_type_relation(Some(sub), "Sub", None, "Base", "implements", sub_file)
+            .unwrap();
+
+        let supertypes = db.supertype_member_ids("foo", "Sub").unwrap();
+        assert_eq!(supertypes, vec![(base_method, "implements".to_string())]);
+        // Never the override itself.
+        assert!(!supertypes.iter().any(|(id, _)| *id == override_method));
     }
 }

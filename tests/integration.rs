@@ -5870,3 +5870,701 @@ fn test_cross_file_impl_resolves_sub_via_second_pass() {
         "the cross-file edge must not be silently dropped, got: {stdout}"
     );
 }
+
+// --------------------------------------------------------------------------
+// Task 914: `deps` gained symbol-level transitive traversal (`--depth` on a
+// symbol target, not just a file target), a call-path query (`--to`), and
+// dynamic-dispatch traversal (`--follow-impls`). See src/commands/deps.rs
+// (`bfs_call_graph`, `run_to_query`, `call_steps`) and src/db.rs
+// (`callees_of`, `callers_of`, `override_impl_ids`) for the implementation
+// exercised below.
+
+/// A 3-deep call chain (`a` -> `b` -> `c`), plus one unrelated function with
+/// no edges to or from the chain — shared by several tests below that need a
+/// deterministic call graph with known line numbers.
+fn write_call_chain_fixture(dir: &std::path::Path) {
+    std::fs::write(
+        dir.join("chain.rs"),
+        "pub fn a() {\n    b();\n}\n\npub fn b() {\n    c();\n}\n\npub fn c() {\n    println!(\"c\");\n}\n\npub fn unrelated() {\n    println!(\"unrelated\");\n}\n",
+    )
+    .unwrap();
+}
+
+/// Acceptance criterion 1: a symbol target now accepts `--depth`, but only
+/// additively — `--depth 1` (the pre-existing default) must still produce
+/// exactly today's JSON, with no `calls`/`calls_truncated`/`callers`/
+/// `callers_truncated` keys at all. This is the regression guard called out
+/// in the task: depth-1 symbol JSON is byte-identical to before the feature.
+#[test]
+fn test_deps_depth1_symbol_json_has_no_new_keys() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    write_call_chain_fixture(dir.path());
+
+    Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+
+    // Depth defaults to 1 when omitted, so both spellings must agree.
+    for args in [vec!["--json", "deps", "a"], vec!["--json", "deps", "a", "--depth", "1"]] {
+        let output = Command::new(&bin)
+            .args(&args)
+            .current_dir(dir.path())
+            .output()
+            .expect("deps a");
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+        let keys: std::collections::BTreeSet<&str> =
+            value.as_object().unwrap().keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> = [
+            "target",
+            "definitions",
+            "supertypes",
+            "implementors",
+            "overrides",
+            "edge_languages",
+            "dependencies",
+            "dependents",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            keys, expected,
+            "depth-1 symbol JSON must have exactly the pre-existing keys, got: {stdout}"
+        );
+    }
+}
+
+/// Acceptance criterion 1: `--depth N > 1` on a symbol target walks the call
+/// graph transitively (a -> b -> c), reporting each hop's depth. `--depth 1`
+/// must not surface `c` at all — it is two hops away from `a` — proving the
+/// new traversal is genuinely gated on `depth > 1`, not always-on.
+#[test]
+fn test_deps_symbol_depth_walks_transitive_calls() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    write_call_chain_fixture(dir.path());
+
+    Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+
+    // --depth 3 reaches c at depth 2 (a -> b at depth 1 -> c at depth 2).
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "a", "--depth", "3"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps a --depth 3");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+    let calls = value["calls"].as_array().expect("calls array");
+    let names_and_depths: Vec<(&str, u64)> = calls
+        .iter()
+        .map(|c| (c["name"].as_str().unwrap(), c["depth"].as_u64().unwrap()))
+        .collect();
+    assert!(
+        names_and_depths.contains(&("b", 1)),
+        "expected b at depth 1, got {names_and_depths:?}"
+    );
+    assert!(
+        names_and_depths.contains(&("c", 2)),
+        "expected c at depth 2, got {names_and_depths:?}"
+    );
+    assert_eq!(
+        value["calls_truncated"],
+        serde_json::json!(false),
+        "the whole chain fit inside depth 3, got: {stdout}"
+    );
+
+    // Human output: same depth-indented shape.
+    let output = Command::new(&bin)
+        .args(["deps", "a", "--depth", "3"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps a --depth 3 (human)");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Calls (what a reaches, transitively):"),
+        "expected a Calls section, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("b (depth 1)"),
+        "expected b at depth 1, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("c (depth 2)"),
+        "expected c at depth 2, got: {stdout}"
+    );
+
+    // --depth 1 must NOT reach c — depth-1 output is unchanged from before
+    // this feature, so a two-hop-away symbol has no way to appear.
+    let output = Command::new(&bin)
+        .args(["deps", "a", "--depth", "1"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps a --depth 1");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("Calls ("),
+        "depth 1 must not print a Calls section at all, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains(" c "),
+        "depth 1 must not reach c, got: {stdout}"
+    );
+}
+
+/// Acceptance criterion 2: `--to` returns the actual call chain, not a
+/// boolean. Each hop names both the callee's own definition site and the
+/// call site that produced the edge.
+#[test]
+fn test_deps_to_returns_full_call_chain() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    write_call_chain_fixture(dir.path());
+
+    Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "a", "--to", "c"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps a --to c");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+    assert_eq!(value["found"], serde_json::json!(true), "got: {stdout}");
+    let path = value["path"].as_array().expect("path array");
+    assert_eq!(path.len(), 2, "a -> b -> c is a 2-hop path, got: {stdout}");
+    assert_eq!(path[0]["name"].as_str(), Some("b"));
+    assert_eq!(path[0]["depth"].as_u64(), Some(1));
+    assert_eq!(path[1]["name"].as_str(), Some("c"));
+    assert_eq!(path[1]["depth"].as_u64(), Some(2));
+    // Each hop names the call site that produced the edge, not just the
+    // callee's own definition.
+    assert!(path[0]["call_site"].is_object(), "got: {stdout}");
+    assert!(path[1]["call_site"].is_object(), "got: {stdout}");
+    assert_eq!(path[0]["inferred"], serde_json::json!(false));
+
+    let output = Command::new(&bin)
+        .args(["deps", "a", "--to", "c"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps a --to c (human)");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Path from a to c (2 calls, depth limit"),
+        "expected a path header, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("-> chain.rs:5 b (call at chain.rs:2)"),
+        "expected b's hop naming both its definition and the call site, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("-> chain.rs:9 c (call at chain.rs:6)"),
+        "expected c's hop naming both its definition and the call site, got: {stdout}"
+    );
+}
+
+/// Acceptance criterion 3: cycles terminate. A mutual-recursion pair
+/// (`ping` <-> `pong`) and a self-recursive function (`loopy`) must both
+/// finish `--depth 5` (and a `--to` query against an unreachable symbol) in
+/// bounded time, without the same symbol appearing twice in the output — the
+/// `visited` set is what makes this true, not luck about the depth chosen.
+#[test]
+fn test_deps_call_graph_cycles_terminate() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    std::fs::write(
+        dir.path().join("cycle.rs"),
+        "pub fn ping() {\n    pong();\n}\n\npub fn pong() {\n    ping();\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("selfrec.rs"),
+        "pub fn loopy() {\n    loopy();\n}\n",
+    )
+    .unwrap();
+
+    Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+
+    // Mutual recursion: `pong` must appear exactly once, not once per loop
+    // iteration around the cycle.
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "ping", "--depth", "5"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps ping --depth 5");
+    assert!(output.status.success(), "must terminate and exit successfully");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+    let calls = value["calls"].as_array().expect("calls array");
+    let pong_count = calls.iter().filter(|c| c["name"] == "pong").count();
+    assert_eq!(pong_count, 1, "pong must not be duplicated, got: {stdout}");
+    let ping_in_calls = calls.iter().any(|c| c["name"] == "ping");
+    assert!(
+        !ping_in_calls,
+        "ping is a starting symbol, not a discovered hop, got: {stdout}"
+    );
+
+    // Self-recursion: loopy calling itself must not create any hop at all —
+    // it is pre-seeded into `visited` as a starting symbol.
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "loopy", "--depth", "5"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps loopy --depth 5");
+    assert!(output.status.success(), "must terminate and exit successfully");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+    assert_eq!(
+        value["calls"].as_array().unwrap().len(),
+        0,
+        "a pure self-call must not surface as a discovered hop, got: {stdout}"
+    );
+
+    // A `--to` query against an unreachable symbol over a cyclic graph must
+    // also terminate rather than looping forever chasing the cycle.
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "ping", "--to", "loopy", "--depth", "5"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps ping --to loopy");
+    assert!(output.status.success(), "must terminate and exit successfully");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+    assert_eq!(value["found"], serde_json::json!(false), "got: {stdout}");
+}
+
+/// Acceptance criterion 4 (the most important one): a bounded search must
+/// never read as a complete one. Two symbols separated by more hops than
+/// `--depth` allows ("truncated: true") must be reported differently — in
+/// both JSON and human text — from two symbols with no connection at all
+/// ("truncated: false"). Conflating the two would let a search that simply
+/// gave up masquerade as proof no path exists.
+#[test]
+fn test_deps_to_distinguishes_truncated_from_no_path() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    write_call_chain_fixture(dir.path());
+
+    Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+
+    // c is 2 hops from a; --depth 1 cuts the search off before reaching it.
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "a", "--to", "c", "--depth", "1"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps a --to c --depth 1");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+    assert_eq!(value["found"], serde_json::json!(false), "got: {stdout}");
+    assert_eq!(
+        value["truncated"],
+        serde_json::json!(true),
+        "the depth limit, not exhaustion, is why no path was found, got: {stdout}"
+    );
+
+    let output = Command::new(&bin)
+        .args(["deps", "a", "--to", "c", "--depth", "1"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps a --to c --depth 1 (human)");
+    let truncated_message = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        truncated_message.contains("cut off at depth 1"),
+        "got: {truncated_message}"
+    );
+    assert!(
+        truncated_message.contains("a longer path may exist"),
+        "got: {truncated_message}"
+    );
+
+    // `unrelated` has no static edge to or from a/b/c at all — the depth
+    // limit (10, well above the chain's own length) is never the reason.
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "a", "--to", "unrelated", "--depth", "10"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps a --to unrelated");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+    assert_eq!(value["found"], serde_json::json!(false), "got: {stdout}");
+    assert_eq!(
+        value["truncated"],
+        serde_json::json!(false),
+        "the reachable set was exhausted, not cut off, got: {stdout}"
+    );
+
+    let output = Command::new(&bin)
+        .args(["deps", "a", "--to", "unrelated", "--depth", "10"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps a --to unrelated (human)");
+    let no_path_message = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        no_path_message.contains("was searched") && no_path_message.contains("no static call path exists"),
+        "got: {no_path_message}"
+    );
+    assert!(
+        !no_path_message.contains("cut off"),
+        "an exhausted search must not use the truncated search's wording, got: {no_path_message}"
+    );
+
+    // The two "not found" explanations must be genuinely different strings
+    // — this is the machine-readable criterion 4 made human-readable.
+    assert_ne!(
+        truncated_message, no_path_message,
+        "truncated and exhausted must read differently, not just differ in a shared template"
+    );
+}
+
+/// Acceptance criterion 4, transitive-traversal form: `--depth N` on a plain
+/// symbol target (no `--to`) must also disclose its own truncation via
+/// `calls_truncated`/`callers_truncated`, the same honesty requirement as
+/// the `--to` path query above.
+#[test]
+fn test_deps_transitive_calls_reports_own_truncation() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    write_call_chain_fixture(dir.path());
+
+    Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+
+    // Depth 2 reaches c but never gets to expand it (c sits exactly at the
+    // depth limit), so the walk must report itself as truncated.
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "a", "--depth", "2"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps a --depth 2");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+    assert_eq!(
+        value["calls_truncated"],
+        serde_json::json!(true),
+        "got: {stdout}"
+    );
+
+    let output = Command::new(&bin)
+        .args(["deps", "a", "--depth", "2"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps a --depth 2 (human)");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Calls truncated at depth 2:") && stdout.contains("still unexplored"),
+        "expected a truncation disclosure line, got: {stdout}"
+    );
+}
+
+/// Acceptance criterion 5: with `--follow-impls`, an edge reached only
+/// through dynamic dispatch (calling a base member whose subtype overrides
+/// it) is marked `inferred` — in both JSON and human output — and without
+/// the flag no such edge is produced at all. `Circle` overrides `Shape`'s
+/// `area`, so `deps area --scope Shape --follow-impls` must reach
+/// `Circle.area` as an inferred hop that `deps area --scope Shape` (no flag)
+/// does not.
+#[test]
+fn test_deps_follow_impls_marks_inferred_edges() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    std::fs::write(
+        dir.path().join("shapes.ts"),
+        "export class Shape {\n    area(): number {\n        return 0;\n    }\n}\nexport class Circle extends Shape {\n    area(): number {\n        return 3;\n    }\n}\n",
+    )
+    .unwrap();
+
+    Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+
+    // Without --follow-impls: no inferred edges at all, even at a depth that
+    // would otherwise be deep enough to reach the override.
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "area", "--scope", "Shape", "--depth", "2"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps area --scope Shape --depth 2");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+    let calls = value["calls"].as_array().expect("calls array");
+    assert!(
+        calls.iter().all(|c| c["inferred"] == serde_json::json!(false)),
+        "no edge should be marked inferred without --follow-impls, got: {stdout}"
+    );
+    assert!(
+        !calls.iter().any(|c| c["scope"] == serde_json::json!("Circle")),
+        "Circle.area must not be reached without --follow-impls, got: {stdout}"
+    );
+
+    // With --follow-impls: Circle.area is reached, marked inferred, with its
+    // relation kind ("extends") as edge_kind.
+    let output = Command::new(&bin)
+        .args([
+            "--json", "deps", "area", "--scope", "Shape", "--depth", "2", "--follow-impls",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps area --scope Shape --depth 2 --follow-impls");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+    let calls = value["calls"].as_array().expect("calls array");
+    let circle_area = calls
+        .iter()
+        .find(|c| c["scope"] == serde_json::json!("Circle"))
+        .unwrap_or_else(|| panic!("expected Circle.area reached via --follow-impls, got: {stdout}"));
+    assert_eq!(circle_area["inferred"], serde_json::json!(true));
+    assert_eq!(circle_area["edge_kind"], serde_json::json!("extends"));
+
+    let output = Command::new(&bin)
+        .args([
+            "deps", "area", "--scope", "Shape", "--depth", "2", "--follow-impls",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps area --scope Shape --depth 2 --follow-impls (human)");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Circle.area (depth 1) [inferred: extends]"),
+        "expected the inferred hop to be visually marked, got: {stdout}"
+    );
+}
+
+// --------------------------------------------------------------------------
+// Regression: `--follow-impls` in the Callers direction was applying the
+// same "widen to subtypes" rule the Callees direction correctly uses —
+// `override_impl_ids(name, scope)` always finds subtypes of `scope`, which
+// is right for "what might this call dispatch to" but wrong for "what calls
+// this": a sibling override is not a caller of the base member it overrides.
+// The fix branches `call_steps` on direction: Callers now bridges to the
+// *supertype*'s member (`Database::supertype_member_ids`) instead, so a
+// caller of the base member's real callers surface one hop further out, and
+// the base's own callers listing never gets polluted with unrelated
+// overrides. See src/commands/deps.rs `call_steps` (~182-247) and
+// `inferred_label` (~357-376).
+//
+// The fixture below writes real TypeScript (Shape, and Circle/Square both
+// `extends Shape` overriding `foo`) so `type_relations` and the three
+// `foo` symbols come from the real parser — but does NOT write any call to
+// `.foo()` in source. A textual `.foo()` call would itself be an ambiguous
+// name and fan out to a reference row per candidate definition (Shape's,
+// Circle's, and Square's `foo` all at once, a documented, unrelated
+// behavior — see `bfs_call_graph`'s doc comment), which would make it
+// impossible to tell "reached via the real edge" apart from "reached via
+// the inferred bridge" in these assertions. Instead, exactly one
+// `references_` row is inserted directly (`run` calling `Shape.foo`,
+// following the same seed-the-database convention
+// `test_deps_type_edge_external_cross_language_shows_declaring_file` uses),
+// so the only way from `Circle.foo` to `run` is through the bridge under
+// test.
+fn write_dispatch_fixture(dir: &std::path::Path) {
+    std::fs::write(
+        dir.join("shapes3.ts"),
+        "export class Shape {\n    foo(): number {\n        return 0;\n    }\n}\nexport class Circle extends Shape {\n    foo(): number {\n        return 1;\n    }\n}\nexport class Square extends Shape {\n    foo(): number {\n        return 2;\n    }\n}\nexport function run(): number {\n    return 0;\n}\n",
+    )
+    .unwrap();
+}
+
+/// Inserts one `references_` row recording `run` as a real (non-inferred)
+/// caller of `Shape.foo` — the only edge into the base member that exists
+/// anywhere in this fixture's graph.
+fn seed_run_calls_shape_foo(conn: &rusqlite::Connection) {
+    let file_id: i64 = conn
+        .query_row("SELECT id FROM files WHERE path = 'shapes3.ts'", [], |row| row.get(0))
+        .expect("finding shapes3.ts file row");
+    let shape_foo_id: i64 = conn
+        .query_row(
+            "SELECT id FROM symbols WHERE name = 'foo' AND scope = 'Shape'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("finding Shape.foo symbol row");
+    let run_id: i64 = conn
+        .query_row("SELECT id FROM symbols WHERE name = 'run'", [], |row| row.get(0))
+        .expect("finding run symbol row");
+    conn.execute(
+        "INSERT INTO references_ (symbol_id, file_id, line, column, qualified, container_symbol_id, usage_kind)
+         VALUES (?1, ?2, 17, 4, 0, ?3, 'read')",
+        rusqlite::params![shape_foo_id, file_id, run_id],
+    )
+    .expect("seeding run -> Shape.foo reference");
+}
+
+/// Direct regression guard for the bug: querying the BASE member's callers
+/// with `--follow-impls` must not surface either subtype's override —
+/// before the fix, `Circle.foo` and `Square.foo` would both appear here,
+/// mislabeled as callers of `Shape.foo`. Also covers "walking Callers from
+/// the base adds no inferred edges at all": the only entry present is the
+/// one real caller, and nothing here is `inferred: true`.
+#[test]
+fn test_deps_follow_impls_callers_from_base_excludes_sibling_overrides() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    write_dispatch_fixture(dir.path());
+
+    Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    {
+        let conn = rusqlite::Connection::open(dir.path().join(".helios").join("index.db"))
+            .expect("opening index.db");
+        seed_run_calls_shape_foo(&conn);
+    }
+
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "foo", "--scope", "Shape", "--depth", "2", "--follow-impls"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps foo --scope Shape --depth 2 --follow-impls");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+    let callers = value["callers"].as_array().expect("callers array");
+
+    assert!(
+        !callers.iter().any(|c| c["scope"] == serde_json::json!("Circle")),
+        "regression: Circle.foo (a sibling override) must not be reported as a caller of the base member, got: {stdout}"
+    );
+    assert!(
+        !callers.iter().any(|c| c["scope"] == serde_json::json!("Square")),
+        "regression: Square.foo (a sibling override) must not be reported as a caller of the base member, got: {stdout}"
+    );
+    assert!(
+        callers.iter().all(|c| c["inferred"] == serde_json::json!(false)),
+        "the base member has no supertype of its own, so --follow-impls must add nothing here, got: {stdout}"
+    );
+    let names: Vec<&str> = callers.iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names, vec!["run"],
+        "the only caller present must be the one genuine edge, got: {stdout}"
+    );
+
+    let output = Command::new(&bin)
+        .args(["deps", "foo", "--scope", "Shape", "--depth", "2", "--follow-impls"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps foo --scope Shape --depth 2 --follow-impls (human)");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Scoped to the Callers section specifically: Circle/Square legitimately
+    // appear elsewhere in this output (the Overrides section, and the Calls
+    // section's own --follow-impls dispatch, which is the correct, unrelated
+    // Callees-direction behaviour covered by
+    // `test_deps_follow_impls_marks_inferred_edges`).
+    let callers_section = stdout
+        .split("Callers (what reaches foo, transitively):")
+        .nth(1)
+        .unwrap_or_else(|| panic!("expected a Callers section, got: {stdout}"));
+    assert!(
+        !callers_section.contains("Circle") && !callers_section.contains("Square"),
+        "regression: neither override's name should appear in the base's Callers section, got: {stdout}"
+    );
+    assert!(
+        callers_section.contains("run (depth 1)"),
+        "expected the one genuine caller edge, got: {stdout}"
+    );
+}
+
+/// The fixed behaviour: from an override (`Circle.foo`), `--follow-impls`
+/// bridges inward to the base member (`Shape.foo`, marked `inferred: true`)
+/// at depth 1, and the base member's own genuine caller (`run`) surfaces
+/// one hop further out, at depth 2 — reachable only through the bridge,
+/// since `run` has no edge to `Circle.foo` in this fixture. Also asserts
+/// the human label is the new wording ("callers of ... may dispatch here"),
+/// not the old bare `[inferred: <kind>]` form the Callees direction still
+/// uses (see `test_deps_follow_impls_marks_inferred_edges`), since that
+/// wording would misdescribe the relationship in this direction.
+#[test]
+fn test_deps_follow_impls_callers_bridges_override_to_base_caller() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+    write_dispatch_fixture(dir.path());
+
+    Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    {
+        let conn = rusqlite::Connection::open(dir.path().join(".helios").join("index.db"))
+            .expect("opening index.db");
+        seed_run_calls_shape_foo(&conn);
+    }
+
+    let output = Command::new(&bin)
+        .args(["--json", "deps", "foo", "--scope", "Circle", "--depth", "2", "--follow-impls"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps foo --scope Circle --depth 2 --follow-impls");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("parsing deps JSON");
+    let callers = value["callers"].as_array().expect("callers array");
+
+    let bridge = callers
+        .iter()
+        .find(|c| c["name"] == "foo" && c["scope"] == serde_json::json!("Shape"))
+        .unwrap_or_else(|| panic!("expected Shape.foo reached as an inferred bridge, got: {stdout}"));
+    assert_eq!(bridge["inferred"], serde_json::json!(true), "got: {stdout}");
+    assert_eq!(bridge["depth"], serde_json::json!(1), "got: {stdout}");
+
+    let real_caller = callers
+        .iter()
+        .find(|c| c["name"] == "run")
+        .unwrap_or_else(|| panic!("expected run to surface via the bridge, got: {stdout}"));
+    assert_eq!(
+        real_caller["inferred"],
+        serde_json::json!(false),
+        "run is a genuine caller of the base member, not itself inferred, got: {stdout}"
+    );
+    assert_eq!(
+        real_caller["depth"],
+        serde_json::json!(2),
+        "run should surface one hop past the bridge, not directly at depth 1, got: {stdout}"
+    );
+
+    let output = Command::new(&bin)
+        .args(["deps", "foo", "--scope", "Circle", "--depth", "2", "--follow-impls"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps foo --scope Circle --depth 2 --follow-impls (human)");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[inferred: callers of Shape.foo may dispatch here]"),
+        "expected the new inward-direction wording, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("[inferred: extends]") && !stdout.contains("[inferred: implements]"),
+        "a Callers-direction inferred edge must not use the bare Callees-direction label, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("run (depth 2)"),
+        "expected run's real caller edge one hop past the bridge, got: {stdout}"
+    );
+}

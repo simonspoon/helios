@@ -187,7 +187,7 @@ symbol has one, so same-named symbols stay distinguishable. When a symbol's
 signature is known, it's appended: `(params)` for a callable, and
 ` -> returns` (callable) or `: returns` (field/const/variable) for its type.
 
-### `helios deps <TARGET> [--scope <S>] [--file <P>] [--depth <N>]`
+### `helios deps <TARGET> [--scope <S>] [--file <P>] [--depth <N>] [--to <T>] [--follow-impls]`
 
 Show dependencies and dependents for a symbol or file. Auto-detects the target
 type: a target with a `/` or a source-file extension is a file, anything else is
@@ -208,6 +208,17 @@ helios deps "src/parser.rs" --depth 3
 # Symbol references
 helios deps "parse_token"
 
+# Transitive call-graph reachability for a symbol target (depth 3): what
+# parse_token calls, and what calls it, up to 3 hops away
+helios deps "parse_token" --depth 3
+# Calls (what parse_token reaches, transitively):
+#   -> src/lexer.rs:40 next_token (depth 1)
+#     -> src/lexer.rs:12 advance (depth 2)
+# Callers (what reaches parse_token, transitively):
+#   -> src/parser.rs:88 parse_expr (depth 1)
+#     -> src/main.rs:20 main (depth 2)
+# Calls truncated at depth 3: 6 symbols were still unexplored.
+
 # One definition of an ambiguous name, three ways to say it
 helios deps "formatMoney" --file src/util
 helios deps "Compute" --scope PromoPricing
@@ -217,7 +228,91 @@ helios deps "src/util/money.ts:formatMoney"
 
 - `--scope <S>` — Restrict a symbol target to definitions in this scope (class or impl block), matched exactly
 - `--file <P>` — Restrict a symbol target to definitions in files matching this path (substring)
-- `--depth <N>` — Transitive traversal depth (default: 1, file targets only)
+- `--depth <N>` — Transitive traversal depth. For a file target or a plain symbol
+  target, default 1 (a symbol target at depth 1 is just its direct
+  dependencies/references, unchanged from before this flag applied to symbols
+  at all). For a `--to` path query, default 10, since depth 1 could never find
+  a call more than one hop away.
+- `--to <T>` — Find a call path from `TARGET` to `T` over the symbol-level call
+  graph (`references_.container_symbol_id` — the caller — to
+  `references_.symbol_id` — the callee). `T` accepts the same spellings as
+  `TARGET`. Reports the shortest path found, or explains why none was: hitting
+  the depth limit with symbols still unexplored ("a longer path may exist") is
+  a different, weaker answer than exhausting the whole reachable set ("no
+  static call path exists") — the two are never worded alike, so a bounded
+  search can't be mistaken for a complete one.
+- `--follow-impls` — When walking the call graph (`--depth N>1` or `--to`),
+  also add the dynamic-dispatch edge implied by an override — dispatch only
+  ever widens *outward*, from a base member to its overrides, never the
+  reverse, so the two traversal directions add a different edge:
+  - Outward (`Calls`, or `--to`'s forward search): from a member, add an edge
+    to every override of it declared on a subtype — a call through an
+    interface or trait object can dispatch to any of them at runtime, which
+    no `references_` row records directly. Marked `[inferred: <kind>]`
+    (`implements`/`extends`/`overrides`) in human output.
+  - Inward (`Callers`): from an override, add an edge to the *base* member it
+    overrides, not to a sibling override — an override is not a caller of
+    what it overrides, but a caller of the base member may in fact be a
+    caller of this override, since all it knows about is the base member's
+    name. The base member is a bridge node: its own callers surface at the
+    next depth. Marked `[inferred: callers of <base> may dispatch here]` in
+    human output, to say plainly what the edge means rather than name the
+    underlying relation (which would read backwards here).
+
+  Each of `override_impl_ids`/`supertype_member_ids` walks exactly one level
+  of the type hierarchy per call, so reaching a member two levels up or down
+  costs two `--depth` units, not one — `Leaf.foo` reaches `Mid.foo` at depth
+  1 and `Base.foo` at depth 2, for a three-level `Base <- Mid <- Leaf` chain.
+  The BFS still reaches the whole hierarchy, one hop further out per level.
+
+  Either way, `"inferred": true` in JSON, alongside `"via_supertype": true`
+  on an inward edge (`false` everywhere else) — `edge_kind` alone can't
+  distinguish "the far end is an override of the target" (outward) from
+  "the far end is the base member the target overrides" (inward, the
+  opposite relationship), so a JSON consumer needs this field the same way
+  the human label needs its different wording. A static edge is never marked
+  inferred.
+
+```bash
+# Shortest call path from `run` to `find_definitions`
+helios deps run --to find_definitions
+# Path from run to find_definitions (2 calls, depth limit 10):
+#   src/commands/deps.rs:118 run
+#   -> src/commands/deps.rs:30 parse_target (call at src/commands/deps.rs:150)
+#   -> src/db.rs:941 Database.find_definitions (call at src/commands/deps.rs:152)
+
+# Depth limit reached with symbols still unexplored: a longer path may exist
+helios deps run --to placeholders --depth 1
+# No path from run to placeholders within depth 1.
+# The search was cut off at depth 1 with 4 symbols still unexplored — a longer path may exist. Re-run with a larger --depth.
+
+# Whole reachable set searched, no path exists — a different answer from the
+# one above, and worded differently on purpose
+helios deps encode_params --to decode_params --depth 20
+# No path from encode_params to decode_params.
+# The whole reachable set from encode_params was searched (1 symbols, max depth 0) — no static call path exists in the index.
+# Calls through an interface or trait object are not static edges; re-run with --follow-impls to also follow implementors.
+```
+
+Every edge `deps` walks is name-resolved, not type-resolved: an ambiguous
+callee name fans out to one `references_` row per candidate definition (see
+"The resolved imports..." below), so a call whose static target is genuinely
+ambiguous is walked as though it reached every same-named candidate. A hop
+appearing in `--depth`'s Calls/Callers sections or in a `--to` path is
+evidence a call *could* resolve there — never proof that it does.
+
+The call graph is also only as complete as the reference data underneath it.
+On the tree-sitter path every `references_` row already is a real call site
+(each parser's reference query only captures call/`new` expression nodes),
+but a C# row indexed by the Roslyn semantic helper is not guaranteed to be a
+call at all — Roslyn sends no is-call flag over the wire, so a field read or
+write can show up as an edge for semantically-indexed C#. And a call written
+outside every symbol's line range (top-level or module-scope code) has no
+enclosing symbol to record as its caller, so it is invisible to `Callers` and
+to a `--to` path that would otherwise pass through it. `--follow-impls`
+inherits the same limits as `type_relations` generally: only Rust,
+TypeScript, Python and C# populate it, so the flag is a silent no-op for Go
+and Swift.
 
 A symbol name declared in more than one place is ambiguous, and an unnarrowed
 target covers every definition of it. `--scope` and `--file` — or the equivalent
@@ -484,7 +579,7 @@ commands/
   init.rs            Full indexing
   update.rs          Incremental indexing (git-aware)
   symbols.rs         Symbol search & filtering
-  deps.rs            Dependency analysis (transitive via --depth)
+  deps.rs            Dependency analysis (transitive via --depth, call paths via --to)
   flow.rs            Control-flow graph of one function body
   summary.rs         Directory-level overview
   diff.rs            Symbol changes since last index

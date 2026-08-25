@@ -94,15 +94,27 @@ enum Command {
         /// Restrict a symbol target to definitions in files matching this path
         #[arg(long)]
         file: Option<String>,
-        /// Transitive traversal depth (default: 1, file targets only)
-        #[arg(long, default_value = "1")]
-        depth: u32,
+        /// Transitive traversal depth. Default 1 for a plain symbol/file
+        /// target; default 10 for a `--to` path query, since depth 1 could
+        /// never find a call path longer than a single hop.
+        #[arg(long)]
+        depth: Option<u32>,
         /// Only show references that read the target (symbol targets only; today every tree-sitter reference is a read)
         #[arg(long)]
         reads: bool,
         /// Only show references that write the target (symbol targets only; writes are recorded for C# via Roslyn only)
         #[arg(long)]
         writes: bool,
+        /// Find a call path from TARGET to this symbol, over the call graph
+        /// (same target spellings as TARGET: bare name, Class.Method,
+        /// path/to/file.rs:name)
+        #[arg(long)]
+        to: Option<String>,
+        /// Also traverse into implementors/overrides of a member (dynamic
+        /// dispatch) — edges added this way are marked inferred, since no
+        /// call site names them directly
+        #[arg(long)]
+        follow_impls: bool,
     },
     /// Control-flow graph of one function body (Rust and C#)
     Flow {
@@ -189,6 +201,8 @@ fn main() {
             depth,
             reads,
             writes,
+            to,
+            follow_impls,
         } => commands::deps::run(
             target,
             cli.json,
@@ -198,6 +212,8 @@ fn main() {
             file.as_deref(),
             *reads,
             *writes,
+            to.as_deref(),
+            *follow_impls,
         ),
         Command::Flow {
             target,
