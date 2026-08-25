@@ -116,6 +116,22 @@ impl LanguageParser for PythonParser {
                 let visibility = Self::visibility_from_name(&sym_text);
                 let scope = find_class_scope(src, c.node);
 
+                let (params, returns) = if kind == "fn" {
+                    (
+                        def_node.child_by_field_name("parameters").map(|p| {
+                            let mut pc = p.walk();
+                            p.named_children(&mut pc)
+                                .map(|param| text_from(src, param).trim().to_string())
+                                .collect()
+                        }),
+                        def_node
+                            .child_by_field_name("return_type")
+                            .map(|t| text_from(src, t).trim().to_string()),
+                    )
+                } else {
+                    (None, None)
+                };
+
                 result.symbols.push(ParsedSymbol {
                     name: sym_text,
                     kind: kind.to_string(),
@@ -124,6 +140,8 @@ impl LanguageParser for PythonParser {
                     end_line: def_node.end_position().row as i64 + 1,
                     visibility: visibility.to_string(),
                     scope,
+                    params,
+                    returns,
                 });
             }
         }
@@ -208,7 +226,11 @@ impl LanguageParser for PythonParser {
                 let sym_text = text_from(src, c.node);
                 if sym_text.chars().all(|c| c.is_uppercase() || c == '_') && !sym_text.is_empty() {
                     // Use the grandparent (expression_statement) for end_line
-                    let def_node = c.node.parent().and_then(|p| p.parent()).unwrap_or(c.node);
+                    let assignment_node = c.node.parent();
+                    let def_node = assignment_node.and_then(|p| p.parent()).unwrap_or(c.node);
+                    let returns = assignment_node
+                        .and_then(|a| a.child_by_field_name("type"))
+                        .map(|t| text_from(src, t).trim().to_string());
                     result.symbols.push(ParsedSymbol {
                         name: sym_text,
                         kind: "const".to_string(),
@@ -217,6 +239,8 @@ impl LanguageParser for PythonParser {
                         end_line: def_node.end_position().row as i64 + 1,
                         visibility: "pub".to_string(),
                         scope: None,
+                        params: None,
+                        returns,
                     });
                 }
             }
@@ -340,6 +364,86 @@ class MyClass:
             .find(|s| s.name == "public_method")
             .unwrap();
         assert_eq!(pub_method.scope, Some("MyClass".to_string()));
+    }
+
+    #[test]
+    fn test_params_and_returns() {
+        let parser = PythonParser::new();
+        let source = r#"
+def add(x: int, y: int = 3) -> int:
+    return x + y
+
+def no_args():
+    pass
+
+def untyped_return(a):
+    return a
+
+class Service:
+    def method(self, *args, **kwargs):
+        pass
+"#;
+        let result = parser.parse(source).unwrap();
+
+        let add = result.symbols.iter().find(|s| s.name == "add").unwrap();
+        assert_eq!(
+            add.params,
+            Some(vec!["x: int".to_string(), "y: int = 3".to_string()])
+        );
+        assert_eq!(add.returns, Some("int".to_string()));
+
+        let no_args = result.symbols.iter().find(|s| s.name == "no_args").unwrap();
+        assert_eq!(no_args.params, Some(vec![]));
+        assert_eq!(no_args.returns, None);
+
+        let untyped = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "untyped_return")
+            .unwrap();
+        assert_eq!(untyped.returns, None);
+
+        let method = result.symbols.iter().find(|s| s.name == "method").unwrap();
+        assert_eq!(
+            method.params,
+            Some(vec![
+                "self".to_string(),
+                "*args".to_string(),
+                "**kwargs".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_class_has_no_params_or_returns() {
+        let parser = PythonParser::new();
+        let result = parser.parse("class C:\n    pass\n").unwrap();
+        let cls = result.symbols.iter().find(|s| s.name == "C").unwrap();
+        assert_eq!(cls.params, None);
+        assert_eq!(cls.returns, None);
+    }
+
+    #[test]
+    fn test_annotated_constant_records_returns() {
+        let parser = PythonParser::new();
+        let source = r#"
+MAX_SIZE: int = 100
+UNTYPED_CONST = 5
+"#;
+        let result = parser.parse(source).unwrap();
+        let max = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "MAX_SIZE")
+            .unwrap();
+        assert_eq!(max.returns, Some("int".to_string()));
+
+        let untyped = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "UNTYPED_CONST")
+            .unwrap();
+        assert_eq!(untyped.returns, None);
     }
 
     #[test]

@@ -68,6 +68,12 @@ enum Command {
         /// Filter by visibility (pub or private)
         #[arg(long)]
         visibility: Option<String>,
+        /// Only symbols with a parameter whose source spelling contains this
+        #[arg(long)]
+        param: Option<String>,
+        /// Only symbols whose return or declared type contains this
+        #[arg(long)]
+        returns: Option<String>,
         /// Show symbol body/source code
         #[arg(long)]
         body: bool,
@@ -149,6 +155,8 @@ fn main() {
             grep,
             scope,
             visibility,
+            param,
+            returns,
             body,
             limit,
             offset,
@@ -158,6 +166,8 @@ fn main() {
             grep.as_deref(),
             scope.as_deref(),
             visibility.as_deref(),
+            param.as_deref(),
+            returns.as_deref(),
             cli.json,
             compact,
             *body,

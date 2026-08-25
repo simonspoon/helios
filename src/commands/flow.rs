@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use crate::commands::deps::{SymbolTarget, parse_target};
 use crate::db::Database;
 use crate::errors::NoIndexError;
-use crate::flow::{ERR_EXIT, FlowGraph, build};
+use crate::flow::{ERR_EXIT, FlowGraph, StoredSignature, build};
 use crate::parsers::detect_language;
 
 /// Labels carry arbitrary source text. A `"` would close the label early and a
@@ -159,11 +159,14 @@ pub fn run(
             None,
             None,
             None,
+            None,
+            None,
         )?
         .into_iter()
         .filter(|(sym, _)| sym.name == symbol.name)
-        // Overloads differ only by their parameters, which the index does not
-        // record, so the line is the only thing that tells them apart.
+        // Overloads differ only by their parameters. The index records those
+        // now, but there is no `--params` flag to disambiguate by them, so
+        // `--line` remains the only way to pick one.
         .filter(|(sym, _)| line.is_none_or(|l| sym.line == l))
         .collect();
 
@@ -194,6 +197,10 @@ pub fn run(
     let source =
         std::fs::read_to_string(cwd.join(&path)).with_context(|| format!("reading {path}"))?;
 
+    let stored = StoredSignature {
+        params: sym.params.clone(),
+        returns: sym.returns.clone(),
+    };
     let graph = build(
         language,
         &source,
@@ -201,6 +208,7 @@ pub fn run(
         &sym.name,
         sym.scope.as_deref(),
         sym.line,
+        Some(&stored),
     )?;
 
     if json {

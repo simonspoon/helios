@@ -46,6 +46,43 @@ fn detect_visibility(source: &[u8], node: tree_sitter::Node) -> String {
     }
 }
 
+/// Each parameter's source spelling, verbatim (external label, internal
+/// name, type, default). `def_node` is the function_declaration itself --
+/// tree-sitter-swift hangs `parameter` nodes off it as plain positional
+/// children rather than under a parameter-list node, and it attaches a
+/// defaulted parameter's `= <value>` as *siblings* after the parameter
+/// rather than nesting them inside it, so a default has to be picked up by
+/// looking at the following two children.
+fn callable_params(source: &[u8], def_node: tree_sitter::Node) -> Option<Vec<String>> {
+    let mut cursor = def_node.walk();
+    let children: Vec<_> = def_node.children(&mut cursor).collect();
+    let mut params = Vec::new();
+    for (i, child) in children.iter().enumerate() {
+        if child.kind() != "parameter" {
+            continue;
+        }
+        let mut end = child.end_byte();
+        if children.get(i + 1).is_some_and(|n| n.kind() == "=")
+            && let Some(value) = children.get(i + 2)
+        {
+            end = value.end_byte();
+        }
+        let text = std::str::from_utf8(&source[child.start_byte()..end])
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        params.push(text);
+    }
+    Some(params)
+}
+
+/// The declared return type's source spelling (no leading `->`), if any.
+fn callable_returns(source: &[u8], def_node: tree_sitter::Node) -> Option<String> {
+    def_node
+        .child_by_field_name("return_type")
+        .map(|n| text_from(source, n).trim().to_string())
+}
+
 fn find_scope(source: &[u8], node: tree_sitter::Node) -> Option<String> {
     let mut current = node.parent();
     while let Some(parent) = current {
@@ -144,6 +181,18 @@ impl LanguageParser for SwiftParser {
                 let visibility = detect_visibility(src, def_node);
                 let scope = find_scope(src, node);
 
+                // Only `fn` (function_declaration) is callable here --
+                // init/method/etc. aren't captured as symbols by this
+                // query, so there's nothing else to give params/returns to.
+                let (params, returns) = if name == "fn_name" {
+                    (
+                        callable_params(src, def_node),
+                        callable_returns(src, def_node),
+                    )
+                } else {
+                    (None, None)
+                };
+
                 result.symbols.push(ParsedSymbol {
                     name: sym_text,
                     kind: kind.to_string(),
@@ -152,6 +201,8 @@ impl LanguageParser for SwiftParser {
                     end_line: def_node.end_position().row as i64 + 1,
                     visibility,
                     scope,
+                    params,
+                    returns,
                 });
             }
         }
@@ -214,6 +265,44 @@ impl LanguageParser for SwiftParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_params_and_returns_round_trip() {
+        let parser = SwiftParser::new();
+        let source = r#"
+func fetch(_ name: String, count: Int = 0, completion: @escaping () -> Void) -> [String] {
+    return []
+}
+
+func noop() {}
+
+func untyped() {
+}
+
+struct Config {
+    let host: String
+}
+"#;
+        let result = parser.parse(source).unwrap();
+        let sym = |name: &str| result.symbols.iter().find(|s| s.name == name).unwrap();
+
+        assert_eq!(
+            sym("fetch").params,
+            Some(vec![
+                "_ name: String".to_string(),
+                "count: Int = 0".to_string(),
+                "completion: @escaping () -> Void".to_string(),
+            ])
+        );
+        assert_eq!(sym("fetch").returns, Some("[String]".to_string()));
+
+        assert_eq!(sym("noop").params, Some(vec![]));
+        assert_eq!(sym("untyped").returns, None);
+
+        let config = sym("Config");
+        assert_eq!(config.params, None);
+        assert_eq!(config.returns, None);
+    }
 
     #[test]
     fn test_parse_swift_basics() {

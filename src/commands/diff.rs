@@ -30,6 +30,9 @@ struct ModifiedSymbol {
     kind: String,
     old_line: i64,
     new_line: i64,
+    /// "signature" when kind/visibility/params/returns changed, "body" when
+    /// only the line range moved.
+    change: &'static str,
 }
 
 pub fn run(json: bool, compact: bool) -> Result<()> {
@@ -174,20 +177,30 @@ pub fn run(json: bool, compact: bool) -> Result<()> {
                 }
             }
 
-            // Modified: same name, different line/end_line/kind/visibility
+            // Modified: same name, different line/end_line/kind/visibility/signature
             for (name, current_sym) in &current_by_name {
                 if let Some(db_sym) = db_by_name.get(name)
                     && (current_sym.line != db_sym.line
                         || current_sym.end_line != db_sym.end_line
                         || current_sym.kind != db_sym.kind
-                        || current_sym.visibility != db_sym.visibility)
+                        || current_sym.visibility != db_sym.visibility
+                        || signature_changed(current_sym, db_sym))
                 {
+                    let change = if current_sym.kind != db_sym.kind
+                        || current_sym.visibility != db_sym.visibility
+                        || signature_changed(current_sym, db_sym)
+                    {
+                        "signature"
+                    } else {
+                        "body"
+                    };
                     modified.push(ModifiedSymbol {
                         file: file_path.clone(),
                         name: current_sym.name.clone(),
                         kind: current_sym.kind.clone(),
                         old_line: db_sym.line,
                         new_line: current_sym.line,
+                        change,
                     });
                 }
             }
@@ -234,8 +247,8 @@ pub fn run(json: bool, compact: bool) -> Result<()> {
         }
         for sym in &modified {
             println!(
-                "~ {} {} ({}:{} -> {})",
-                sym.kind, sym.name, sym.file, sym.old_line, sym.new_line
+                "~ {} {} ({}:{} -> {}) [{}]",
+                sym.kind, sym.name, sym.file, sym.old_line, sym.new_line, sym.change
             );
         }
     }
@@ -243,10 +256,39 @@ pub fn run(json: bool, compact: bool) -> Result<()> {
     Ok(())
 }
 
+/// Whether a symbol's params or return/declared type changed between the
+/// stored record and the freshly parsed one.
+///
+/// A stored `None` means "not recorded" (a legacy index, or a row indexed
+/// before this feature existed), not "empty" — comparing it against a fresh
+/// `Some(..)` would flag every symbol in every legacy index as an API change
+/// on the first diff. So only compare a field when the stored side is `Some`.
+fn signature_changed(current: &crate::db::ParsedSymbol, stored: &crate::db::SymbolRecord) -> bool {
+    let params_changed = match &stored.params {
+        Some(stored_params) => current.params.as_deref() != Some(stored_params.as_slice()),
+        None => false,
+    };
+    let returns_changed = match &stored.returns {
+        Some(stored_returns) => current.returns.as_ref() != Some(stored_returns),
+        None => false,
+    };
+    params_changed || returns_changed
+}
+
 /// Get symbols for an exact file path from the DB.
 /// query_symbols uses LIKE with substring match, so we query then filter for exact path.
 fn get_exact_file_symbols(db: &Database, file_path: &str) -> Result<Vec<crate::db::SymbolRecord>> {
-    let results = db.query_symbols(Some(file_path), None, None, None, None, None, None)?;
+    let results = db.query_symbols(
+        Some(file_path),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
     Ok(results
         .into_iter()
         .filter(|(_, path)| path == file_path)

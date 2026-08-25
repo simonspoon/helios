@@ -898,6 +898,8 @@ mod tests {
                 end_line: line + 2,
                 visibility: "pub".to_string(),
                 scope: Some(scope.to_string()),
+                params: None,
+                returns: None,
             },
         )
         .unwrap()
@@ -928,6 +930,8 @@ mod tests {
                     end_line: 12,
                     visibility: "pub".to_string(),
                     scope: None,
+                    params: None,
+                    returns: None,
                 },
             )
             .unwrap();

@@ -15,7 +15,7 @@ pub fn run(json: bool, compact: bool, limit: Option<i64>, offset: Option<i64>) -
     let db = Database::open(&db_path).context("opening database")?;
 
     let paginated = limit.is_some() || offset.is_some();
-    let all_symbols = db.query_symbols(None, None, None, None, None, limit, offset)?;
+    let all_symbols = db.query_symbols(None, None, None, None, None, None, None, limit, offset)?;
 
     if json {
         let mut files: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();

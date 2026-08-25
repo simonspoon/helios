@@ -168,6 +168,8 @@ Options:
 - `--grep <PATTERN>` — Filter by symbol name (regex)
 - `--scope <SCOPE>` — Filter by scope (e.g. impl block or class name)
 - `--visibility <pub|private>` — Filter by visibility
+- `--param <SUBSTR>` — Only symbols with a parameter whose source spelling contains this
+- `--returns <SUBSTR>` — Only symbols whose return or declared type contains this
 - `--body` — Include each symbol's source body in the output
 - `--limit <N>` — Maximum number of symbols to return
 - `--offset <N>` — Number of symbols to skip
@@ -177,11 +179,13 @@ Output format:
 ```
 src/main.rs:42:0 fn pub main
 src/lib.rs:10:4 struct pub Parser
-src/Reporting.cs:6:18 fn pub Reporting.Compute
+src/Reporting.cs:6:18 fn pub Reporting.Compute(cfg: &Config) -> Result<(), Error>
 ```
 
 Names are qualified with their scope (class, impl block, or namespace) when the
-symbol has one, so same-named symbols stay distinguishable.
+symbol has one, so same-named symbols stay distinguishable. When a symbol's
+signature is known, it's appended: `(params)` for a callable, and
+` -> returns` (callable) or `: returns` (field/const/variable) for its type.
 
 ### `helios deps <TARGET> [--scope <S>] [--file <P>] [--depth <N>]`
 

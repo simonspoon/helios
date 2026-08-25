@@ -11,6 +11,20 @@ fn placeholders(n: usize) -> String {
     std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
 }
 
+/// JSON-encode a symbol's parameter list for the `params` column. `None`
+/// (not callable) stores SQL NULL rather than the JSON string `"null"`, so
+/// `decode_params` can tell "no params column value" from "empty array".
+fn encode_params(p: &Option<Vec<String>>) -> Option<String> {
+    p.as_ref()
+        .map(|v| serde_json::to_string(v).expect("Vec<String> always serializes"))
+}
+
+/// Inverse of `encode_params`. A malformed or legacy value decodes to
+/// `None` rather than panicking, since old rows may predate this column.
+fn decode_params(s: Option<String>) -> Option<Vec<String>> {
+    s.and_then(|s| serde_json::from_str(&s).ok())
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FileRecord {
     pub id: i64,
@@ -31,6 +45,12 @@ pub struct SymbolRecord {
     pub end_line: i64,
     pub visibility: String,
     pub scope: Option<String>,
+    /// Source spelling of each parameter, `None` for a non-callable symbol
+    /// or a legacy row.
+    pub params: Option<Vec<String>>,
+    /// Source spelling of the return type (callable) or declared type
+    /// (field/const/variable), `None` when absent or legacy.
+    pub returns: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -111,6 +131,11 @@ pub struct ParsedSymbol {
     pub end_line: i64,
     pub visibility: String,
     pub scope: Option<String>,
+    /// Source spelling of each parameter, `None` for a non-callable symbol.
+    pub params: Option<Vec<String>>,
+    /// Source spelling of the return type (callable) or declared type
+    /// (field/const/variable), `None` when absent.
+    pub returns: Option<String>,
 }
 
 /// Parsed import data before insertion
@@ -206,7 +231,9 @@ impl Database {
                 end_line INTEGER NOT NULL DEFAULT 0,
                 visibility TEXT NOT NULL DEFAULT 'private',
                 scope TEXT,
-                docid TEXT
+                docid TEXT,
+                params TEXT,
+                returns TEXT
             );
 
             CREATE TABLE IF NOT EXISTS imports (
@@ -302,6 +329,28 @@ impl Database {
         if !has_docid {
             self.conn
                 .execute_batch("ALTER TABLE symbols ADD COLUMN docid TEXT")?;
+        }
+
+        // Check if params column exists in symbols table
+        let has_params: bool = self
+            .conn
+            .prepare("SELECT params FROM symbols LIMIT 0")
+            .is_ok();
+
+        if !has_params {
+            self.conn
+                .execute_batch("ALTER TABLE symbols ADD COLUMN params TEXT")?;
+        }
+
+        // Check if returns column exists in symbols table
+        let has_returns: bool = self
+            .conn
+            .prepare("SELECT returns FROM symbols LIMIT 0")
+            .is_ok();
+
+        if !has_returns {
+            self.conn
+                .execute_batch("ALTER TABLE symbols ADD COLUMN returns TEXT")?;
         }
 
         // Check if qualified column exists in references_ table
@@ -477,8 +526,8 @@ impl Database {
 
     pub fn insert_symbol(&self, file_id: i64, sym: &ParsedSymbol) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO symbols (name, kind, file_id, line, column, end_line, visibility, scope)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO symbols (name, kind, file_id, line, column, end_line, visibility, scope, params, returns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 sym.name,
                 sym.kind,
@@ -488,6 +537,8 @@ impl Database {
                 sym.end_line,
                 sym.visibility,
                 sym.scope,
+                encode_params(&sym.params),
+                sym.returns,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -520,11 +571,13 @@ impl Database {
         grep: Option<&str>,
         scope: Option<&str>,
         visibility: Option<&str>,
+        param: Option<&str>,
+        returns: Option<&str>,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<Vec<(SymbolRecord, String)>> {
         let mut sql = String::from(
-            "SELECT s.id, s.name, s.kind, s.file_id, s.line, s.column, s.end_line, s.visibility, s.scope, f.path
+            "SELECT s.id, s.name, s.kind, s.file_id, s.line, s.column, s.end_line, s.visibility, s.scope, s.params, s.returns, f.path
              FROM symbols s JOIN files f ON s.file_id = f.id WHERE 1=1",
         );
         let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -548,6 +601,14 @@ impl Database {
         if let Some(v) = visibility {
             params_vec.push(Box::new(v.to_string()));
             sql.push_str(&format!(" AND s.visibility = ?{}", params_vec.len()));
+        }
+        if let Some(p) = param {
+            params_vec.push(Box::new(format!("%{p}%")));
+            sql.push_str(&format!(" AND s.params LIKE ?{}", params_vec.len()));
+        }
+        if let Some(r) = returns {
+            params_vec.push(Box::new(format!("%{r}%")));
+            sql.push_str(&format!(" AND s.returns LIKE ?{}", params_vec.len()));
         }
 
         sql.push_str(" ORDER BY f.path, s.line");
@@ -577,8 +638,10 @@ impl Database {
                     end_line: row.get(6)?,
                     visibility: row.get(7)?,
                     scope: row.get(8)?,
+                    params: decode_params(row.get(9)?),
+                    returns: row.get(10)?,
                 },
-                row.get::<_, String>(9)?,
+                row.get::<_, String>(11)?,
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -631,7 +694,7 @@ impl Database {
 
     pub fn find_symbol_by_name(&self, name: &str) -> Result<Vec<(SymbolRecord, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.id, s.name, s.kind, s.file_id, s.line, s.column, s.end_line, s.visibility, s.scope, f.path
+            "SELECT s.id, s.name, s.kind, s.file_id, s.line, s.column, s.end_line, s.visibility, s.scope, s.params, s.returns, f.path
              FROM symbols s JOIN files f ON s.file_id = f.id
              WHERE s.name = ?1 ORDER BY f.path, s.line",
         )?;
@@ -647,8 +710,10 @@ impl Database {
                     end_line: row.get(6)?,
                     visibility: row.get(7)?,
                     scope: row.get(8)?,
+                    params: decode_params(row.get(9)?),
+                    returns: row.get(10)?,
                 },
-                row.get::<_, String>(9)?,
+                row.get::<_, String>(11)?,
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -1445,7 +1510,7 @@ impl Database {
             format!("{dir_prefix}%")
         };
         let mut stmt = self.conn.prepare(
-            "SELECT s.id, s.name, s.kind, s.file_id, s.line, s.column, s.end_line, s.visibility, s.scope, f.path
+            "SELECT s.id, s.name, s.kind, s.file_id, s.line, s.column, s.end_line, s.visibility, s.scope, s.params, s.returns, f.path
              FROM symbols s JOIN files f ON s.file_id = f.id
              WHERE f.path LIKE ?1
              ORDER BY f.path, s.line",
@@ -1462,8 +1527,10 @@ impl Database {
                     end_line: row.get(6)?,
                     visibility: row.get(7)?,
                     scope: row.get(8)?,
+                    params: decode_params(row.get(9)?),
+                    returns: row.get(10)?,
                 },
-                row.get::<_, String>(9)?,
+                row.get::<_, String>(11)?,
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -1516,55 +1583,107 @@ mod tests {
             end_line: 15,
             visibility: "pub".to_string(),
             scope: Some("MyStruct".to_string()),
+            params: None,
+            returns: None,
         };
         let sym_id = db.insert_symbol(file_id, &sym).unwrap();
         assert!(sym_id > 0);
 
         let results = db
-            .query_symbols(None, None, None, None, None, None, None)
+            .query_symbols(None, None, None, None, None, None, None, None, None)
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.name, "my_function");
 
         // Filter by kind
         let results = db
-            .query_symbols(None, Some("fn"), None, None, None, None, None)
+            .query_symbols(None, Some("fn"), None, None, None, None, None, None, None)
             .unwrap();
         assert_eq!(results.len(), 1);
         let results = db
-            .query_symbols(None, Some("struct"), None, None, None, None, None)
+            .query_symbols(
+                None,
+                Some("struct"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(results.len(), 0);
 
         // Filter by grep
         let results = db
-            .query_symbols(None, None, Some("my_func"), None, None, None, None)
+            .query_symbols(
+                None,
+                None,
+                Some("my_func"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(results.len(), 1);
 
         // Filter by scope
         let results = db
-            .query_symbols(None, None, None, Some("MyStruct"), None, None, None)
+            .query_symbols(
+                None,
+                None,
+                None,
+                Some("MyStruct"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.name, "my_function");
 
         // Non-matching scope returns nothing
         let results = db
-            .query_symbols(None, None, None, Some("NonExistent"), None, None, None)
+            .query_symbols(
+                None,
+                None,
+                None,
+                Some("NonExistent"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(results.len(), 0);
 
         // Filter by visibility
         let results = db
-            .query_symbols(None, None, None, None, Some("pub"), None, None)
+            .query_symbols(None, None, None, None, Some("pub"), None, None, None, None)
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.visibility, "pub");
 
         // Non-matching visibility returns nothing
         let results = db
-            .query_symbols(None, None, None, None, Some("private"), None, None)
+            .query_symbols(
+                None,
+                None,
+                None,
+                None,
+                Some("private"),
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(results.len(), 0);
 
@@ -1675,6 +1794,8 @@ mod tests {
             end_line: 5,
             visibility: "pub".to_string(),
             scope: Some("Person".to_string()),
+            params: None,
+            returns: None,
         };
         let sym_id = db.insert_symbol(file_id, &sym).unwrap();
         let docid: Option<String> = db
@@ -1779,7 +1900,17 @@ mod tests {
 
         // Existing row data intact
         let results = db
-            .query_symbols(None, None, Some("Greet"), None, None, None, None)
+            .query_symbols(
+                None,
+                None,
+                Some("Greet"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.scope.as_deref(), Some("Person"));
@@ -1792,6 +1923,191 @@ mod tests {
             .collect::<std::result::Result<_, _>>()
             .unwrap();
         assert!(names.iter().any(|n| n == "idx_symbols_docid"));
+    }
+
+    #[test]
+    fn test_fresh_db_has_params_and_returns_columns() {
+        let db = Database::open_in_memory().unwrap();
+
+        assert!(
+            db.conn
+                .prepare("SELECT params FROM symbols LIMIT 0")
+                .is_ok()
+        );
+        assert!(
+            db.conn
+                .prepare("SELECT returns FROM symbols LIMIT 0")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_symbol_params_and_returns_round_trip() {
+        let db = Database::open_in_memory().unwrap();
+        let file_id = db.upsert_file("src/lib.rs", "hash", "rust").unwrap();
+
+        let sym = ParsedSymbol {
+            name: "add".to_string(),
+            kind: "fn".to_string(),
+            line: 1,
+            column: 0,
+            end_line: 3,
+            visibility: "pub".to_string(),
+            scope: None,
+            params: Some(vec!["a: i32".to_string()]),
+            returns: Some("i32".to_string()),
+        };
+        db.insert_symbol(file_id, &sym).unwrap();
+
+        let results = db
+            .query_symbols(None, None, Some("add"), None, None, None, None, None, None)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.params, Some(vec!["a: i32".to_string()]));
+        assert_eq!(results[0].0.returns, Some("i32".to_string()));
+    }
+
+    #[test]
+    fn test_legacy_db_migrates_params_and_returns() {
+        // Hand-create a DB with the pre-params/returns schema and rows, then
+        // reopen through Database::open to exercise the migration.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    id INTEGER PRIMARY KEY,
+                    path TEXT NOT NULL UNIQUE,
+                    content_hash TEXT NOT NULL,
+                    language TEXT NOT NULL,
+                    last_indexed_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE symbols (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    line INTEGER NOT NULL,
+                    column INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL DEFAULT 0,
+                    visibility TEXT NOT NULL DEFAULT 'private',
+                    scope TEXT,
+                    docid TEXT
+                );
+                CREATE TABLE imports (
+                    id INTEGER PRIMARY KEY,
+                    source_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    import_path TEXT NOT NULL,
+                    alias TEXT,
+                    resolved_file_id INTEGER REFERENCES files(id) ON DELETE SET NULL
+                );
+                CREATE TABLE references_ (
+                    id INTEGER PRIMARY KEY,
+                    symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+                    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    line INTEGER NOT NULL,
+                    column INTEGER NOT NULL
+                );
+                CREATE TABLE metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO files (id, path, content_hash, language) VALUES (1, 'src/a.cs', 'h1', 'csharp');
+                INSERT INTO symbols (name, kind, file_id, line, column, end_line, visibility, scope)
+                    VALUES ('Greet', 'fn', 1, 3, 4, 5, 'pub', 'Person');",
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(&db_path).unwrap();
+
+        assert!(
+            db.conn
+                .prepare("SELECT params FROM symbols LIMIT 0")
+                .is_ok()
+        );
+        assert!(
+            db.conn
+                .prepare("SELECT returns FROM symbols LIMIT 0")
+                .is_ok()
+        );
+
+        let results = db
+            .query_symbols(
+                None,
+                None,
+                Some("Greet"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.params, None);
+        assert_eq!(results[0].0.returns, None);
+    }
+
+    #[test]
+    fn test_query_symbols_filters_by_param_and_returns() {
+        let db = Database::open_in_memory().unwrap();
+        let file_id = db.upsert_file("src/lib.rs", "hash", "rust").unwrap();
+
+        db.insert_symbol(
+            file_id,
+            &ParsedSymbol {
+                name: "add".to_string(),
+                kind: "fn".to_string(),
+                line: 1,
+                column: 0,
+                end_line: 3,
+                visibility: "pub".to_string(),
+                scope: None,
+                params: Some(vec!["a: i32".to_string(), "b: i32".to_string()]),
+                returns: Some("i32".to_string()),
+            },
+        )
+        .unwrap();
+        db.insert_symbol(
+            file_id,
+            &ParsedSymbol {
+                name: "greet".to_string(),
+                kind: "fn".to_string(),
+                line: 5,
+                column: 0,
+                end_line: 7,
+                visibility: "pub".to_string(),
+                scope: None,
+                params: Some(vec!["name: &str".to_string()]),
+                returns: Some("String".to_string()),
+            },
+        )
+        .unwrap();
+
+        let results = db
+            .query_symbols(None, None, None, None, None, Some("i32"), None, None, None)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.name, "add");
+
+        let results = db
+            .query_symbols(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("String"),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.name, "greet");
     }
 
     #[test]

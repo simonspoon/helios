@@ -115,6 +115,27 @@ impl LanguageParser for GoParser {
                     None
                 };
 
+                let (params, returns) = match cname {
+                    "fn_name" | "method_name" => (
+                        def_node.child_by_field_name("parameters").map(|p| {
+                            let mut pc = p.walk();
+                            p.named_children(&mut pc)
+                                .map(|param| text_from(src, param).trim().to_string())
+                                .collect()
+                        }),
+                        def_node
+                            .child_by_field_name("result")
+                            .map(|r| text_from(src, r).trim().to_string()),
+                    ),
+                    "const_name" | "var_name" => (
+                        None,
+                        def_node
+                            .child_by_field_name("type")
+                            .map(|t| text_from(src, t).trim().to_string()),
+                    ),
+                    _ => (None, None),
+                };
+
                 result.symbols.push(ParsedSymbol {
                     name: sym_text,
                     kind: kind.to_string(),
@@ -123,6 +144,8 @@ impl LanguageParser for GoParser {
                     end_line: def_node.end_position().row as i64 + 1,
                     visibility: visibility.to_string(),
                     scope,
+                    params,
+                    returns,
                 });
             }
         }
@@ -223,6 +246,80 @@ func (s *Server) Start() error {
         let start = fns.iter().find(|s| s.name == "Start").unwrap();
         assert_eq!(start.visibility, "pub");
         assert_eq!(start.scope, Some("Server".to_string()));
+    }
+
+    #[test]
+    fn test_params_and_returns() {
+        let parser = GoParser::new();
+        let source = r#"
+package main
+
+func Add(a int, b, c string) (int, error) {
+    return a, nil
+}
+
+func NoArgs() {
+}
+
+func OneResult(x int) error {
+    return nil
+}
+"#;
+        let result = parser.parse(source).unwrap();
+        let fns: Vec<_> = result.symbols.iter().filter(|s| s.kind == "fn").collect();
+
+        let add = fns.iter().find(|s| s.name == "Add").unwrap();
+        assert_eq!(
+            add.params,
+            Some(vec!["a int".to_string(), "b, c string".to_string()])
+        );
+        assert_eq!(add.returns, Some("(int, error)".to_string()));
+
+        let no_args = fns.iter().find(|s| s.name == "NoArgs").unwrap();
+        assert_eq!(no_args.params, Some(vec![]));
+        assert_eq!(no_args.returns, None);
+
+        let one_result = fns.iter().find(|s| s.name == "OneResult").unwrap();
+        assert_eq!(one_result.params, Some(vec!["x int".to_string()]));
+        assert_eq!(one_result.returns, Some("error".to_string()));
+    }
+
+    #[test]
+    fn test_typed_const_records_returns() {
+        let parser = GoParser::new();
+        let source = r#"
+package main
+
+const MaxRetries int = 3
+const Untyped = 3
+"#;
+        let result = parser.parse(source).unwrap();
+        let max = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "MaxRetries")
+            .unwrap();
+        assert_eq!(max.returns, Some("int".to_string()));
+        assert_eq!(max.params, None);
+
+        let untyped = result.symbols.iter().find(|s| s.name == "Untyped").unwrap();
+        assert_eq!(untyped.returns, None);
+    }
+
+    #[test]
+    fn test_struct_has_no_params_or_returns() {
+        let parser = GoParser::new();
+        let source = r#"
+package main
+
+type Config struct {
+    Host string
+}
+"#;
+        let result = parser.parse(source).unwrap();
+        let cfg = result.symbols.iter().find(|s| s.name == "Config").unwrap();
+        assert_eq!(cfg.params, None);
+        assert_eq!(cfg.returns, None);
     }
 
     #[test]

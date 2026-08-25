@@ -40,6 +40,49 @@ fn text_from(source: &[u8], node: tree_sitter::Node) -> String {
         .to_string()
 }
 
+/// Each parameter's source spelling, verbatim (type, optionality, default,
+/// rest, destructuring pattern -- whatever is written). `def_node` is the
+/// function_declaration/method_definition/arrow_function itself.
+fn callable_params(source: &[u8], def_node: tree_sitter::Node) -> Option<Vec<String>> {
+    if let Some(params_node) = def_node.child_by_field_name("parameters") {
+        let mut cursor = params_node.walk();
+        return Some(
+            params_node
+                .named_children(&mut cursor)
+                .map(|p| text_from(source, p))
+                .collect(),
+        );
+    }
+    // Arrow functions may bind a single bare parameter instead of a
+    // parenthesized list: `x => x * 2`.
+    if let Some(param_node) = def_node.child_by_field_name("parameter") {
+        return Some(vec![text_from(source, param_node)]);
+    }
+    Some(Vec::new())
+}
+
+/// The declared return type's source spelling, with the leading `:` and
+/// surrounding whitespace stripped.
+fn callable_returns(source: &[u8], def_node: tree_sitter::Node) -> Option<String> {
+    def_node.child_by_field_name("return_type").map(|n| {
+        text_from(source, n)
+            .trim_start_matches(':')
+            .trim()
+            .to_string()
+    })
+}
+
+/// A variable/const declarator's own type annotation, if any -- the `type`
+/// field is on the declarator, not on the enclosing lexical_declaration.
+fn declared_type(source: &[u8], declarator_node: tree_sitter::Node) -> Option<String> {
+    declarator_node.child_by_field_name("type").map(|n| {
+        text_from(source, n)
+            .trim_start_matches(':')
+            .trim()
+            .to_string()
+    })
+}
+
 fn find_class_scope(source: &[u8], node: tree_sitter::Node) -> Option<String> {
     let mut current = node.parent();
     while let Some(parent) = current {
@@ -207,6 +250,33 @@ impl LanguageParser for TypeScriptParser {
                     None
                 };
 
+                // `fn`/method callables get their parameter list and return
+                // type; a const/var declarator gets its own type annotation
+                // (this parser never reclassifies an arrow-bound const as
+                // `fn`, so an arrow function's own signature is not surfaced
+                // here); everything else has neither.
+                let (params, returns) = match name {
+                    "fn_name" => {
+                        let fn_node = def_node.unwrap_or(node);
+                        (
+                            callable_params(src, fn_node),
+                            callable_returns(src, fn_node),
+                        )
+                    }
+                    "method_name" => {
+                        let fn_node = node.parent().unwrap_or(node);
+                        (
+                            callable_params(src, fn_node),
+                            callable_returns(src, fn_node),
+                        )
+                    }
+                    "const_name" | "var_name" => {
+                        let declarator_node = node.parent().unwrap_or(node);
+                        (None, declared_type(src, declarator_node))
+                    }
+                    _ => (None, None),
+                };
+
                 result.symbols.push(ParsedSymbol {
                     name: sym_text,
                     kind: kind.to_string(),
@@ -215,6 +285,8 @@ impl LanguageParser for TypeScriptParser {
                     end_line: end_node.end_position().row as i64 + 1,
                     visibility: visibility.to_string(),
                     scope,
+                    params,
+                    returns,
                 });
             }
         }
@@ -406,6 +478,70 @@ impl LanguageParser for TypeScriptParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_params_and_returns_round_trip() {
+        let parser = TypeScriptParser::new("typescript");
+        let source = r#"
+export function createServer(config: Config, opts?: Options, ...rest: string[]): Promise<Server> {
+    return new Server(config);
+}
+
+export function noop(): void {}
+
+function untyped() {}
+
+export const handler = (a: number, b: number): number => a + b;
+
+class Server {
+    start(host: string): void {}
+    stop(): void {}
+}
+
+export const PORT: number = 3000;
+const label = "x";
+
+export interface Config {
+    host: string;
+}
+"#;
+        let result = parser.parse(source).unwrap();
+        let sym = |name: &str| result.symbols.iter().find(|s| s.name == name).unwrap();
+
+        assert_eq!(
+            sym("createServer").params,
+            Some(vec![
+                "config: Config".to_string(),
+                "opts?: Options".to_string(),
+                "...rest: string[]".to_string(),
+            ])
+        );
+        assert_eq!(
+            sym("createServer").returns,
+            Some("Promise<Server>".to_string())
+        );
+
+        assert_eq!(sym("noop").params, Some(vec![]));
+        assert_eq!(sym("untyped").returns, None);
+
+        assert_eq!(
+            sym("handler").params,
+            None,
+            "an arrow bound to a const stays kind `const`, so its own params aren't surfaced"
+        );
+
+        assert_eq!(sym("start").params, Some(vec!["host: string".to_string()]));
+        assert_eq!(sym("start").returns, Some("void".to_string()));
+        assert_eq!(sym("stop").params, Some(vec![]));
+
+        assert_eq!(sym("PORT").returns, Some("number".to_string()));
+        assert_eq!(sym("PORT").params, None);
+        assert_eq!(sym("label").returns, None);
+
+        let iface = sym("Config");
+        assert_eq!(iface.params, None);
+        assert_eq!(iface.returns, None);
+    }
 
     #[test]
     fn test_parse_typescript() {

@@ -47,6 +47,8 @@ pub fn run(
     grep: Option<&str>,
     scope: Option<&str>,
     visibility: Option<&str>,
+    param: Option<&str>,
+    returns: Option<&str>,
     json: bool,
     compact: bool,
     body: bool,
@@ -85,10 +87,14 @@ pub fn run(
         }
     });
 
-    // regex_total_count holds the true count after regex filtering (only set when regex is active).
-    let (results, regex_total_count) = if let Some(ref re) = grep_re {
-        // When regex filtering, fetch all LIKE-matched results (no SQL limit/offset)
-        // so we can apply regex, then handle pagination in Rust.
+    // manual_total_count holds the true count after in-Rust filtering (only set
+    // when regex or param/returns filtering makes the SQL-side count unreliable).
+    // count_symbols doesn't know about param/returns, so any query using them
+    // must also compute its own total to keep pagination correct.
+    let (results, manual_total_count) = if grep_re.is_some() || param.is_some() || returns.is_some()
+    {
+        // Fetch all LIKE/param/returns-matched results (no SQL limit/offset) so we
+        // can apply the regex and handle pagination in Rust.
         // Pass the literal hint to LIKE for pre-filtering, not the raw regex.
         let all = db.query_symbols(
             file,
@@ -96,16 +102,21 @@ pub fn run(
             like_hint.as_deref(),
             scope,
             visibility,
+            param,
+            returns,
             None,
             None,
         )?;
-        let filtered: Vec<_> = all
-            .into_iter()
-            .filter(|(sym, _)| re.is_match(&sym.name))
-            .collect();
+        let filtered: Vec<_> = match &grep_re {
+            Some(re) => all
+                .into_iter()
+                .filter(|(sym, _)| re.is_match(&sym.name))
+                .collect(),
+            None => all,
+        };
         let total = filtered.len() as i64;
 
-        // Apply limit/offset in Rust after regex filtering
+        // Apply limit/offset in Rust after filtering
         let start = offset.unwrap_or(0) as usize;
         let page = if limit.is_some() || offset.is_some() {
             let end = match limit {
@@ -122,7 +133,9 @@ pub fn run(
         };
         (page, Some(total))
     } else {
-        let r = db.query_symbols(file, kind, grep, scope, visibility, limit, offset)?;
+        let r = db.query_symbols(
+            file, kind, grep, scope, visibility, None, None, limit, offset,
+        )?;
         (r, None)
     };
 
@@ -143,6 +156,8 @@ pub fn run(
                     "visibility": sym.visibility,
                     "name": sym.name,
                     "scope": sym.scope,
+                    "params": sym.params,
+                    "returns": sym.returns,
                 });
                 if body {
                     let body_text = read_body(&mut file_cache, &cwd, path, sym.line, sym.end_line);
@@ -153,7 +168,7 @@ pub fn run(
             .collect();
 
         if paginated {
-            let total_count = match regex_total_count {
+            let total_count = match manual_total_count {
                 Some(c) => c,
                 None => db.count_symbols(file, kind, grep, scope, visibility)?,
             };
@@ -195,10 +210,19 @@ pub fn run(
             } else {
                 // Qualify the name with its scope so same-named symbols in
                 // different classes/namespaces are distinguishable.
-                let name = match &sym.scope {
+                let mut name = match &sym.scope {
                     Some(scope) if !scope.is_empty() => format!("{}.{}", scope, sym.name),
                     _ => sym.name.clone(),
                 };
+                // Append the signature when known: `(params)` for a callable,
+                // ` -> returns` or `: returns` for its return/declared type.
+                if let Some(params) = &sym.params {
+                    name.push_str(&format!("({})", params.join(", ")));
+                }
+                if let Some(returns) = &sym.returns {
+                    let sep = if sym.params.is_some() { " -> " } else { ": " };
+                    name.push_str(&format!("{sep}{returns}"));
+                }
                 println!(
                     "{}:{}:{} {} {} {}",
                     path, sym.line, sym.column, sym.kind, sym.visibility, name
@@ -209,7 +233,7 @@ pub fn run(
             println!("No symbols found");
         }
         if paginated {
-            let total_count = match regex_total_count {
+            let total_count = match manual_total_count {
                 Some(c) => c,
                 None => db.count_symbols(file, kind, grep, scope, visibility)?,
             };

@@ -1640,6 +1640,103 @@ fn test_visibility_with_kind() {
     );
 }
 
+#[test]
+fn test_symbols_param_and_returns_filters() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    std::fs::write(
+        dir.path().join("main.rs"),
+        r#"pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+pub fn greet(name: &str) {
+    println!("{}", name);
+}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(
+        output.status.success(),
+        "helios init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // --param narrows to symbols with a matching parameter substring.
+    let output = Command::new(&bin)
+        .args(["--json", "symbols", "--param", "i32"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --param i32");
+    assert!(output.status.success());
+    let symbols: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("parsing JSON");
+    let names: Vec<&str> = symbols
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["add"],
+        "expected only add to have an i32 param: {:?}",
+        symbols
+    );
+    assert_eq!(
+        symbols[0]["params"],
+        serde_json::json!(["a: i32", "b: i32"]),
+        "params should be the source spelling as a JSON array: {:?}",
+        symbols[0]
+    );
+
+    // --returns narrows to symbols with a matching return-type substring.
+    let output = Command::new(&bin)
+        .args(["--json", "symbols", "--returns", "i32"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --returns i32");
+    assert!(output.status.success());
+    let symbols: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("parsing JSON");
+    let names: Vec<&str> = symbols
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["add"],
+        "expected only add to return i32: {:?}",
+        symbols
+    );
+    assert_eq!(symbols[0]["returns"], serde_json::json!("i32"));
+
+    // A different --param substring selects a different symbol.
+    let output = Command::new(&bin)
+        .args(["--json", "symbols", "--param", "str"])
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols --param str");
+    assert!(output.status.success());
+    let symbols: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("parsing JSON");
+    let names: Vec<&str> = symbols
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["greet"],
+        "expected only greet to have a str param: {:?}",
+        symbols
+    );
+}
+
 // --- Status command tests ---
 
 #[test]
@@ -2053,6 +2150,179 @@ fn test_diff_no_index() {
         stderr.contains("No index found"),
         "expected no index message on stderr, got: {}",
         stderr
+    );
+}
+
+/// Find a named entry in `diff`'s `modified` JSON array.
+fn find_modified<'a>(json: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    json["modified"]
+        .as_array()
+        .expect("modified array")
+        .iter()
+        .find(|s| s["name"] == name)
+        .unwrap_or_else(|| panic!("expected {name} in modified: {}", json["modified"]))
+}
+
+#[test]
+fn test_diff_body_only_change_reports_body() {
+    let (dir, bin) = setup_git_indexed_project();
+
+    // Add a line inside hello()'s body: line range moves but the signature
+    // (kind, visibility, params, returns) is untouched.
+    std::fs::write(
+        dir.path().join("main.rs"),
+        r#"pub fn hello() {
+    println!("hello");
+    println!("again");
+}
+
+pub struct Config {
+    pub name: String,
+}
+
+fn helper() -> i32 {
+    42
+}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .args(["--json", "diff"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios --json diff");
+    assert!(output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parsing JSON output");
+
+    let hello = find_modified(&json, "hello");
+    assert_eq!(hello["change"], "body", "body-only edit: {}", hello);
+}
+
+#[test]
+fn test_diff_param_change_reports_signature() {
+    let (dir, bin) = setup_git_indexed_project();
+
+    // helper() gains a parameter; keep it on the same line so only the
+    // signature, not the line range, changes.
+    std::fs::write(
+        dir.path().join("main.rs"),
+        r#"pub fn hello() {
+    println!("hello");
+}
+
+pub struct Config {
+    pub name: String,
+}
+
+fn helper(x: i32) -> i32 {
+    x
+}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .args(["--json", "diff"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios --json diff");
+    assert!(output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parsing JSON output");
+
+    let helper = find_modified(&json, "helper");
+    assert_eq!(helper["change"], "signature", "param change: {}", helper);
+}
+
+#[test]
+fn test_diff_return_type_change_reports_signature() {
+    let (dir, bin) = setup_git_indexed_project();
+
+    // helper()'s return type changes from i32 to i64.
+    std::fs::write(
+        dir.path().join("main.rs"),
+        r#"pub fn hello() {
+    println!("hello");
+}
+
+pub struct Config {
+    pub name: String,
+}
+
+fn helper() -> i64 {
+    42
+}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .args(["--json", "diff"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios --json diff");
+    assert!(output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parsing JSON output");
+
+    let helper = find_modified(&json, "helper");
+    assert_eq!(
+        helper["change"], "signature",
+        "return type change: {}",
+        helper
+    );
+}
+
+#[test]
+fn test_diff_legacy_null_signature_is_not_reported_as_change() {
+    let (dir, bin) = setup_git_indexed_project();
+
+    // Simulate a legacy index: params/returns were never recorded for `helper`.
+    {
+        let conn = rusqlite::Connection::open(dir.path().join(".helios").join("index.db"))
+            .expect("opening index.db");
+        conn.execute(
+            "UPDATE symbols SET params = NULL, returns = NULL WHERE name = 'helper'",
+            [],
+        )
+        .expect("nulling out legacy signature columns");
+    }
+
+    // Move helper's line without touching its signature.
+    std::fs::write(
+        dir.path().join("main.rs"),
+        r#"pub fn hello() {
+    println!("hello");
+}
+
+pub struct Config {
+    pub name: String,
+}
+
+
+fn helper() -> i32 {
+    42
+}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .args(["--json", "diff"])
+        .current_dir(dir.path())
+        .output()
+        .expect("helios --json diff");
+    assert!(output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parsing JSON output");
+
+    let helper = find_modified(&json, "helper");
+    assert_eq!(
+        helper["change"], "body",
+        "a stored NULL signature vs. a freshly parsed one must not read as a signature change: {}",
+        helper
     );
 }
 

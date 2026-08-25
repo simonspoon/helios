@@ -82,6 +82,25 @@ fn text_from(source: &[u8], node: tree_sitter::Node) -> String {
         .to_string()
 }
 
+/// The signature of a `function_item`: one entry per parameter (as written,
+/// `&self` included) and the return type spelling, if any.
+fn signature_of(
+    source: &[u8],
+    def_node: tree_sitter::Node,
+) -> (Option<Vec<String>>, Option<String>) {
+    let params = def_node.child_by_field_name("parameters").map(|p| {
+        (0..p.named_child_count() as u32)
+            .filter_map(|i| p.named_child(i))
+            .filter(|c| !c.is_extra())
+            .map(|c| text_from(source, c).trim().to_string())
+            .collect()
+    });
+    let returns = def_node
+        .child_by_field_name("return_type")
+        .map(|r| text_from(source, r).trim().to_string());
+    (params, returns)
+}
+
 /// The base identifier of an impl's Self type: `Foo` as-is, or `Vec` out of
 /// a generic `Vec<T>` -- the bare name a `ParsedSymbol` was recorded under.
 fn base_type_name(source: &[u8], node: tree_sitter::Node) -> String {
@@ -158,6 +177,19 @@ impl LanguageParser for RustParser {
                 let visibility = Self::extract_visibility(src, def_node);
                 let scope = Self::find_scope(src, node);
 
+                let (params, returns) = if kind == "fn" {
+                    signature_of(src, def_node)
+                } else if kind == "const" {
+                    (
+                        None,
+                        def_node
+                            .child_by_field_name("type")
+                            .map(|t| text_from(src, t).trim().to_string()),
+                    )
+                } else {
+                    (None, None)
+                };
+
                 result.symbols.push(ParsedSymbol {
                     name: sym_name,
                     kind: kind.to_string(),
@@ -166,6 +198,8 @@ impl LanguageParser for RustParser {
                     end_line: def_node.end_position().row as i64 + 1,
                     visibility,
                     scope,
+                    params,
+                    returns,
                 });
             }
         }
@@ -538,6 +572,86 @@ impl S {
             relation_tuples(&result.type_relations),
             vec![("Vec", Some(1), "Trait", "implements")]
         );
+    }
+
+    #[test]
+    fn test_fn_params_and_return_round_trip() {
+        let parser = RustParser::new();
+        let source = "fn add(a: i32, b: i32) -> i32 { a + b }";
+        let result = parser.parse(source).unwrap();
+        let add = result.symbols.iter().find(|s| s.name == "add").unwrap();
+        assert_eq!(
+            add.params,
+            Some(vec!["a: i32".to_string(), "b: i32".to_string()])
+        );
+        assert_eq!(add.returns, Some("i32".to_string()));
+    }
+
+    #[test]
+    fn test_fn_generic_return_round_trips() {
+        let parser = RustParser::new();
+        let source = "fn make() -> Result<Foo, E> { todo!() }";
+        let result = parser.parse(source).unwrap();
+        let make = result.symbols.iter().find(|s| s.name == "make").unwrap();
+        assert_eq!(make.returns, Some("Result<Foo, E>".to_string()));
+    }
+
+    #[test]
+    fn test_fn_no_params_gives_empty_vec_not_none() {
+        let parser = RustParser::new();
+        let source = "fn noop() {}";
+        let result = parser.parse(source).unwrap();
+        let noop = result.symbols.iter().find(|s| s.name == "noop").unwrap();
+        assert_eq!(noop.params, Some(vec![]));
+    }
+
+    #[test]
+    fn test_fn_no_arrow_gives_none_return() {
+        let parser = RustParser::new();
+        let source = "fn noop() {}";
+        let result = parser.parse(source).unwrap();
+        let noop = result.symbols.iter().find(|s| s.name == "noop").unwrap();
+        assert_eq!(noop.returns, None);
+    }
+
+    #[test]
+    fn test_method_receiver_included_as_written() {
+        let parser = RustParser::new();
+        let source = "struct S;\nimpl S {\n    fn method(&self, x: i32) -> i32 { x }\n}\n";
+        let result = parser.parse(source).unwrap();
+        let method = result.symbols.iter().find(|s| s.name == "method").unwrap();
+        assert_eq!(
+            method.params,
+            Some(vec!["&self".to_string(), "x: i32".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_non_callable_has_no_signature() {
+        let parser = RustParser::new();
+        let source = "struct MyStruct { field: i32 }";
+        let result = parser.parse(source).unwrap();
+        let s = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "MyStruct")
+            .unwrap();
+        assert_eq!(s.params, None);
+        assert_eq!(s.returns, None);
+    }
+
+    #[test]
+    fn test_const_records_declared_type() {
+        let parser = RustParser::new();
+        let source = "pub const MAX_SIZE: usize = 100;";
+        let result = parser.parse(source).unwrap();
+        let c = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "MAX_SIZE")
+            .unwrap();
+        assert_eq!(c.params, None);
+        assert_eq!(c.returns, Some("usize".to_string()));
     }
 
     #[test]

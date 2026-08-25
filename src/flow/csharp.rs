@@ -4,8 +4,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use tree_sitter::{Node, Parser};
 
 use super::{
-    Breakable, Builder, FlowEdge, FlowGraph, FunctionInfo, LABEL_WIDTH, Pending, collapsed,
-    label_of, line_of, qualified,
+    Breakable, Builder, FlowEdge, FlowGraph, FunctionInfo, LABEL_WIDTH, Pending, StoredSignature,
+    collapsed, label_of, line_of, qualified,
 };
 use crate::parsers::csharp::find_scope;
 
@@ -782,6 +782,7 @@ pub(super) fn build(
     name: &str,
     scope: Option<&str>,
     line: i64,
+    stored: Option<&StoredSignature>,
 ) -> Result<FlowGraph> {
     let mut parser = Parser::new();
     parser
@@ -807,16 +808,25 @@ pub(super) fn build(
         );
     }
 
-    let params = func
-        .child_by_field_name("parameters")
-        .map(|p| {
-            (0..p.named_child_count() as u32)
-                .filter_map(|i| p.named_child(i))
-                .filter(|c| !c.is_extra())
-                .map(|c| label_of(src, c))
-                .collect()
-        })
-        .unwrap_or_default();
+    let params = stored.and_then(|s| s.params.clone()).unwrap_or_else(|| {
+        func.child_by_field_name("parameters")
+            .map(|p| {
+                (0..p.named_child_count() as u32)
+                    .filter_map(|i| p.named_child(i))
+                    .filter(|c| !c.is_extra())
+                    .map(|c| label_of(src, c))
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+
+    // A method spells its result `returns`; a property and a local function
+    // both spell theirs `type`.
+    let returns = stored.and_then(|s| s.returns.clone()).or_else(|| {
+        func.child_by_field_name("returns")
+            .or_else(|| func.child_by_field_name("type"))
+            .map(|r| label_of(src, r))
+    });
 
     let function = FunctionInfo {
         name: name.to_string(),
@@ -826,12 +836,7 @@ pub(super) fn build(
         end_line: func.end_position().row as i64 + 1,
         language: "csharp".to_string(),
         params,
-        // A method spells its result `returns`; a property and a local function
-        // both spell theirs `type`.
-        returns: func
-            .child_by_field_name("returns")
-            .or_else(|| func.child_by_field_name("type"))
-            .map(|r| label_of(src, r)),
+        returns,
     };
 
     let mut cs = CsBuilder {
@@ -883,7 +888,7 @@ mod tests {
             .position(|l| l.contains(name))
             .map(|i| i as i64 + 1)
             .unwrap_or(1);
-        build(source, "Test.cs", name, None, line).unwrap()
+        build(source, "Test.cs", name, None, line, None).unwrap()
     }
 
     /// Wrap statements in a class and a method, so a test only spells the body.
@@ -916,6 +921,32 @@ mod tests {
 
     fn has_edge(g: &FlowGraph, from: usize, to: usize) -> bool {
         g.edges.iter().any(|e| e.from == from && e.to == to)
+    }
+
+    #[test]
+    fn stored_signature_overrides_derivation() {
+        let source = "class C {\n    int Add(int a, int b) {\n        return a + b;\n    }\n}\n";
+        let stored = StoredSignature {
+            params: Some(vec!["long a".to_string()]),
+            returns: Some("long".to_string()),
+        };
+        let g = build(source, "Test.cs", "Add", None, 2, Some(&stored)).unwrap();
+        assert_eq!(g.function.params, vec!["long a"]);
+        assert_eq!(g.function.returns.as_deref(), Some("long"));
+        assert_eq!(g.nodes[0].label, "Add(long a) -> long");
+    }
+
+    #[test]
+    fn empty_stored_signature_falls_back_to_derivation() {
+        let source = "class C {\n    int Add(int a, int b) {\n        return a + b;\n    }\n}\n";
+        let stored = StoredSignature {
+            params: None,
+            returns: None,
+        };
+        let g = build(source, "Test.cs", "Add", None, 2, Some(&stored)).unwrap();
+        assert_eq!(g.function.params, vec!["int a", "int b"]);
+        assert_eq!(g.function.returns.as_deref(), Some("int"));
+        assert_eq!(g.nodes[0].label, "Add(int a, int b) -> int");
     }
 
     #[test]
@@ -1221,10 +1252,10 @@ mod tests {
         // Two `Go`s; the recorded line now points inside A.Go, as it would
         // after the file was edited without reindexing.
         let source = "class A {\n    void Go() {\n        AGo();\n    }\n}\n\nclass B {\n    void Go() {\n        BGo();\n    }\n}\n";
-        let g = build(source, "Test.cs", "Go", Some("B"), 2).unwrap();
+        let g = build(source, "Test.cs", "Go", Some("B"), 2, None).unwrap();
         assert_eq!(kinds(&g, "call"), vec!["BGo(…)"]);
 
-        let g = build(source, "Test.cs", "Go", Some("A"), 8).unwrap();
+        let g = build(source, "Test.cs", "Go", Some("A"), 8, None).unwrap();
         assert_eq!(kinds(&g, "call"), vec!["AGo(…)"]);
     }
 
@@ -1642,7 +1673,7 @@ mod tests {
     #[test]
     fn a_property_with_accessors_is_rejected() {
         let source = "class C {\n    int Rate { get { return Lookup(); } }\n}\n";
-        let err = build(source, "Test.cs", "Rate", Some("C"), 2).unwrap_err();
+        let err = build(source, "Test.cs", "Rate", Some("C"), 2, None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("C.Rate is a property with accessors"),

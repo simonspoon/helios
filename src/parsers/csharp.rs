@@ -28,6 +28,17 @@ fn qualified_text(source: &[u8], node: tree_sitter::Node) -> String {
     text_from(source, node)
 }
 
+/// A method/constructor's parameters, as written (one entry per parameter).
+fn params_of(source: &[u8], def_node: tree_sitter::Node) -> Option<Vec<String>> {
+    def_node.child_by_field_name("parameters").map(|p| {
+        (0..p.named_child_count() as u32)
+            .filter_map(|i| p.named_child(i))
+            .filter(|c| !c.is_extra())
+            .map(|c| text_from(source, c).trim().to_string())
+            .collect()
+    })
+}
+
 /// Extract visibility from modifier children of a declaration node.
 /// C# defaults: members default to private, top-level types default to internal.
 fn detect_visibility(source: &[u8], node: tree_sitter::Node) -> String {
@@ -185,6 +196,26 @@ impl LanguageParser for CSharpParser {
 
                 let scope = find_scope(src, node);
 
+                // Methods and constructors are callable: params always Some,
+                // a method's return type (constructors have none). A
+                // property has a declared type but isn't callable.
+                let (params, returns) = match name {
+                    "method_name" => (
+                        params_of(src, def_node),
+                        def_node
+                            .child_by_field_name("returns")
+                            .map(|r| text_from(src, r).trim().to_string()),
+                    ),
+                    "ctor_name" => (params_of(src, def_node), None),
+                    "prop_name" => (
+                        None,
+                        def_node
+                            .child_by_field_name("type")
+                            .map(|t| text_from(src, t).trim().to_string()),
+                    ),
+                    _ => (None, None),
+                };
+
                 result.symbols.push(ParsedSymbol {
                     name: sym_text,
                     kind: kind.to_string(),
@@ -193,6 +224,8 @@ impl LanguageParser for CSharpParser {
                     end_line: def_node.end_position().row as i64 + 1,
                     visibility,
                     scope,
+                    params,
+                    returns,
                 });
             }
         }
@@ -662,6 +695,82 @@ namespace MyApp.Models {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn test_method_params_and_return_round_trip() {
+        let parser = CSharpParser::new();
+        let source = "class C {\n    public int Add(int a, int b) { return a + b; }\n}\n";
+        let result = parser.parse(source).unwrap();
+        let add = result.symbols.iter().find(|s| s.name == "Add").unwrap();
+        assert_eq!(
+            add.params,
+            Some(vec!["int a".to_string(), "int b".to_string()])
+        );
+        assert_eq!(add.returns, Some("int".to_string()));
+    }
+
+    #[test]
+    fn test_method_generic_return_round_trips() {
+        let parser = CSharpParser::new();
+        let source = "class C {\n    public List<int> Make() { return null; }\n}\n";
+        let result = parser.parse(source).unwrap();
+        let make = result.symbols.iter().find(|s| s.name == "Make").unwrap();
+        assert_eq!(make.returns, Some("List<int>".to_string()));
+    }
+
+    #[test]
+    fn test_void_return_stored_as_written() {
+        let parser = CSharpParser::new();
+        let source = "class C {\n    public void Noop() { }\n}\n";
+        let result = parser.parse(source).unwrap();
+        let noop = result.symbols.iter().find(|s| s.name == "Noop").unwrap();
+        assert_eq!(noop.returns, Some("void".to_string()));
+    }
+
+    #[test]
+    fn test_method_no_params_gives_empty_vec_not_none() {
+        let parser = CSharpParser::new();
+        let source = "class C {\n    public void Noop() { }\n}\n";
+        let result = parser.parse(source).unwrap();
+        let noop = result.symbols.iter().find(|s| s.name == "Noop").unwrap();
+        assert_eq!(noop.params, Some(vec![]));
+    }
+
+    #[test]
+    fn test_constructor_records_params_no_return() {
+        let parser = CSharpParser::new();
+        let source = "class Person {\n    public Person(string name, int age) { }\n}\n";
+        let result = parser.parse(source).unwrap();
+        let ctor = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "Person" && s.kind == "fn")
+            .unwrap();
+        assert_eq!(
+            ctor.params,
+            Some(vec!["string name".to_string(), "int age".to_string()])
+        );
+        assert_eq!(ctor.returns, None);
+    }
+
+    #[test]
+    fn test_non_callable_has_no_signature() {
+        let parser = CSharpParser::new();
+        let result = parser.parse("class C { }").unwrap();
+        let c = result.symbols.iter().find(|s| s.name == "C").unwrap();
+        assert_eq!(c.params, None);
+        assert_eq!(c.returns, None);
+    }
+
+    #[test]
+    fn test_property_records_declared_type() {
+        let parser = CSharpParser::new();
+        let source = "class C {\n    public int Age { get; set; }\n}\n";
+        let result = parser.parse(source).unwrap();
+        let age = result.symbols.iter().find(|s| s.name == "Age").unwrap();
+        assert_eq!(age.params, None);
+        assert_eq!(age.returns, Some("int".to_string()));
     }
 
     #[test]

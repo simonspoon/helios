@@ -34,6 +34,14 @@ pub struct FunctionInfo {
     pub returns: Option<String>,
 }
 
+/// A signature already recorded in the index, so `flow` does not re-derive
+/// what indexing already extracted. `None` for a legacy row or a language
+/// whose parser does not record one yet.
+pub struct StoredSignature {
+    pub params: Option<Vec<String>>,
+    pub returns: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FlowNode {
     pub id: usize,
@@ -212,10 +220,11 @@ pub fn build(
     name: &str,
     scope: Option<&str>,
     line: i64,
+    stored: Option<&StoredSignature>,
 ) -> Result<FlowGraph> {
     match language {
-        "rust" => rust::build(source, file, name, scope, line),
-        "csharp" => csharp::build(source, file, name, scope, line),
+        "rust" => rust::build(source, file, name, scope, line, stored),
+        "csharp" => csharp::build(source, file, name, scope, line, stored),
         _ => bail!(
             "flow does not support {language} yet (supported: rust, csharp); \
              the graph builder is per-language and only those two are mapped so far"
@@ -229,7 +238,7 @@ mod tests {
 
     #[test]
     fn unsupported_language_is_rejected() {
-        let err = build("python", "def f(): pass", "a.py", "f", None, 1).unwrap_err();
+        let err = build("python", "def f(): pass", "a.py", "f", None, 1, None).unwrap_err();
         assert!(err.to_string().contains("does not support python"));
     }
 }

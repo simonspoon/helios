@@ -4,8 +4,8 @@ use anyhow::{Context, Result, anyhow};
 use tree_sitter::{Node, Parser};
 
 use super::{
-    Breakable, Builder, ERR_EXIT, FlowEdge, FlowGraph, FunctionInfo, Pending, label_of, line_of,
-    qualified,
+    Breakable, Builder, ERR_EXIT, FlowEdge, FlowGraph, FunctionInfo, Pending, StoredSignature,
+    label_of, line_of, qualified,
 };
 use crate::parsers::rust_parser::RustParser;
 
@@ -509,6 +509,7 @@ pub(super) fn build(
     name: &str,
     scope: Option<&str>,
     line: i64,
+    stored: Option<&StoredSignature>,
 ) -> Result<FlowGraph> {
     let mut parser = Parser::new();
     parser
@@ -525,16 +526,22 @@ pub(super) fn build(
         )
     })?;
 
-    let params = func
-        .child_by_field_name("parameters")
-        .map(|p| {
-            (0..p.named_child_count() as u32)
-                .filter_map(|i| p.named_child(i))
-                .filter(|c| !c.is_extra())
-                .map(|c| label_of(src, c))
-                .collect()
-        })
-        .unwrap_or_default();
+    let params = stored.and_then(|s| s.params.clone()).unwrap_or_else(|| {
+        func.child_by_field_name("parameters")
+            .map(|p| {
+                (0..p.named_child_count() as u32)
+                    .filter_map(|i| p.named_child(i))
+                    .filter(|c| !c.is_extra())
+                    .map(|c| label_of(src, c))
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+
+    let returns = stored.and_then(|s| s.returns.clone()).or_else(|| {
+        func.child_by_field_name("return_type")
+            .map(|r| label_of(src, r))
+    });
 
     let function = FunctionInfo {
         name: name.to_string(),
@@ -544,9 +551,7 @@ pub(super) fn build(
         end_line: func.end_position().row as i64 + 1,
         language: "rust".to_string(),
         params,
-        returns: func
-            .child_by_field_name("return_type")
-            .map(|r| label_of(src, r)),
+        returns,
     };
 
     let mut builder = Builder::start(src, &function);
@@ -571,7 +576,7 @@ mod tests {
             .position(|l| l.contains(&format!("fn {name}")))
             .map(|i| i as i64 + 1)
             .unwrap_or(1);
-        build(source, "test.rs", name, None, line).unwrap()
+        build(source, "test.rs", name, None, line, None).unwrap()
     }
 
     fn kinds(g: &FlowGraph, kind: &str) -> Vec<String> {
@@ -597,6 +602,32 @@ mod tests {
         assert_eq!(g.function.params, vec!["a: i32", "b: i32"]);
         assert_eq!(g.function.returns.as_deref(), Some("i32"));
         assert_eq!(kinds(&g, "return"), vec!["a + b"]);
+    }
+
+    #[test]
+    fn stored_signature_overrides_derivation() {
+        let source = "fn add(a: i32, b: i32) -> i32 { a + b }";
+        let stored = StoredSignature {
+            params: Some(vec!["a: i64".to_string()]),
+            returns: Some("i64".to_string()),
+        };
+        let g = build(source, "test.rs", "add", None, 1, Some(&stored)).unwrap();
+        assert_eq!(g.function.params, vec!["a: i64"]);
+        assert_eq!(g.function.returns.as_deref(), Some("i64"));
+        assert_eq!(g.nodes[0].label, "add(a: i64) -> i64");
+    }
+
+    #[test]
+    fn empty_stored_signature_falls_back_to_derivation() {
+        let source = "fn add(a: i32, b: i32) -> i32 { a + b }";
+        let stored = StoredSignature {
+            params: None,
+            returns: None,
+        };
+        let g = build(source, "test.rs", "add", None, 1, Some(&stored)).unwrap();
+        assert_eq!(g.function.params, vec!["a: i32", "b: i32"]);
+        assert_eq!(g.function.returns.as_deref(), Some("i32"));
+        assert_eq!(g.nodes[0].label, "add(a: i32, b: i32) -> i32");
     }
 
     #[test]
@@ -907,7 +938,7 @@ fn outer() {
             .position(|l| l.contains("fn helper"))
             .map(|i| i as i64 + 1)
             .unwrap();
-        let g = build(source, "test.rs", "helper", None, line).unwrap();
+        let g = build(source, "test.rs", "helper", None, line, None).unwrap();
         assert_eq!(kinds(&g, "call"), vec!["inner_call(…)"]);
     }
 
@@ -1178,17 +1209,17 @@ impl B {
     }
 }
 "#;
-        let g = build(source, "test.rs", "go", Some("B"), 7).unwrap();
+        let g = build(source, "test.rs", "go", Some("B"), 7, None).unwrap();
         assert_eq!(kinds(&g, "call"), vec!["b_go(…)"]);
 
-        let g = build(source, "test.rs", "go", Some("A"), 13).unwrap();
+        let g = build(source, "test.rs", "go", Some("A"), 13, None).unwrap();
         assert_eq!(kinds(&g, "call"), vec!["a_go(…)"]);
     }
 
     #[test]
     fn a_stale_line_still_finds_the_only_function_with_that_name() {
         let source = "fn moved() {\n    work();\n}\n";
-        let g = build(source, "test.rs", "moved", None, 97).unwrap();
+        let g = build(source, "test.rs", "moved", None, 97, None).unwrap();
         assert_eq!(kinds(&g, "call"), vec!["work(…)"]);
         assert_eq!(g.function.line, 1, "the graph reports where it really is");
     }
