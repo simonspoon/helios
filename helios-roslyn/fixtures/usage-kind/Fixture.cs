@@ -4,6 +4,7 @@ public class Counter
 {
     public int Value { get; set; }
     public Counter Inner { get; set; }
+    public int Count;
 }
 
 /// <summary>
@@ -55,6 +56,9 @@ public static class Usage
         counter.Value++;                        // increment readwrite
 
         counter.Inner.Value = 2;                // receiver (Inner) is read; Value is write
+
+        counter.Count = 1;                      // plain field: simple assignment write
+        counter.Count++;                        // plain field: increment readwrite
 
         bag[3] = 9;                             // indexer write
 

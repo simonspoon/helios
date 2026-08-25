@@ -33,6 +33,23 @@ fn text_from(source: &[u8], node: tree_sitter::Node) -> String {
         .to_string()
 }
 
+/// Walk up from a struct field's `field_identifier` capture to the enclosing
+/// `type_spec` and return the struct's own name (the field's `scope`).
+fn find_enclosing_struct(source: &[u8], field_ident: tree_sitter::Node) -> Option<String> {
+    let mut node = field_ident.parent()?; // field_declaration
+    loop {
+        if node.kind() == "struct_type" {
+            let type_spec = node.parent()?;
+            if type_spec.kind() != "type_spec" {
+                return None;
+            }
+            let name_node = type_spec.child_by_field_name("name")?;
+            return Some(text_from(source, name_node));
+        }
+        node = node.parent()?;
+    }
+}
+
 fn find_receiver_type(source: &[u8], method_node: tree_sitter::Node) -> Option<String> {
     let parent = method_node.parent()?;
     let receiver = parent.child_by_field_name("receiver")?;
@@ -79,6 +96,7 @@ impl LanguageParser for GoParser {
             (method_declaration name: (field_identifier) @method_name)
             (type_declaration (type_spec name: (type_identifier) @type_name type: (struct_type)))
             (type_declaration (type_spec name: (type_identifier) @iface_name type: (interface_type)))
+            (struct_type (field_declaration_list (field_declaration name: (field_identifier) @field_name)))
             (const_declaration (const_spec name: (identifier) @const_name))
             (var_declaration (var_spec name: (identifier) @var_name))
             "#,
@@ -99,6 +117,7 @@ impl LanguageParser for GoParser {
                     "type_name" => "struct",
                     "iface_name" => "interface",
                     "const_name" | "var_name" => "const",
+                    "field_name" => "field",
                     _ => continue,
                 };
 
@@ -111,6 +130,8 @@ impl LanguageParser for GoParser {
                 let visibility = Self::visibility_from_name(&sym_text);
                 let scope = if cname == "method_name" {
                     find_receiver_type(src, c.node)
+                } else if cname == "field_name" {
+                    find_enclosing_struct(src, c.node)
                 } else {
                     None
                 };
@@ -127,7 +148,7 @@ impl LanguageParser for GoParser {
                             .child_by_field_name("result")
                             .map(|r| text_from(src, r).trim().to_string()),
                     ),
-                    "const_name" | "var_name" => (
+                    "const_name" | "var_name" | "field_name" => (
                         None,
                         def_node
                             .child_by_field_name("type")
@@ -177,14 +198,14 @@ impl LanguageParser for GoParser {
             }
         }
 
-        // --- References ---
+        // --- References (function calls, member writes) ---
         //
-        // Field write targets (`x.count = 1`, `x.count += 1`, `x.count++`)
-        // are deliberately not captured -- see the comment above the
-        // reference query in `rust_parser.rs` for why: no parser in this
-        // codebase indexes plain fields as symbols, so a write capture has
-        // no correct symbol to resolve to and can only produce a
-        // confidently wrong "who mutates this" answer.
+        // Calls (`call_name`, `method_call`) are unqualified or qualified
+        // reads of the callee, `member: false`, which at index time
+        // (`resolve_member_candidates` in `src/indexer.rs`) restricts
+        // resolution to field-kind symbols only, so a member write can
+        // never land on an unrelated same-named function or type elsewhere
+        // in the index.
         let ref_query = Query::new(
             &self.language,
             r#"
@@ -208,7 +229,95 @@ impl LanguageParser for GoParser {
                     qualified: ref_query.capture_names()[c.index as usize] == "method_call",
                     // These captures are calls, which read the callee.
                     usage_kind: UsageKind::Read,
+                // Calls, not member writes.
+                member: false,
                 });
+            }
+        }
+
+        // Member write targets: `x.count = 1` (Write), `x.count += 1` and
+        // every other compound-assign operator (ReadWrite), and
+        // `x.count++`/`x.count--` (ReadWrite).
+        //
+        // Go's `assignment_statement` uses a single node kind for every
+        // operator (`=`, `+=`, `-=`, ...), distinguished only by the text of
+        // its `operator` field, and its `left` side is a comma-separated
+        // `expression_list` that may hold several targets at once (`x.a,
+        // y.b = 1, 2`). Neither is expressible as a plain capture query, so
+        // the statement node is captured whole and walked here. Go's short
+        // variable declaration (`x := 1`) is a distinct node kind
+        // (`short_var_declaration`) that this query does not match, so it
+        // correctly produces no reference.
+        let write_query = Query::new(
+            &self.language,
+            r#"
+            (assignment_statement) @assign_stmt
+            (inc_statement) @incdec_stmt
+            (dec_statement) @incdec_stmt
+            "#,
+        )
+        .context("compiling Go member-write query")?;
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&write_query, root, src);
+
+        while let Some(m) = matches.next() {
+            for c in m.captures {
+                let cname = write_query.capture_names()[c.index as usize];
+                match cname {
+                    "assign_stmt" => {
+                        let (Some(left), Some(operator)) = (
+                            c.node.child_by_field_name("left"),
+                            c.node.child_by_field_name("operator"),
+                        ) else {
+                            continue;
+                        };
+                        let usage_kind = if text_from(src, operator) == "=" {
+                            UsageKind::Write
+                        } else {
+                            UsageKind::ReadWrite
+                        };
+                        let mut lc = left.walk();
+                        for target in left.named_children(&mut lc) {
+                            if target.kind() != "selector_expression" {
+                                continue;
+                            }
+                            let Some(field) = target.child_by_field_name("field") else {
+                                continue;
+                            };
+                            result.references.push(ParsedReference {
+                                symbol_name: text_from(src, field),
+                                line: field.start_position().row as i64 + 1,
+                                column: field.start_position().column as i64,
+                                from_scope: None,
+                                qualified: true,
+                                usage_kind,
+                                member: true,
+                            });
+                        }
+                    }
+                    "incdec_stmt" => {
+                        let Some(target) = c.node.named_child(0) else {
+                            continue;
+                        };
+                        if target.kind() != "selector_expression" {
+                            continue;
+                        }
+                        let Some(field) = target.child_by_field_name("field") else {
+                            continue;
+                        };
+                        result.references.push(ParsedReference {
+                            symbol_name: text_from(src, field),
+                            line: field.start_position().row as i64 + 1,
+                            column: field.start_position().column as i64,
+                            from_scope: None,
+                            qualified: true,
+                            usage_kind: UsageKind::ReadWrite,
+                            member: true,
+                        });
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -428,15 +537,117 @@ func Run() int {
     }
 
     #[test]
-    fn test_assignment_targets_emit_no_reference() {
+    fn test_bare_assignment_target_emits_no_reference() {
         let parser = GoParser::new();
         let result = parser
-            .parse("package main\nfunc f() { count = 1; x.count = 1; x.count += 1; x.count++ }")
+            .parse("package main\nfunc f() { count = 1; count := 1 }")
             .unwrap();
         assert!(
             result.references.is_empty(),
-            "assignment targets must not be captured as references: {:?}",
+            "bare assignment/declaration targets must not be captured as references: {:?}",
             result.references
         );
+    }
+
+    #[test]
+    fn test_field_write_emits_member_write_reference() {
+        let parser = GoParser::new();
+        let result = parser
+            .parse("package main\nfunc f() { x.count = 1 }")
+            .unwrap();
+        let r = result
+            .references
+            .iter()
+            .find(|r| r.symbol_name == "count")
+            .unwrap();
+        assert!(r.member);
+        assert!(r.qualified);
+        assert_eq!(r.usage_kind, UsageKind::Write);
+    }
+
+    #[test]
+    fn test_compound_field_assignment_and_incdec_are_readwrite() {
+        let parser = GoParser::new();
+        let result = parser
+            .parse("package main\nfunc f() { x.count += 1; x.count++; x.count-- }")
+            .unwrap();
+        let writes: Vec<_> = result
+            .references
+            .iter()
+            .filter(|r| r.symbol_name == "count")
+            .collect();
+        assert_eq!(writes.len(), 3, "{:?}", result.references);
+        for r in writes {
+            assert!(r.member);
+            assert_eq!(r.usage_kind, UsageKind::ReadWrite);
+        }
+    }
+
+    #[test]
+    fn test_multi_target_assignment_emits_one_write_per_field() {
+        let parser = GoParser::new();
+        let result = parser
+            .parse("package main\nfunc f() { x.a, y.b = 1, 2 }")
+            .unwrap();
+        let a = result.references.iter().find(|r| r.symbol_name == "a").unwrap();
+        let b = result.references.iter().find(|r| r.symbol_name == "b").unwrap();
+        assert_eq!(a.usage_kind, UsageKind::Write);
+        assert_eq!(b.usage_kind, UsageKind::Write);
+    }
+
+    #[test]
+    fn test_short_var_declaration_of_field_read_is_not_a_write() {
+        let parser = GoParser::new();
+        let result = parser
+            .parse("package main\nfunc f() { z := x.count }")
+            .unwrap();
+        assert!(
+            result.references.is_empty(),
+            "`:=` must not produce a member write reference: {:?}",
+            result.references
+        );
+    }
+
+    #[test]
+    fn test_struct_fields_indexed_with_scope_and_visibility() {
+        let parser = GoParser::new();
+        let source = r#"
+package main
+
+type Server struct {
+    Port int
+    host string
+}
+"#;
+        let result = parser.parse(source).unwrap();
+        let fields: Vec<_> = result.symbols.iter().filter(|s| s.kind == "field").collect();
+        assert_eq!(fields.len(), 2, "{:?}", fields);
+
+        let port = fields.iter().find(|s| s.name == "Port").unwrap();
+        assert_eq!(port.visibility, "pub");
+        assert_eq!(port.scope, Some("Server".to_string()));
+        assert_eq!(port.returns, Some("int".to_string()));
+        assert_eq!(port.params, None);
+
+        let host = fields.iter().find(|s| s.name == "host").unwrap();
+        assert_eq!(host.visibility, "private");
+        assert_eq!(host.scope, Some("Server".to_string()));
+    }
+
+    #[test]
+    fn test_multi_name_field_declaration_emits_one_symbol_per_name() {
+        let parser = GoParser::new();
+        let source = r#"
+package main
+
+type Point struct {
+    a, b int
+}
+"#;
+        let result = parser.parse(source).unwrap();
+        let fields: Vec<_> = result.symbols.iter().filter(|s| s.kind == "field").collect();
+        let names: Vec<_> = fields.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"a"));
+        assert!(names.contains(&"b"));
     }
 }

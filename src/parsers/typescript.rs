@@ -83,17 +83,35 @@ fn declared_type(source: &[u8], declarator_node: tree_sitter::Node) -> Option<St
     })
 }
 
+/// Walks up to the enclosing class or interface's name. Used for methods and
+/// for fields/property signatures (a `property_signature` inside a bare
+/// `object_type`, e.g. a type alias, has no such ancestor and gets `None`).
 fn find_class_scope(source: &[u8], node: tree_sitter::Node) -> Option<String> {
     let mut current = node.parent();
     while let Some(parent) = current {
-        if (parent.kind() == "class_declaration" || parent.kind() == "class")
-            && let Some(name_node) = parent.child_by_field_name("name")
+        if matches!(
+            parent.kind(),
+            "class_declaration" | "class" | "interface_declaration"
+        ) && let Some(name_node) = parent.child_by_field_name("name")
         {
             return Some(text_from(source, name_node));
         }
         current = parent.parent();
     }
     None
+}
+
+/// A field-like definition node's visibility, matching TS's `private`/
+/// `protected` accessibility modifiers to `"private"` and everything else
+/// (including explicit `public` and JS, which has no such modifiers) to
+/// `"pub"` -- the same two-value convention the rest of this file uses.
+fn field_visibility(source: &[u8], field_def: tree_sitter::Node) -> &'static str {
+    let mut cursor = field_def.walk();
+    let restricted = field_def.named_children(&mut cursor).any(|c| {
+        c.kind() == "accessibility_modifier"
+            && matches!(text_from(source, c).as_str(), "private" | "protected")
+    });
+    if restricted { "private" } else { "pub" }
 }
 
 /// The local names an import statement binds: `import Money, { formatMoney,
@@ -187,6 +205,11 @@ impl LanguageParser for TypeScriptParser {
                 (interface_declaration name: (type_identifier) @iface_name) @iface_def
                 (type_alias_declaration name: (type_identifier) @type_name) @type_def
                 (enum_declaration name: (identifier) @enum_name) @enum_def
+                (public_field_definition name: (property_identifier) @field_name) @field_def
+                (public_field_definition name: (private_property_identifier) @field_name) @field_def
+                (property_signature name: (property_identifier) @field_name) @field_def
+                (required_parameter (accessibility_modifier) pattern: (identifier) @ctor_field_name) @ctor_field_def
+                (required_parameter "readonly" pattern: (identifier) @ctor_field_name) @ctor_field_def
                 "#,
             )
         } else {
@@ -198,6 +221,8 @@ impl LanguageParser for TypeScriptParser {
                 (method_definition name: (property_identifier) @method_name)
                 (lexical_declaration (variable_declarator name: (identifier) @const_name)) @const_def
                 (variable_declaration (variable_declarator name: (identifier) @var_name)) @var_def
+                (field_definition property: (property_identifier) @field_name) @field_def
+                (field_definition property: (private_property_identifier) @field_name) @field_def
                 "#,
             )
         };
@@ -207,6 +232,12 @@ impl LanguageParser for TypeScriptParser {
 
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&symbol_query, root, src);
+
+        // A constructor parameter property can carry both `readonly` and an
+        // accessibility modifier (`private readonly a: T`), which are two
+        // separate query alternatives above -- dedup on the identifier
+        // node so such a parameter is only indexed once.
+        let mut seen_ctor_fields = std::collections::HashSet::new();
 
         while let Some(m) = matches.next() {
             let captures: Vec<_> = m
@@ -224,6 +255,13 @@ impl LanguageParser for TypeScriptParser {
                     "iface_name" => "interface",
                     "type_name" => "type",
                     "enum_name" => "enum",
+                    "field_name" => "field",
+                    "ctor_field_name" => {
+                        if !seen_ctor_fields.insert(node.id()) {
+                            continue;
+                        }
+                        "field"
+                    }
                     _ => continue,
                 };
 
@@ -237,24 +275,49 @@ impl LanguageParser for TypeScriptParser {
 
                 // Use def_node for end_line, falling back to parent node for methods
                 let end_node = def_node.or_else(|| node.parent()).unwrap_or(node);
-                if is_function_local(end_node, CALLABLE_KINDS) {
+
+                // A constructor parameter property's def node (a
+                // `required_parameter`) sits inside the constructor's own
+                // `method_definition`, which is itself a `CALLABLE_KINDS`
+                // member -- so a locality check from there would always
+                // read as "inside a callable" and wrongly exclude every
+                // parameter property. Check the constructor's own ancestry
+                // instead, same as `method_name` does by starting from
+                // `method_definition` rather than from inside it.
+                let local_check_node = if name == "ctor_field_name" {
+                    let mut cur = end_node.parent();
+                    while let Some(p) = cur {
+                        if p.kind() == "method_definition" {
+                            break;
+                        }
+                        cur = p.parent();
+                    }
+                    cur.unwrap_or(end_node)
+                } else {
+                    end_node
+                };
+                if is_function_local(local_check_node, CALLABLE_KINDS) {
                     continue;
                 }
 
-                let exported = def_node.is_some_and(is_exported);
-                let visibility = if exported { "pub" } else { "private" };
+                let visibility = if kind == "field" {
+                    field_visibility(src, end_node)
+                } else {
+                    let exported = def_node.is_some_and(is_exported);
+                    if exported { "pub" } else { "private" }
+                };
 
-                let scope = if name == "method_name" {
+                let scope = if matches!(name, "method_name" | "field_name" | "ctor_field_name") {
                     find_class_scope(src, node)
                 } else {
                     None
                 };
 
                 // `fn`/method callables get their parameter list and return
-                // type; a const/var declarator gets its own type annotation
-                // (this parser never reclassifies an arrow-bound const as
-                // `fn`, so an arrow function's own signature is not surfaced
-                // here); everything else has neither.
+                // type; a const/var declarator or field gets its own type
+                // annotation (this parser never reclassifies an arrow-bound
+                // const as `fn`, so an arrow function's own signature is not
+                // surfaced here); everything else has neither.
                 let (params, returns) = match name {
                     "fn_name" => {
                         let fn_node = def_node.unwrap_or(node);
@@ -270,7 +333,7 @@ impl LanguageParser for TypeScriptParser {
                             callable_returns(src, fn_node),
                         )
                     }
-                    "const_name" | "var_name" => {
+                    "const_name" | "var_name" | "field_name" | "ctor_field_name" => {
                         let declarator_node = node.parent().unwrap_or(node);
                         (None, declared_type(src, declarator_node))
                     }
@@ -444,18 +507,24 @@ impl LanguageParser for TypeScriptParser {
 
         // --- References ---
         //
-        // Member/field write targets (`x.count = 1`, `x.count += 1`,
-        // `x.count++`) are deliberately not captured -- see the comment
-        // above the reference query in `rust_parser.rs` for why: no parser
-        // in this codebase indexes plain fields as symbols, so a write
-        // capture has no correct symbol to resolve to and can only produce
-        // a confidently wrong "who mutates this" answer.
+        // Member/field writes (`x.count = 1`, `x.count += 1`, `x.count++`)
+        // are captured as `member: true` usages, now that class fields and
+        // interface/object-type property signatures are indexed as
+        // `field`-kind symbols above -- `member: true` narrows resolution
+        // to those candidates at index time (see `src/indexer.rs`), so a
+        // write with no matching field candidate is correctly dropped
+        // rather than landing on an unrelated same-named symbol. A bare
+        // assignment target (`count = 1`) is not a member access and stays
+        // uncaptured, same as before.
         let ref_query = Query::new(
             &self.language,
             r#"
             (call_expression function: (identifier) @call_name)
             (call_expression function: (member_expression property: (property_identifier) @method_call))
             (new_expression constructor: (identifier) @new_call)
+            (assignment_expression left: (member_expression property: (property_identifier) @member_write))
+            (augmented_assignment_expression left: (member_expression property: (property_identifier) @member_readwrite))
+            (update_expression argument: (member_expression property: (property_identifier) @member_readwrite))
             "#,
         )
         .context("compiling TS/JS reference query")?;
@@ -466,17 +535,23 @@ impl LanguageParser for TypeScriptParser {
         while let Some(m) = matches.next() {
             for c in m.captures {
                 let text = text_from(src, c.node);
+                let capture_name = ref_query.capture_names()[c.index as usize];
+                let member = matches!(capture_name, "member_write" | "member_readwrite");
                 result.references.push(ParsedReference {
                     symbol_name: text,
                     line: c.node.start_position().row as i64 + 1,
                     column: c.node.start_position().column as i64,
                     from_scope: None,
-                    // `money.formatMoney()` names a member of some receiver,
-                    // not the bare name an import binds.
-                    qualified: ref_query.capture_names()[c.index as usize] == "method_call",
-                    // These captures are calls / `new T()`, which read the
-                    // callee/constructed type.
-                    usage_kind: UsageKind::Read,
+                    // `money.formatMoney()`/`x.count` name a member of some
+                    // receiver, not the bare name an import binds.
+                    qualified: capture_name == "method_call" || member,
+                    usage_kind: match capture_name {
+                        "member_write" => UsageKind::Write,
+                        "member_readwrite" => UsageKind::ReadWrite,
+                        // Calls / `new T()`, which read the callee/constructed type.
+                        _ => UsageKind::Read,
+                    },
+                    member,
                 });
             }
         }
@@ -830,15 +905,164 @@ export class Registry {
     }
 
     #[test]
-    fn test_assignment_targets_emit_no_reference() {
+    fn test_bare_assignment_target_emits_no_reference() {
         let parser = TypeScriptParser::new("typescript");
-        let result = parser
-            .parse("count = 1; x.count = 1; x.count += 1; x.count++;")
-            .unwrap();
+        let result = parser.parse("count = 1;").unwrap();
         assert!(
             result.references.is_empty(),
-            "assignment targets must not be captured as references: {:?}",
+            "a bare assignment target is not a member access: {:?}",
             result.references
         );
+    }
+
+    #[test]
+    fn test_member_write_is_captured() {
+        let parser = TypeScriptParser::new("typescript");
+        let result = parser.parse("x.count = 1;").unwrap();
+        let r = result
+            .references
+            .iter()
+            .find(|r| r.symbol_name == "count")
+            .unwrap();
+        assert_eq!(r.usage_kind, UsageKind::Write);
+        assert!(r.member);
+        assert!(r.qualified);
+    }
+
+    #[test]
+    fn test_member_compound_assignment_and_increment_are_readwrite() {
+        let parser = TypeScriptParser::new("typescript");
+        let result = parser
+            .parse("x.count += 1; x.count++; ++x.count; x.count--; --x.count;")
+            .unwrap();
+        let count_refs: Vec<_> = result
+            .references
+            .iter()
+            .filter(|r| r.symbol_name == "count")
+            .collect();
+        assert_eq!(count_refs.len(), 5);
+        for r in count_refs {
+            assert_eq!(r.usage_kind, UsageKind::ReadWrite);
+            assert!(r.member);
+            assert!(r.qualified);
+        }
+    }
+
+    #[test]
+    fn test_class_field_declaration_emits_no_reference() {
+        let parser = TypeScriptParser::new("typescript");
+        let result = parser.parse("class C { count = 0; }").unwrap();
+        assert!(
+            result.references.is_empty(),
+            "a field declaration with an initializer is not a usage: {:?}",
+            result.references
+        );
+    }
+
+    #[test]
+    fn test_class_fields_are_indexed_with_scope_and_visibility() {
+        let parser = TypeScriptParser::new("typescript");
+        let source = r#"
+class Wallet {
+    readonly balance: number;
+    label = "USD";
+    private secret: string;
+    protected guard?: boolean;
+    public open: boolean;
+    #hidden: number = 0;
+}
+"#;
+        let result = parser.parse(source).unwrap();
+        let field = |name: &str| {
+            result
+                .symbols
+                .iter()
+                .find(|s| s.name == name && s.kind == "field")
+                .unwrap_or_else(|| panic!("no field symbol named {name}"))
+        };
+
+        let balance = field("balance");
+        assert_eq!(balance.scope, Some("Wallet".to_string()));
+        assert_eq!(balance.visibility, "pub");
+        assert_eq!(balance.returns, Some("number".to_string()));
+        assert_eq!(balance.params, None);
+
+        assert_eq!(field("label").visibility, "pub");
+        assert_eq!(field("secret").visibility, "private");
+        assert_eq!(field("guard").visibility, "private");
+        assert_eq!(field("open").visibility, "pub");
+        assert_eq!(field("#hidden").scope, Some("Wallet".to_string()));
+    }
+
+    #[test]
+    fn test_interface_property_signatures_are_indexed_as_fields() {
+        let parser = TypeScriptParser::new("typescript");
+        let source = r#"
+interface Config {
+    host: string;
+    port?: number;
+}
+"#;
+        let result = parser.parse(source).unwrap();
+        let host = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "host" && s.kind == "field")
+            .unwrap();
+        assert_eq!(host.scope, Some("Config".to_string()));
+        assert_eq!(host.visibility, "pub");
+        assert_eq!(host.returns, Some("string".to_string()));
+
+        let port = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "port" && s.kind == "field")
+            .unwrap();
+        assert_eq!(port.returns, Some("number".to_string()));
+    }
+
+    #[test]
+    fn test_constructor_parameter_properties_are_indexed_as_fields() {
+        let parser = TypeScriptParser::new("typescript");
+        let source = r#"
+class Wallet {
+    constructor(private readonly balance: number, public label: string, plain: string) {}
+}
+"#;
+        let result = parser.parse(source).unwrap();
+        let fields: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == "field")
+            .collect();
+        assert_eq!(fields.len(), 2, "plain (non-property) parameters are not fields: {fields:?}");
+
+        let balance = fields.iter().find(|s| s.name == "balance").unwrap();
+        assert_eq!(balance.scope, Some("Wallet".to_string()));
+        assert_eq!(balance.visibility, "private");
+        assert_eq!(balance.returns, Some("number".to_string()));
+
+        let label = fields.iter().find(|s| s.name == "label").unwrap();
+        assert_eq!(label.visibility, "pub");
+    }
+
+    #[test]
+    fn test_javascript_class_fields_are_indexed() {
+        let parser = TypeScriptParser::new("javascript");
+        let source = r#"
+class C {
+    x = 5;
+    #y = 1;
+}
+"#;
+        let result = parser.parse(source).unwrap();
+        let names: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == "field")
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(names.contains(&"x"));
+        assert!(names.contains(&"#y"));
     }
 }

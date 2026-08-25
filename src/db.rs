@@ -237,6 +237,12 @@ pub struct ParsedReference {
     pub qualified: bool,
     /// Whether this usage reads, writes, or both reads and writes the target.
     pub usage_kind: UsageKind,
+    /// True when the usage names a member of a receiver (`x.count`) rather
+    /// than a bare name. At index time such a usage may only resolve to a
+    /// member definition (kind "field"); it is never attributed to a
+    /// same-named function or type, which would be a confidently wrong
+    /// "who mutates this" answer.
+    pub member: bool,
 }
 
 /// Parsed type-relation data before insertion (`class C extends B`, `impl
@@ -1769,15 +1775,17 @@ impl Database {
 
     /// Bump this when adding a table or pass that a full re-index must
     /// populate for every file, not just ones whose content changed.
-    /// Current: 4 — every reference row now carries a `usage_kind`
-    /// (read/write/readwrite/unknown), classified from the reference site's
-    /// syntax. A pre-existing row's `usage_kind` was backfilled to
-    /// `'unknown'` by the additive `ALTER TABLE` migration alone, which is
-    /// correct as a placeholder but not as a final answer — the file's
-    /// content hash is unchanged, so nothing else would ever re-derive the
-    /// real kind for it. Same reasoning as version 3: this bump forces the
-    /// same backfill-on-upgrade re-parse.
-    pub const CURRENT_INDEX_FORMAT_VERSION: &str = "4";
+    /// Current: 5 — field declarations become indexed symbols (kind
+    /// "field"), and reference sites now record whether they name a member
+    /// of a receiver (`x.count`). Same reasoning as version 4: the file's
+    /// content hash is unchanged, so nothing else would ever re-derive
+    /// these from an already-parsed file. Prior: 4 — every reference row
+    /// carries a `usage_kind` (read/write/readwrite/unknown), classified
+    /// from the reference site's syntax. A pre-existing row's `usage_kind`
+    /// was backfilled to `'unknown'` by the additive `ALTER TABLE`
+    /// migration alone, which is correct as a placeholder but not as a
+    /// final answer.
+    pub const CURRENT_INDEX_FORMAT_VERSION: &str = "5";
 
     pub fn set_metadata(&self, key: &str, value: &str) -> Result<()> {
         self.conn.execute(

@@ -745,9 +745,40 @@ fn test_csharp_indexing() {
         "Should find Greet method, got: {:?}",
         sym_info
     );
+    // A method (Greet) is "fn", a property (Name) is "property", and a plain
+    // field (enum members, struct fields) is "field" -- pin the three-way split.
     assert!(
-        sym_info.iter().any(|(n, k)| n == "Name" && k == "fn"),
-        "Should find Name property, got: {:?}",
+        sym_info
+            .iter()
+            .any(|(n, k)| n == "Name" && k == "property"),
+        "Should find Name property with kind 'property', got: {:?}",
+        sym_info
+    );
+    assert!(
+        sym_info.iter().any(|(n, k)| n == "Age" && k == "property"),
+        "Should find Age property with kind 'property', got: {:?}",
+        sym_info
+    );
+    assert!(
+        sym_info.iter().any(|(n, k)| n == "Active" && k == "field"),
+        "Should find Active enum member with kind 'field', got: {:?}",
+        sym_info
+    );
+    assert!(
+        sym_info
+            .iter()
+            .any(|(n, k)| n == "Inactive" && k == "field"),
+        "Should find Inactive enum member with kind 'field', got: {:?}",
+        sym_info
+    );
+    assert!(
+        sym_info.iter().any(|(n, k)| n == "X" && k == "field"),
+        "Should find Vector.X field with kind 'field', got: {:?}",
+        sym_info
+    );
+    assert!(
+        sym_info.iter().any(|(n, k)| n == "Y" && k == "field"),
+        "Should find Vector.Y field with kind 'field', got: {:?}",
         sym_info
     );
 
@@ -1416,10 +1447,15 @@ fn test_scope_filter_json() {
         "should contain 'parse', got: {:?}",
         names
     );
+    assert!(
+        names.contains(&"input"),
+        "should contain the 'input' field, got: {:?}",
+        names
+    );
     assert_eq!(
         symbols.len(),
-        2,
-        "Parser scope should have exactly 2 methods, got: {:?}",
+        3,
+        "Parser scope should have exactly 3 members (input field, new, parse), got: {:?}",
         names
     );
 }
@@ -4657,22 +4693,19 @@ fn test_deps_unknown_kind_reference_excluded_by_both_flags() {
 /// CLI level, the same way `test_deps_unknown_kind_reference_excluded_by_both_flags`
 /// covers `unknown`.
 ///
-/// No tree-sitter parser can attach a correct `write`/`readwrite` reference
-/// to a real definition today: none of the six languages index struct/class
-/// fields as symbols, so a member write has no correct symbol to attach to
-/// and would land on whatever unrelated same-named symbol happens to exist
-/// instead — a confident false claim, which is why the tree-sitter write
-/// captures were pulled rather than shipped with that defect. The `write`/
-/// `readwrite` path is real end-to-end only via the Roslyn leg (C#
-/// properties, which are indexed symbols with exact docids), and exercising
-/// that here would need a live `dotnet` build (`built_roslyn_dll()`, gated
-/// and skipped when unavailable). So — exactly the seeding technique
-/// `test_deps_unknown_kind_reference_excluded_by_both_flags` uses for
-/// `unknown` — this seeds `write` and `readwrite` rows directly into a real
-/// index's `references_` table, then drives the filtering purely through
-/// the CLI. This keeps `--writes`/`--reads` covered at the CLI level for
-/// every kind the enum has, independent of which producer (Roslyn today,
-/// tree-sitter once fields are indexed) supplies the row.
+/// Both producers now emit these rows for real: the Roslyn leg (C# fields
+/// and properties, indexed symbols with exact docids) and the tree-sitter
+/// leg, which attaches a member write to the field it actually names now
+/// that fields are indexed symbols — see
+/// `test_member_write_never_attributed_to_same_named_function` and
+/// `test_go_member_write_and_readwrite_usage_kinds` for that end-to-end
+/// path. This test deliberately stays independent of both. It seeds `write`
+/// and `readwrite` rows straight into a real index's `references_` table —
+/// exactly the technique `test_deps_unknown_kind_reference_excluded_by_both_flags`
+/// uses for `unknown` — and drives the filtering purely through the CLI, so
+/// `--writes`/`--reads` stay covered for every kind the enum has no matter
+/// which producer supplies the row, and without needing a live `dotnet`
+/// build (`built_roslyn_dll()`, gated and skipped when unavailable).
 #[test]
 fn test_deps_write_and_readwrite_kinds_sorted_by_flags_at_cli_level() {
     let (dir, bin) = setup_single_reference_project();
@@ -4735,6 +4768,166 @@ fn test_deps_write_and_readwrite_kinds_sorted_by_flags_at_cli_level() {
     assert!(
         read_lines.contains(&222),
         "--reads must keep the readwrite row: {reads}"
+    );
+}
+
+/// The bug this feature fixes: `a.name = 1` writes the struct field
+/// `S::name`, and `fn name()` is an unrelated, same-named top-level
+/// function. Before member references could only resolve to a field/
+/// property, this write was mis-attributed to the function `name` (the only
+/// symbol named `name` the indexer knew about at the time). Now that plain
+/// fields are indexed, the write must resolve to the field's symbol id, not
+/// the function's.
+#[test]
+fn test_member_write_never_attributed_to_same_named_function() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    std::fs::write(
+        dir.path().join("repro.rs"),
+        "struct S { name: i32 }\nfn f(a: &mut S) { a.name = 1; }\nfn name() -> i32 { 42 }\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    let conn = index_db(dir.path());
+    let field_id: i64 = conn
+        .query_row(
+            "SELECT id FROM symbols WHERE name = 'name' AND kind = 'field'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("finding the S.name field symbol");
+    let function_id: i64 = conn
+        .query_row(
+            "SELECT id FROM symbols WHERE name = 'name' AND kind = 'fn'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("finding the name() function symbol");
+    assert_ne!(
+        field_id, function_id,
+        "the field and the function must be distinct symbols"
+    );
+
+    let write_symbol_id: i64 = conn
+        .query_row(
+            "SELECT symbol_id FROM references_ WHERE usage_kind = 'write'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("finding the seeded write reference");
+    assert_eq!(
+        write_symbol_id, field_id,
+        "the write on a.name must resolve to the S.name field, not the name() function \
+         (function id {function_id}, field id {field_id}, resolved to {write_symbol_id})"
+    );
+    assert_ne!(
+        write_symbol_id, function_id,
+        "the write must never be attributed to the same-named function"
+    );
+
+    // Confirm the same guarantee holds through the CLI: scoped to the field
+    // itself, `--writes` reports exactly the one real write site.
+    let field_writes = deps_json(&bin, dir.path(), &["S.name", "--writes"]);
+    let dependents = field_writes["dependents"].as_array().unwrap();
+    assert_eq!(
+        dependents.len(),
+        1,
+        "the S.name field should show exactly the one write, got: {field_writes}"
+    );
+    assert_eq!(dependents[0]["line"].as_i64(), Some(2));
+    assert_eq!(dependents[0]["container"].as_str(), Some("f"));
+}
+
+/// The positive half of the field-write fix: `helios deps <field> --writes`
+/// must return the real write site (file, line, and the containing
+/// function), not merely avoid the false-attribution bug.
+#[test]
+fn test_deps_field_writes_returns_real_write_site() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    std::fs::write(
+        dir.path().join("wallet.rs"),
+        "struct Wallet { balance: i32 }\nfn deposit(w: &mut Wallet, amount: i32) {\n    w.balance = w.balance + amount;\n}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    let value = deps_json(&bin, dir.path(), &["Wallet.balance", "--writes"]);
+    let dependents = value["dependents"].as_array().unwrap();
+    assert_eq!(
+        dependents.len(),
+        1,
+        "expected exactly one write to Wallet.balance, got: {value}"
+    );
+    assert_eq!(dependents[0]["file"].as_str(), Some("wallet.rs"));
+    assert_eq!(dependents[0]["line"].as_i64(), Some(3));
+    assert_eq!(
+        dependents[0]["container"].as_str(),
+        Some("deposit"),
+        "the write site's containing function should be reported: {value}"
+    );
+    assert_eq!(dependents[0]["usage_kind"].as_str(), Some("write"));
+}
+
+/// Cross-language coverage: a Go struct field written with `=` is recorded
+/// as `write`, and the same field mutated with `++` is recorded as
+/// `readwrite` -- proving the member-write classification isn't Rust-only.
+#[test]
+fn test_go_member_write_and_readwrite_usage_kinds() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let bin = helios_bin();
+
+    std::fs::write(
+        dir.path().join("counter.go"),
+        "package main\n\ntype Counter struct {\n\tcount int\n}\n\nfunc inc(c *Counter) {\n\tc.count++\n}\n\nfunc set(c *Counter) {\n\tc.count = 5\n}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("helios init");
+    assert!(output.status.success(), "helios init failed");
+
+    let value = deps_json(&bin, dir.path(), &["count"]);
+    let dependents = value["dependents"].as_array().unwrap();
+    assert_eq!(
+        dependents.len(),
+        2,
+        "expected the ++ and the = reference on count, got: {value}"
+    );
+
+    let by_container = |container: &str| -> &serde_json::Value {
+        dependents
+            .iter()
+            .find(|d| d["container"].as_str() == Some(container))
+            .unwrap_or_else(|| panic!("no dependent in container {container}: {value}"))
+    };
+    assert_eq!(
+        by_container("inc")["usage_kind"].as_str(),
+        Some("readwrite"),
+        "c.count++ should be classified readwrite: {value}"
+    );
+    assert_eq!(
+        by_container("set")["usage_kind"].as_str(),
+        Some("write"),
+        "c.count = 5 should be classified write: {value}"
     );
 }
 
@@ -5160,7 +5353,7 @@ fn test_flow_unknown_target_errors() {
     assert_eq!(code, 1, "an unknown flow target should exit 1, got {code}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("no function named nosuchfunction"),
+        stderr.contains("no function or property named nosuchfunction"),
         "stderr should name the missing function, got: {stderr}"
     );
 }
@@ -6159,7 +6352,7 @@ fn test_init_backfills_type_relations_after_format_upgrade() {
     );
     assert_eq!(
         metadata_value(dir.path(), "index_format_version").as_deref(),
-        Some("4"),
+        Some("5"),
         "a successful full index must stamp the current format version"
     );
 }

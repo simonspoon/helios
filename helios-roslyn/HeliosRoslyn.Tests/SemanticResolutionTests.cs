@@ -108,18 +108,26 @@ public class SemanticResolutionTests
         Assert.Equal(zero.Docid, reference.ContainerDocid);
     }
 
-    [Fact] // (d5) container_docid: a field initializer attributes to the containing type
-           // (fields are not an indexed kind, so the field symbol itself is never a usable container)
-    public void Reference_InsideFieldInitializer_ContainerIsContainingType()
+    [Fact] // (d5) container_docid: a field initializer expression attributes to the field itself
+           // (fields are an indexed kind, so the field symbol is a usable container); the field's
+           // own type annotation, coming before the field is "entered", still attributes to the
+           // containing type.
+    public void Reference_InsideFieldInitializer_ContainerIsField()
     {
         var calculator = DefinitionAt("Calculator.cs", "class Calculator");
+        var self = DefinitionAt("Calculator.cs", "_self = new Calculator()");
         var line = HelperHarness.LineOf(SemanticFixture, "Calculator.cs", "_self = new Calculator();");
         var references = Output.Value.References
             .Where(r => r is { File: "Calculator.cs", IsDefinition: false } && r.Line == line)
+            .OrderBy(r => r.Col)
             .ToList();
 
-        Assert.NotEmpty(references); // the field type and `new Calculator()` both reference the type
-        Assert.All(references, r => Assert.Equal(calculator.Docid, r.ContainerDocid));
+        // the field's declared type ("Calculator _self") and the initializer's `new Calculator()`
+        var typeAnnotation = Assert.Single(references, r => r.Col < self.StartCol);
+        var initializer = Assert.Single(references, r => r.Col > self.StartCol);
+
+        Assert.Equal(calculator.Docid, typeAnnotation.ContainerDocid);
+        Assert.Equal(self.Docid, initializer.ContainerDocid);
     }
 
     [Fact] // (e1) relation: a class extending a base and implementing an interface emits both edges

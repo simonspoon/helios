@@ -246,6 +246,164 @@ impl LanguageParser for PythonParser {
             }
         }
 
+        // --- Field symbols (class attributes and self./cls. attributes) ---
+        //
+        // Python has no field declaration syntax; two attribute-assignment
+        // shapes serve as declarations: `x = 5` / `x: int = 5` directly in a
+        // class body (class attributes / dataclass fields), and `self.x =
+        // ...` / `self.x: T = ...` inside a method (the idiomatic
+        // instance-attribute declaration). The same attribute assigned in
+        // two places within a class is one field -- candidates are deduped
+        // below by (scope, name), keeping the earliest line.
+        let mut field_candidates: Vec<ParsedSymbol> = Vec::new();
+
+        let class_field_query = Query::new(
+            &self.language,
+            r#"
+            (class_definition
+              body: (block
+                (expression_statement
+                  (assignment left: (identifier) @field_name))))
+            "#,
+        )
+        .context("compiling Python class field query")?;
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&class_field_query, root, src);
+
+        while let Some(m) = matches.next() {
+            for c in m.captures {
+                let name_node = c.node;
+                let assign_node = name_node.parent().unwrap_or(name_node);
+                let class_node = assign_node
+                    .parent() // expression_statement
+                    .and_then(|p| p.parent()) // block
+                    .and_then(|p| p.parent()); // class_definition
+                let Some(class_node) = class_node else {
+                    continue;
+                };
+                if is_function_local(class_node, CALLABLE_KINDS) {
+                    continue;
+                }
+
+                let name = text_from(src, name_node);
+                let scope = find_class_scope(src, name_node);
+                let returns = assign_node
+                    .child_by_field_name("type")
+                    .map(|t| text_from(src, t).trim().to_string());
+                let def_node = assign_node.parent().unwrap_or(assign_node);
+                field_candidates.push(ParsedSymbol {
+                    name: name.clone(),
+                    kind: "field".to_string(),
+                    line: name_node.start_position().row as i64 + 1,
+                    column: name_node.start_position().column as i64,
+                    end_line: def_node.end_position().row as i64 + 1,
+                    visibility: Self::visibility_from_name(&name).to_string(),
+                    scope,
+                    params: None,
+                    returns,
+                });
+            }
+        }
+
+        // (self/cls declarations, and every other attribute-assignment
+        // usage) -- see the comment above the reference query below for why
+        // these are handled together.
+        let attr_assign_query = Query::new(
+            &self.language,
+            r#"
+            (assignment
+              left: (attribute
+                object: (identifier) @recv
+                attribute: (identifier) @field_name)) @attr_assign
+            (augmented_assignment
+              left: (attribute
+                object: (identifier) @recv
+                attribute: (identifier) @field_name)) @attr_assign
+            "#,
+        )
+        .context("compiling Python attribute assignment query")?;
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&attr_assign_query, root, src);
+
+        while let Some(m) = matches.next() {
+            let captures: Vec<_> = m
+                .captures
+                .iter()
+                .map(|c| {
+                    (
+                        attr_assign_query.capture_names()[c.index as usize],
+                        c.node,
+                    )
+                })
+                .collect();
+            let Some(&(_, recv_node)) = captures.iter().find(|(n, _)| *n == "recv") else {
+                continue;
+            };
+            let Some(&(_, name_node)) = captures.iter().find(|(n, _)| *n == "field_name") else {
+                continue;
+            };
+            let Some(&(_, assign_node)) = captures.iter().find(|(n, _)| *n == "attr_assign")
+            else {
+                continue;
+            };
+
+            let recv = text_from(src, recv_node);
+            let name = text_from(src, name_node);
+            let is_self_or_cls = recv == "self" || recv == "cls";
+
+            // `self.x = ...` / `cls.x = ...` is the instance-attribute
+            // declaration from rule (1b), not a usage -- it emits the field
+            // symbol and no reference. Augmented assignment (`+=`) can never
+            // declare -- it presupposes the attribute already exists -- so
+            // it's always a usage, even through self/cls.
+            if assign_node.kind() == "assignment" && is_self_or_cls {
+                let Some(scope) = find_class_scope(src, assign_node) else {
+                    continue;
+                };
+                let returns = assign_node
+                    .child_by_field_name("type")
+                    .map(|t| text_from(src, t).trim().to_string());
+                let def_node = assign_node.parent().unwrap_or(assign_node);
+                field_candidates.push(ParsedSymbol {
+                    name: name.clone(),
+                    kind: "field".to_string(),
+                    line: name_node.start_position().row as i64 + 1,
+                    column: name_node.start_position().column as i64,
+                    end_line: def_node.end_position().row as i64 + 1,
+                    visibility: Self::visibility_from_name(&name).to_string(),
+                    scope: Some(scope),
+                    params: None,
+                    returns,
+                });
+                continue;
+            }
+
+            let usage_kind = if assign_node.kind() == "augmented_assignment" {
+                UsageKind::ReadWrite
+            } else {
+                UsageKind::Write
+            };
+            result.references.push(ParsedReference {
+                symbol_name: name,
+                line: name_node.start_position().row as i64 + 1,
+                column: name_node.start_position().column as i64,
+                from_scope: None,
+                qualified: true,
+                usage_kind,
+                member: true,
+            });
+        }
+
+        field_candidates.sort_by_key(|s| s.line);
+        let mut seen_fields = std::collections::HashSet::new();
+        for sym in field_candidates {
+            if seen_fields.insert((sym.scope.clone(), sym.name.clone())) {
+                result.symbols.push(sym);
+            }
+        }
+
         // --- Imports ---
         let import_query = Query::new(
             &self.language,
@@ -285,11 +443,8 @@ impl LanguageParser for PythonParser {
         // --- References ---
         //
         // Attribute write targets (`x.count = 1`, `x.count += 1`) are
-        // deliberately not captured -- see the comment above the reference
-        // query in `rust_parser.rs` for why: no parser in this codebase
-        // indexes plain fields as symbols, so a write capture has no
-        // correct symbol to resolve to and can only produce a confidently
-        // wrong "who mutates this" answer.
+        // captured above, alongside the field symbols they resolve to --
+        // see the "Field symbols" section.
         let ref_query = Query::new(
             &self.language,
             r#"
@@ -317,6 +472,8 @@ impl LanguageParser for PythonParser {
                     // calls, which the grammar has no separate node for),
                     // which read the callee/constructed type.
                     usage_kind: UsageKind::Read,
+                // Calls, not member writes.
+                member: false,
                 });
             }
         }
@@ -624,13 +781,110 @@ class Service:
     }
 
     #[test]
-    fn test_assignment_targets_emit_no_reference() {
+    fn test_bare_assignment_target_emits_no_reference() {
         let parser = PythonParser::new();
-        let result = parser.parse("count = 1\nx.count = 1\nx.count += 1\n").unwrap();
+        let result = parser.parse("count = 1\n").unwrap();
         assert!(
             result.references.is_empty(),
-            "assignment targets must not be captured as references: {:?}",
+            "a bare local/global binding must not be captured as a reference: {:?}",
             result.references
         );
+    }
+
+    #[test]
+    fn test_member_write_emits_write_reference() {
+        let parser = PythonParser::new();
+        let result = parser.parse("x.count = 1\n").unwrap();
+        let r = result
+            .references
+            .iter()
+            .find(|r| r.symbol_name == "count")
+            .unwrap();
+        assert!(r.member);
+        assert!(r.qualified);
+        assert_eq!(r.usage_kind, UsageKind::Write);
+    }
+
+    #[test]
+    fn test_member_augmented_write_emits_readwrite_reference() {
+        let parser = PythonParser::new();
+        let result = parser.parse("x.count += 1\n").unwrap();
+        let r = result
+            .references
+            .iter()
+            .find(|r| r.symbol_name == "count")
+            .unwrap();
+        assert!(r.member);
+        assert_eq!(r.usage_kind, UsageKind::ReadWrite);
+    }
+
+    #[test]
+    fn test_self_assignment_declares_field_and_emits_no_reference() {
+        let parser = PythonParser::new();
+        let source = r#"
+class MyClass:
+    def __init__(self):
+        self.count = 1
+"#;
+        let result = parser.parse(source).unwrap();
+        assert!(
+            result.references.iter().all(|r| r.symbol_name != "count"),
+            "self.x = ... is a declaration, not a usage: {:?}",
+            result.references
+        );
+        let field = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "count" && s.kind == "field")
+            .unwrap();
+        assert_eq!(field.scope, Some("MyClass".to_string()));
+    }
+
+    #[test]
+    fn test_class_body_field_indexed() {
+        let parser = PythonParser::new();
+        let source = r#"
+class MyClass:
+    name: str = "x"
+    _hidden = 1
+"#;
+        let result = parser.parse(source).unwrap();
+        let name = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "name" && s.kind == "field")
+            .unwrap();
+        assert_eq!(name.scope, Some("MyClass".to_string()));
+        assert_eq!(name.visibility, "pub");
+        assert_eq!(name.returns, Some("str".to_string()));
+        assert_eq!(name.params, None);
+
+        let hidden = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "_hidden" && s.kind == "field")
+            .unwrap();
+        assert_eq!(hidden.visibility, "protected");
+    }
+
+    #[test]
+    fn test_self_field_deduped_across_methods() {
+        let parser = PythonParser::new();
+        let source = r#"
+class MyClass:
+    def __init__(self):
+        self.count = 1
+
+    def reset(self):
+        self.count = 0
+"#;
+        let result = parser.parse(source).unwrap();
+        let fields: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.name == "count" && s.kind == "field")
+            .collect();
+        assert_eq!(fields.len(), 1, "expected one deduped field: {fields:?}");
+        assert_eq!(fields[0].line, 4);
     }
 }

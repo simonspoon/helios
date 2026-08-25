@@ -74,6 +74,32 @@ impl RustParser {
         }
         None
     }
+
+    /// Scope of a field: the enclosing struct/enum's own name. A field
+    /// lives inside a `field_declaration_list`, whose own parent is either
+    /// the `struct_item` it belongs to directly, or an `enum_variant`
+    /// (itself inside the `enum_item`) for a struct-like variant -- either
+    /// way the enclosing type's own name, not the variant's, is the
+    /// field's scope. Separate from `find_scope` because a struct/enum's
+    /// own name node is *itself* a direct child of its `struct_item`/
+    /// `enum_item`: reusing `find_scope` there would make the struct/enum
+    /// report its own name as its scope.
+    fn field_scope(source: &[u8], node: tree_sitter::Node) -> Option<String> {
+        let mut current = node.parent();
+        while let Some(parent) = current {
+            if matches!(parent.kind(), "struct_item" | "enum_item")
+                && let Some(name_node) = parent.child_by_field_name("name")
+            {
+                return Some(
+                    std::str::from_utf8(&source[name_node.byte_range()])
+                        .unwrap_or("")
+                        .to_string(),
+                );
+            }
+            current = parent.parent();
+        }
+        None
+    }
 }
 
 fn text_from(source: &[u8], node: tree_sitter::Node) -> String {
@@ -137,6 +163,7 @@ impl LanguageParser for RustParser {
             (const_item name: (identifier) @const_name) @const_def
             (static_item name: (identifier) @static_name) @static_def
             (mod_item name: (identifier) @mod_name) @mod_def
+            (field_declaration name: (field_identifier) @field_name) @field_def
             "#,
         )
         .context("compiling Rust symbol query")?;
@@ -160,6 +187,7 @@ impl LanguageParser for RustParser {
                     "type_name" => ("type", text_from(src, node)),
                     "const_name" | "static_name" => ("const", text_from(src, node)),
                     "mod_name" => ("mod", text_from(src, node)),
+                    "field_name" => ("field", text_from(src, node)),
                     _ => continue,
                 };
 
@@ -175,11 +203,15 @@ impl LanguageParser for RustParser {
                 }
 
                 let visibility = Self::extract_visibility(src, def_node);
-                let scope = Self::find_scope(src, node);
+                let scope = if kind == "field" {
+                    Self::field_scope(src, node)
+                } else {
+                    Self::find_scope(src, node)
+                };
 
                 let (params, returns) = if kind == "fn" {
                     signature_of(src, def_node)
-                } else if kind == "const" {
+                } else if kind == "const" || kind == "field" {
                     (
                         None,
                         def_node
@@ -322,31 +354,25 @@ impl LanguageParser for RustParser {
             }
         }
 
-        // --- References (function calls) ---
+        // --- References (function calls, member writes) ---
         //
-        // Member/field write targets (`x.count = 1`, `x.count += 1`, `&mut
-        // x.count`) are deliberately NOT captured here. Not because the
-        // node kinds are hard to find -- `assignment_expression left:
-        // (field_expression field: (field_identifier))` and friends are
-        // straightforward -- but because no parser in this codebase indexes
-        // plain fields as `ParsedSymbol`s, in any language. A captured
-        // field write therefore has no correct symbol to resolve to; it
-        // can only land on an unrelated same-named symbol elsewhere in the
-        // index (a function, a method, anything sharing that identifier),
-        // producing a confidently wrong "who mutates this" answer. That is
-        // worse than reporting no write at all, so these writes go
-        // uncaptured until field declarations become indexed symbols in
-        // their own right -- at which point a write capture would have
-        // something correct to resolve against, and revisiting this is
-        // worthwhile. Every other parser in `src/parsers/` follows this
-        // same rule for the same reason; this is the one comment that
-        // spells it out in full.
+        // Calls (`call_name`, `scoped_call`, `method_call`) are unqualified
+        // or qualified reads of the callee, `member: false`. Member write
+        // targets -- `x.count = 1` (Write), `x.count += 1` (ReadWrite), and
+        // `&mut x.count` (ReadWrite) -- are captured as `member: true`,
+        // which at index time (`resolve_member_candidates` in
+        // `src/indexer.rs`) restricts resolution to field-kind symbols
+        // only, so a member write can never land on an unrelated
+        // same-named function or method elsewhere in the index.
         let ref_query = Query::new(
             &self.language,
             r#"
             (call_expression function: (identifier) @call_name)
             (call_expression function: (scoped_identifier name: (identifier) @scoped_call))
             (call_expression function: (field_expression field: (field_identifier) @method_call))
+            (assignment_expression left: (field_expression field: (field_identifier) @field_write))
+            (compound_assignment_expr left: (field_expression field: (field_identifier) @field_compound))
+            (reference_expression (mutable_specifier) value: (field_expression field: (field_identifier) @field_mut_ref))
             "#,
         )
         .context("compiling Rust reference query")?;
@@ -357,14 +383,21 @@ impl LanguageParser for RustParser {
         while let Some(m) = matches.next() {
             for c in m.captures {
                 let text = text_from(src, c.node);
+                let capture_name = ref_query.capture_names()[c.index as usize];
+                let (usage_kind, member) = match capture_name {
+                    "field_write" => (UsageKind::Write, true),
+                    "field_compound" | "field_mut_ref" => (UsageKind::ReadWrite, true),
+                    // Calls read the callee.
+                    _ => (UsageKind::Read, false),
+                };
                 result.references.push(ParsedReference {
                     symbol_name: text,
                     line: c.node.start_position().row as i64 + 1,
                     column: c.node.start_position().column as i64,
                     from_scope: None,
-                    qualified: ref_query.capture_names()[c.index as usize] != "call_name",
-                    // These captures are calls, which read the callee.
-                    usage_kind: UsageKind::Read,
+                    qualified: member || capture_name != "call_name",
+                    usage_kind,
+                    member,
                 });
             }
         }
@@ -702,18 +735,115 @@ impl S {
     }
 
     #[test]
-    fn test_assignment_targets_emit_no_reference() {
-        // Neither a bare local (`count = 1`) nor a field write (`x.count =
-        // 1`) is captured -- see the comment above the reference query for
-        // why field writes specifically are excluded.
+    fn test_bare_assignment_target_emits_no_reference() {
+        // A bare local (`count = 1`) is not a member usage, so it is not
+        // captured as a reference at all.
         let parser = RustParser::new();
-        let result = parser
-            .parse("fn f() { count = 1; x.count = 1; x.count += 1; }")
-            .unwrap();
+        let result = parser.parse("fn f() { count = 1; }").unwrap();
         assert!(
             result.references.is_empty(),
-            "assignment targets must not be captured as references: {:?}",
+            "bare assignment target must not be captured as a reference: {:?}",
             result.references
         );
+    }
+
+    #[test]
+    fn test_struct_fields_indexed_with_scope_and_visibility() {
+        let parser = RustParser::new();
+        let source = r#"
+pub struct MyStruct {
+    pub name: String,
+    count: u32,
+}
+"#;
+        let result = parser.parse(source).unwrap();
+        let fields: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == "field")
+            .collect();
+        assert_eq!(fields.len(), 2);
+
+        let name = fields.iter().find(|s| s.name == "name").unwrap();
+        assert_eq!(name.visibility, "pub");
+        assert_eq!(name.scope, Some("MyStruct".to_string()));
+        assert_eq!(name.returns, Some("String".to_string()));
+        assert_eq!(name.params, None);
+
+        let count = fields.iter().find(|s| s.name == "count").unwrap();
+        assert_eq!(count.visibility, "private");
+        assert_eq!(count.scope, Some("MyStruct".to_string()));
+        assert_eq!(count.returns, Some("u32".to_string()));
+    }
+
+    #[test]
+    fn test_struct_like_enum_variant_field_scoped_to_enum() {
+        let parser = RustParser::new();
+        let source = "enum E {\n    C { x: i32 },\n}\n";
+        let result = parser.parse(source).unwrap();
+        let x = result.symbols.iter().find(|s| s.name == "x").unwrap();
+        assert_eq!(x.kind, "field");
+        assert_eq!(x.scope, Some("E".to_string()));
+    }
+
+    #[test]
+    fn test_tuple_struct_positional_fields_not_indexed() {
+        let parser = RustParser::new();
+        let result = parser.parse("struct Point(i32, i32);").unwrap();
+        assert!(!result.symbols.iter().any(|s| s.kind == "field"));
+    }
+
+    #[test]
+    fn test_function_local_struct_fields_are_not_symbols() {
+        let parser = RustParser::new();
+        let source = "fn f() {\n    struct S { x: i32 }\n}\n";
+        let result = parser.parse(source).unwrap();
+        assert!(!result.symbols.iter().any(|s| s.kind == "field"));
+    }
+
+    #[test]
+    fn test_field_write_emits_member_write_reference() {
+        let parser = RustParser::new();
+        let result = parser.parse("fn f() { a.name = 1; }").unwrap();
+        let r = result
+            .references
+            .iter()
+            .find(|r| r.symbol_name == "name")
+            .unwrap();
+        assert!(r.member);
+        assert!(r.qualified);
+        assert_eq!(r.usage_kind, UsageKind::Write);
+    }
+
+    #[test]
+    fn test_compound_field_assignment_and_mut_ref_are_readwrite() {
+        let parser = RustParser::new();
+        let result = parser
+            .parse("fn f() { a.name += 1; let r = &mut a.name; }")
+            .unwrap();
+        let refs: Vec<_> = result
+            .references
+            .iter()
+            .filter(|r| r.symbol_name == "name")
+            .collect();
+        assert_eq!(refs.len(), 2);
+        for r in refs {
+            assert!(r.member);
+            assert_eq!(r.usage_kind, UsageKind::ReadWrite);
+        }
+    }
+
+    #[test]
+    fn test_plain_call_is_still_unqualified_non_member_read() {
+        let parser = RustParser::new();
+        let result = parser.parse("fn f() { helper(); }").unwrap();
+        let r = result
+            .references
+            .iter()
+            .find(|r| r.symbol_name == "helper")
+            .unwrap();
+        assert!(!r.member);
+        assert!(!r.qualified);
+        assert_eq!(r.usage_kind, UsageKind::Read);
     }
 }

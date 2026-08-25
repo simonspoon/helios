@@ -93,7 +93,8 @@ pub(crate) fn find_scope(source: &[u8], node: tree_sitter::Node) -> Option<Strin
             "class_declaration"
             | "struct_declaration"
             | "record_declaration"
-            | "interface_declaration" => {
+            | "interface_declaration"
+            | "enum_declaration" => {
                 if let Some(name_node) = parent.child_by_field_name("name") {
                     return Some(text_from(source, name_node));
                 }
@@ -135,6 +136,8 @@ impl LanguageParser for CSharpParser {
             (method_declaration name: (identifier) @method_name) @method_def
             (property_declaration name: (identifier) @prop_name) @prop_def
             (constructor_declaration name: (identifier) @ctor_name) @ctor_def
+            (field_declaration (variable_declaration type: (_) @field_type (variable_declarator name: (identifier) @field_name))) @field_def
+            (enum_member_declaration name: (identifier) @enum_member_name) @enum_member_def
             (namespace_declaration name: (_) @ns_name) @ns_def
             (file_scoped_namespace_declaration name: (_) @fns_name) @fns_def
             "#,
@@ -159,8 +162,14 @@ impl LanguageParser for CSharpParser {
                     "interface_name" => ("interface", text_from(src, node)),
                     "enum_name" => ("enum", text_from(src, node)),
                     "method_name" => ("fn", text_from(src, node)),
-                    "prop_name" => ("fn", text_from(src, node)), // properties as fn (getter/setter)
+                    // A property is a member that can be written like a field
+                    // AND has a body like a method (getter/setter, or an
+                    // expression body `=> ...` that `helios flow` needs to
+                    // find), so it's neither "fn" nor "field" -- its own kind.
+                    "prop_name" => ("property", text_from(src, node)),
                     "ctor_name" => ("fn", text_from(src, node)),
+                    "field_name" => ("field", text_from(src, node)),
+                    "enum_member_name" => ("field", text_from(src, node)), // enum members, like the Roslyn side
                     "ns_name" => ("mod", qualified_text(src, node)),
                     "fns_name" => ("mod", qualified_text(src, node)),
                     _ => continue,
@@ -176,6 +185,8 @@ impl LanguageParser for CSharpParser {
                     "method_name" => "method_def",
                     "prop_name" => "prop_def",
                     "ctor_name" => "ctor_def",
+                    "field_name" => "field_def",
+                    "enum_member_name" => "enum_member_def",
                     "ns_name" => "ns_def",
                     "fns_name" => "fns_def",
                     _ => continue,
@@ -190,6 +201,10 @@ impl LanguageParser for CSharpParser {
                 let visibility = if kind == "mod" {
                     // Namespaces don't have visibility modifiers
                     "pub".to_string()
+                } else if name == "enum_member_name" {
+                    // Enum members can't carry modifiers and are always public,
+                    // same as the Roslyn side's DeclaredAccessibility for them.
+                    "pub".to_string()
                 } else {
                     detect_visibility(src, def_node)
                 };
@@ -197,8 +212,9 @@ impl LanguageParser for CSharpParser {
                 let scope = find_scope(src, node);
 
                 // Methods and constructors are callable: params always Some,
-                // a method's return type (constructors have none). A
-                // property has a declared type but isn't callable.
+                // a method's return type (constructors have none). A property
+                // or field has a declared type but isn't callable; an enum
+                // member has neither.
                 let (params, returns) = match name {
                     "method_name" => (
                         params_of(src, def_node),
@@ -212,6 +228,13 @@ impl LanguageParser for CSharpParser {
                         def_node
                             .child_by_field_name("type")
                             .map(|t| text_from(src, t).trim().to_string()),
+                    ),
+                    "field_name" => (
+                        None,
+                        captures
+                            .iter()
+                            .find(|(n, _)| *n == "field_type")
+                            .map(|(_, t)| text_from(src, *t).trim().to_string()),
                     ),
                     _ => (None, None),
                 };
@@ -384,24 +407,39 @@ impl LanguageParser for CSharpParser {
             }
         }
 
-        // --- References (invocations and object creation) ---
+        // --- References (invocations, object creation, member writes) ---
         //
         // This is the tree-sitter fallback path only: `helios init` also
         // runs the Roslyn sidecar, which replaces this parser's whole C#
-        // reference set. Member write targets are not captured here: unlike
-        // the other tree-sitter parsers (see the comment above the
-        // reference query in `rust_parser.rs`), C# properties *are* indexed
-        // as symbols -- but as kind `"fn"` (see `prop_name` above),
-        // indistinguishable at resolution time from a method of the same
-        // name. A property write would carry the same false-attribution
-        // risk as an unindexed field, so it's excluded for the same reason,
-        // by a different mechanism.
+        // reference set. Calls and `new T()` are unqualified or qualified
+        // reads of the callee/constructed type, `member: false`. Member
+        // write targets -- `x.Count = 1` (Write), `x.Count += 1` /
+        // `x.Count++` / `++x.Count` (ReadWrite) -- are captured as
+        // `member: true, qualified: true`, which at index time
+        // (`resolve_member_candidates` in `src/indexer.rs`) restricts
+        // resolution to `"field"`/`"property"` symbols only (see `prop_name`
+        // and `field_name` above), recording nothing when no such candidate
+        // exists. That's what makes it safe for a member write to never
+        // land on an unrelated same-named method elsewhere in the index.
+        //
+        // C# unifies `=`, `+=`, `??=`, etc. into one `assignment_expression`
+        // node, so the plain-vs-compound distinction is read from the
+        // `operator` field's text at match time rather than from the node
+        // kind. Likewise `postfix_unary_expression` covers `x.Count++` /
+        // `x.Count--` *and* the null-forgiving operator `x.Count!` with the
+        // same node kind -- the query pins the literal `"++"` / `"--"`
+        // token so a `!` never matches and is never mislabeled as a write.
         let ref_query = Query::new(
             &self.language,
             r#"
             (invocation_expression function: (identifier) @call_name)
             (invocation_expression function: (member_access_expression name: (identifier) @member_call))
             (object_creation_expression type: (_) @new_type)
+            (assignment_expression left: (member_access_expression name: (identifier) @assign_target)) @assign_expr
+            (postfix_unary_expression (member_access_expression name: (identifier) @postfix_target) "++")
+            (postfix_unary_expression (member_access_expression name: (identifier) @postfix_target) "--")
+            (prefix_unary_expression "++" (member_access_expression name: (identifier) @prefix_target))
+            (prefix_unary_expression "--" (member_access_expression name: (identifier) @prefix_target))
             "#,
         )
         .context("compiling C# reference query")?;
@@ -410,27 +448,53 @@ impl LanguageParser for CSharpParser {
         let mut matches = cursor.matches(&ref_query, root, src);
 
         while let Some(m) = matches.next() {
-            for c in m.captures {
-                let cap_name = ref_query.capture_names()[c.index as usize];
-                let text = match cap_name {
-                    "call_name" | "member_call" => text_from(src, c.node),
+            let captures: Vec<_> = m
+                .captures
+                .iter()
+                .map(|c| (ref_query.capture_names()[c.index as usize], c.node))
+                .collect();
+
+            for &(cap_name, node) in &captures {
+                let (text, member, qualified, usage_kind) = match cap_name {
+                    "call_name" => (text_from(src, node), false, false, UsageKind::Read),
+                    "member_call" => (text_from(src, node), false, true, UsageKind::Read),
                     "new_type" => {
                         // For generic types like List<int>, just get the identifier
-                        if c.node.kind() == "generic_name" {
-                            if let Some(id) = c.node.child_by_field_name("name") {
+                        let text = if node.kind() == "generic_name" {
+                            if let Some(id) = node.child_by_field_name("name") {
                                 text_from(src, id)
                             } else {
                                 // Walk to first identifier child
-                                let mut wc = c.node.walk();
+                                let mut wc = node.walk();
                                 if wc.goto_first_child() && wc.node().kind() == "identifier" {
                                     text_from(src, wc.node())
                                 } else {
-                                    text_from(src, c.node)
+                                    text_from(src, node)
                                 }
                             }
                         } else {
-                            text_from(src, c.node)
-                        }
+                            text_from(src, node)
+                        };
+                        (text, false, false, UsageKind::Read)
+                    }
+                    "assign_target" => {
+                        // Plain `=` is a Write; any compound form (`+=`,
+                        // `??=`, ...) reads the old value too, so ReadWrite.
+                        let is_plain_eq = captures
+                            .iter()
+                            .find(|(n, _)| *n == "assign_expr")
+                            .and_then(|(_, e)| e.child_by_field_name("operator"))
+                            .map(|op| text_from(src, op) == "=")
+                            .unwrap_or(true);
+                        let usage_kind = if is_plain_eq {
+                            UsageKind::Write
+                        } else {
+                            UsageKind::ReadWrite
+                        };
+                        (text_from(src, node), true, true, usage_kind)
+                    }
+                    "postfix_target" | "prefix_target" => {
+                        (text_from(src, node), true, true, UsageKind::ReadWrite)
                     }
                     _ => continue,
                 };
@@ -438,13 +502,12 @@ impl LanguageParser for CSharpParser {
                 if !text.is_empty() {
                     result.references.push(ParsedReference {
                         symbol_name: text,
-                        line: c.node.start_position().row as i64 + 1,
-                        column: c.node.start_position().column as i64,
-                        from_scope: find_scope(src, c.node),
-                        qualified: cap_name == "member_call",
-                        // These captures are calls / `new T()`, which read
-                        // the callee/constructed type.
-                        usage_kind: UsageKind::Read,
+                        line: node.start_position().row as i64 + 1,
+                        column: node.start_position().column as i64,
+                        from_scope: find_scope(src, node),
+                        qualified,
+                        usage_kind,
+                        member,
                     });
                 }
             }
@@ -619,11 +682,11 @@ namespace MyApp.Models {
             sym_names
         );
 
-        // Properties
+        // Properties are indexed as their own kind
         assert!(
             sym_names
                 .iter()
-                .any(|(n, k, _)| n.as_str() == "Name" && k.as_str() == "fn"),
+                .any(|(n, k, _)| n.as_str() == "Name" && k.as_str() == "property"),
             "Should find Name property, got: {:?}",
             sym_names
         );
@@ -878,14 +941,107 @@ namespace MyApp.Models {
     }
 
     #[test]
-    fn test_assignment_targets_emit_no_reference() {
+    fn test_bare_assignment_target_emits_no_reference() {
         let parser = CSharpParser::new();
         let result = parser
-            .parse("class C { void f() { count = 1; x.count = 1; x.count += 1; x.count++; } }")
+            .parse("class C { void f() { count = 1; } }")
             .unwrap();
         assert!(
             !result.references.iter().any(|r| r.symbol_name == "count"),
-            "assignment targets must not be captured as references: {:?}",
+            "a bare (unqualified) assignment target must not be captured: {:?}",
+            result.references
+        );
+    }
+
+    #[test]
+    fn test_plain_field_indexed_with_scope_and_visibility() {
+        let parser = CSharpParser::new();
+        let source = "class C {\n    public int Count;\n    private string name;\n}\n";
+        let result = parser.parse(source).unwrap();
+        let count = result.symbols.iter().find(|s| s.name == "Count").unwrap();
+        assert_eq!(count.kind, "field");
+        assert_eq!(count.scope.as_deref(), Some("C"));
+        assert_eq!(count.visibility, "pub");
+        assert_eq!(count.returns, Some("int".to_string()));
+        assert_eq!(count.params, None);
+
+        let name = result.symbols.iter().find(|s| s.name == "name").unwrap();
+        assert_eq!(name.kind, "field");
+        assert_eq!(name.visibility, "private");
+    }
+
+    #[test]
+    fn test_multi_declarator_field_emits_one_symbol_per_name() {
+        let parser = CSharpParser::new();
+        let result = parser.parse("class C {\n    public int a, b;\n}\n").unwrap();
+        let a = result.symbols.iter().find(|s| s.name == "a").unwrap();
+        let b = result.symbols.iter().find(|s| s.name == "b").unwrap();
+        assert_eq!(a.kind, "field");
+        assert_eq!(b.kind, "field");
+        assert_eq!(a.returns, Some("int".to_string()));
+        assert_eq!(b.returns, Some("int".to_string()));
+    }
+
+    #[test]
+    fn test_enum_members_indexed_as_public_fields_scoped_to_enum() {
+        let parser = CSharpParser::new();
+        let result = parser
+            .parse("enum Status {\n    Active,\n    Inactive\n}\n")
+            .unwrap();
+        let active = result.symbols.iter().find(|s| s.name == "Active").unwrap();
+        assert_eq!(active.kind, "field");
+        assert_eq!(active.visibility, "pub");
+        assert_eq!(active.scope.as_deref(), Some("Status"));
+    }
+
+    #[test]
+    fn test_plain_assignment_to_member_is_write() {
+        let parser = CSharpParser::new();
+        let result = parser
+            .parse("class C { void f() { x.Count = 1; } }")
+            .unwrap();
+        let r = result
+            .references
+            .iter()
+            .find(|r| r.symbol_name == "Count")
+            .unwrap();
+        assert_eq!(r.usage_kind, UsageKind::Write);
+        assert!(r.member);
+        assert!(r.qualified);
+    }
+
+    #[test]
+    fn test_compound_assignment_and_incr_decr_are_readwrite() {
+        let parser = CSharpParser::new();
+        let result = parser
+            .parse(
+                "class C { void f() { x.Count += 1; x.Count++; ++x.Count; x.Count--; --x.Count; } }",
+            )
+            .unwrap();
+        let writes: Vec<_> = result
+            .references
+            .iter()
+            .filter(|r| r.symbol_name == "Count")
+            .collect();
+        assert_eq!(writes.len(), 5, "got: {:?}", result.references);
+        for r in writes {
+            assert_eq!(r.usage_kind, UsageKind::ReadWrite);
+            assert!(r.member);
+        }
+    }
+
+    #[test]
+    fn test_null_forgiving_operator_is_not_a_write() {
+        let parser = CSharpParser::new();
+        let result = parser
+            .parse("class C { void f() { var y = x.Count!; } }")
+            .unwrap();
+        assert!(
+            !result
+                .references
+                .iter()
+                .any(|r| r.symbol_name == "Count" && r.member),
+            "null-forgiving `x.Count!` must not be captured as a member write: {:?}",
             result.references
         );
     }

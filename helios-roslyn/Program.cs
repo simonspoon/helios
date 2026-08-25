@@ -714,7 +714,7 @@ internal static class Program
                         }
                         Visit(type);
                         break;
-                    case IMethodSymbol or IPropertySymbol when IsIndexedDefinitionKind(member):
+                    case IMethodSymbol or IPropertySymbol or IFieldSymbol when IsIndexedDefinitionKind(member):
                         if (member.Locations.Any(l => l.IsInSource))
                         {
                             result.Add(member);
@@ -735,7 +735,9 @@ internal static class Program
         INamedTypeSymbol { TypeKind: TypeKind.Struct } => "struct",
         INamedTypeSymbol { TypeKind: TypeKind.Interface } => "interface",
         INamedTypeSymbol { TypeKind: TypeKind.Enum } => "enum",
-        _ => "fn", // methods, constructors, properties — the only other collected kinds
+        IFieldSymbol => "field",
+        IPropertySymbol => "property", // writable member AND callable-with-a-body — its own kind
+        _ => "fn", // methods and constructors — the only other collected kinds
     };
 
     private static string VisibilityOf(ISymbol symbol) =>
@@ -963,10 +965,11 @@ internal static class Program
     /// that pass 1 (<see cref="CollectIndexedSymbols"/>) actually emits as a definition, so the
     /// consumer can always resolve it: walk <see cref="SemanticModel.GetEnclosingSymbol"/> outward
     /// via <see cref="NextContainer"/>, accepting only symbols <see cref="IsIndexedDefinitionKind"/>
-    /// allows — everything else (lambdas, local functions, accessors, field/event symbols, the
+    /// allows — everything else (lambdas, local functions, accessors, event symbols, the
     /// synthesized top-level-statements entry point, ...) is climbed past regardless of whether it
-    /// happens to carry its own non-null DocumentationCommentId. Null at file/namespace scope, or
-    /// when nothing encloses the position at all.
+    /// happens to carry its own non-null DocumentationCommentId. A reference inside a field
+    /// initializer now resolves to that field itself, since fields are indexed definitions too.
+    /// Null at file/namespace scope, or when nothing encloses the position at all.
     /// </summary>
     private static string? ContainerDocidAt(SemanticModel model, int position)
     {
@@ -1009,6 +1012,9 @@ internal static class Program
         INamedTypeSymbol { TypeKind: TypeKind.Class or TypeKind.Struct or TypeKind.Interface or TypeKind.Enum } => true,
         IMethodSymbol { MethodKind: MethodKind.Ordinary or MethodKind.Constructor } => true,
         IPropertySymbol => true,
+        // Explicitly declared fields, const fields, and enum members — but not compiler-generated
+        // ones (auto-property backing fields, etc.), which must never become indexed symbols.
+        IFieldSymbol { IsImplicitlyDeclared: false } => true,
         _ => false,
     };
 

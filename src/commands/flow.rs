@@ -148,12 +148,15 @@ pub fn run(
         None => bail!("flow needs a function or method, not a file: {target}"),
     };
 
-    // A LIKE search on the name, narrowed to functions and then to an exact
-    // name match: `query_symbols` is the only lookup that carries the kind.
+    // A LIKE search on the name, narrowed to functions and properties (a
+    // property has a body worth a control-flow graph, e.g. `Rate => Lookup()`;
+    // a plain field has none, so it's excluded) and then to an exact name
+    // match. `query_symbols` takes only one kind, so `None` here and the
+    // kind filter below stand in for "fn or property".
     let matches: Vec<_> = db
         .query_symbols(
             symbol.file.as_deref(),
-            Some("fn"),
+            None,
             Some(&symbol.name),
             symbol.scope.as_deref(),
             None,
@@ -163,6 +166,7 @@ pub fn run(
             None,
         )?
         .into_iter()
+        .filter(|(sym, _)| sym.kind == "fn" || sym.kind == "property")
         .filter(|(sym, _)| sym.name == symbol.name)
         // Overloads differ only by their parameters. The index records those
         // now, but there is no `--params` flag to disambiguate by them, so
@@ -172,8 +176,8 @@ pub fn run(
 
     let (sym, path) = match matches.len() {
         0 => match line {
-            Some(l) => bail!("no function named {target} declared on line {l}"),
-            None => bail!("no function named {target} in the index"),
+            Some(l) => bail!("no function or property named {target} declared on line {l}"),
+            None => bail!("no function or property named {target} in the index"),
         },
         1 => matches.into_iter().next().expect("one match"),
         _ => {

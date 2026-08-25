@@ -38,6 +38,19 @@ fn resolve_reference_candidates(
     candidates.iter().map(|(sym, _)| sym.id).collect()
 }
 
+/// Narrow same-named candidates to member-kind ones (`MEMBER_KINDS`) for a
+/// member reference (`x.count`, see `ParsedReference::member`) — such a
+/// usage can only legally name a field of its receiver, never a same-named
+/// function or type declared elsewhere.
+fn resolve_member_candidates(
+    candidates: Vec<(SymbolRecord, String)>,
+) -> Vec<(SymbolRecord, String)> {
+    candidates
+        .into_iter()
+        .filter(|(sym, _)| MEMBER_KINDS.contains(&sym.kind.as_str()))
+        .collect()
+}
+
 /// Which symbol a reference at `ref_line` sits inside, given the file's
 /// `(id, line, end_line)` symbol ranges.
 ///
@@ -110,6 +123,14 @@ fn base_type_identifier(name: &str) -> &str {
 /// the same set — matching Roslyn's own `KindOf` (Program.cs), which only
 /// ever reports class/struct/interface/enum.
 const TYPE_LIKE_KINDS: &[&str] = &["class", "struct", "interface", "enum", "trait", "type"];
+
+/// Symbol kinds a member usage (`x.count`, see `ParsedReference::member`) may
+/// resolve to. A member is reached through a receiver, so it can only ever
+/// name a field of that receiver's type, or a property of it (a member
+/// written through its setter, e.g. `obj.Name = "x"`) — never a same-named
+/// function or type declared elsewhere, which would be a confidently wrong
+/// "who mutates this" answer.
+const MEMBER_KINDS: &[&str] = &["field", "property"];
 
 /// Resolve a type relation's endpoint name — `super_name`, or `sub_name` when
 /// the parser couldn't supply a local declaration line for it — to a symbol
@@ -509,7 +530,10 @@ fn index_file_definitions(
 /// linked (same class/namespace wins over same-named definitions elsewhere).
 /// When no scope context is available or no candidate matches, ALL candidates
 /// are linked — preserving the ambiguous-name behavior so `helios deps` never
-/// silently drops a usage.
+/// silently drops a usage. A member usage (`x.count`, see
+/// `ParsedReference::member`) is narrowed first to only member-kind
+/// candidates (`MEMBER_KINDS`) before that scope-aware step runs, since it
+/// can never legally resolve to a same-named function or type.
 fn index_file_references(
     db: &Database,
     abs_path: &Path,
@@ -533,7 +557,18 @@ fn index_file_references(
     let ranges = db.symbol_ranges_for_file(file.id)?;
 
     for reference in &parse_result.references {
-        let candidates = db.find_symbol_by_name(&reference.symbol_name)?;
+        let mut candidates = db.find_symbol_by_name(&reference.symbol_name)?;
+        if reference.member {
+            candidates = resolve_member_candidates(candidates);
+            if candidates.is_empty() {
+                // A member usage may only resolve to a field-kind definition
+                // (MEMBER_KINDS). None here means we can't back this write
+                // with a real field — record nothing rather than attribute
+                // it to an unrelated same-named function or type: no claim
+                // beats a wrong claim.
+                continue;
+            }
+        }
         let symbol_ids = resolve_reference_candidates(reference.from_scope.as_deref(), &candidates);
         let container_symbol_id = innermost_enclosing_symbol(&ranges, reference.line);
         db.insert_references(
@@ -947,6 +982,73 @@ mod tests {
             )
             .unwrap();
         assert_eq!(resolve_type_name(&db, "Base").unwrap(), Some(base_class));
+    }
+
+    /// A member usage (`x.count`) must never resolve to a same-named
+    /// function — only a field-kind candidate (`MEMBER_KINDS`) counts. With
+    /// only the function in the index the member stays unresolved (not
+    /// silently pointed at the wrong symbol); once an actual field named
+    /// the same thing is added, resolution picks it.
+    #[test]
+    fn resolve_member_candidates_ignores_non_member_kinds() {
+        let db = Database::open_in_memory().unwrap();
+        let file = add_file(&db, "app.ts", "typescript");
+        // `add_symbol` inserts kind "fn" — not in MEMBER_KINDS.
+        add_symbol(&db, file, "count", 1, "");
+
+        let candidates = db.find_symbol_by_name("count").unwrap();
+        assert!(resolve_member_candidates(candidates).is_empty());
+
+        let count_field = db
+            .insert_symbol(
+                file,
+                &ParsedSymbol {
+                    name: "count".to_string(),
+                    kind: "field".to_string(),
+                    line: 10,
+                    column: 4,
+                    end_line: 10,
+                    visibility: "pub".to_string(),
+                    scope: None,
+                    params: None,
+                    returns: None,
+                },
+            )
+            .unwrap();
+        let candidates = db.find_symbol_by_name("count").unwrap();
+        let resolved = resolve_member_candidates(candidates);
+        assert_eq!(
+            resolved.iter().map(|(sym, _)| sym.id).collect::<Vec<_>>(),
+            vec![count_field]
+        );
+
+        // A property (e.g. a C# `public int Name { get; set; }`) is also a
+        // valid member-usage target — it's written through its setter.
+        let name_property = db
+            .insert_symbol(
+                file,
+                &ParsedSymbol {
+                    name: "Name".to_string(),
+                    kind: "property".to_string(),
+                    line: 20,
+                    column: 4,
+                    end_line: 20,
+                    visibility: "pub".to_string(),
+                    scope: None,
+                    params: None,
+                    returns: None,
+                },
+            )
+            .unwrap();
+        // `add_symbol` inserts kind "fn" — not in MEMBER_KINDS — so this
+        // proves the property is accepted while the same-named fn is still rejected.
+        add_symbol(&db, file, "Name", 1, "");
+        let candidates = db.find_symbol_by_name("Name").unwrap();
+        let resolved = resolve_member_candidates(candidates);
+        assert_eq!(
+            resolved.iter().map(|(sym, _)| sym.id).collect::<Vec<_>>(),
+            vec![name_property]
+        );
     }
 
     fn def(docid: &str, name: &str, file: &str, start_line: i64) -> Definition {

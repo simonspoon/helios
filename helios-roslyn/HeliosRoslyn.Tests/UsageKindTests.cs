@@ -58,6 +58,32 @@ public class UsageKindTests
         Assert.Equal("write", ReferenceAt("counter.Inner.Value = 2;", "Counter.Value").UsageKind);
     }
 
+    [Fact] // plain field: simple assignment write
+    public void FieldSimpleAssignment_IsClassifiedWrite()
+    {
+        Assert.Equal("write", ReferenceAt("counter.Count = 1;", "Counter.Count").UsageKind);
+    }
+
+    [Fact] // plain field: ++ readwrite
+    public void FieldIncrement_IsClassifiedReadWrite()
+    {
+        Assert.Equal("readwrite", ReferenceAt("counter.Count++;", "Counter.Count").UsageKind);
+    }
+
+    [Fact] // a plain field is indexed with kind "field", not "fn"
+    public void Field_IsEmittedWithFieldKind()
+    {
+        var definition = Assert.Single(Output.Value.Definitions, d => d.Docid == "F:UsageKind.Counter.Count");
+        Assert.Equal("field", definition.Kind);
+    }
+
+    [Fact] // a property is indexed with kind "property", distinct from a plain field
+    public void Property_IsEmittedWithPropertyKind()
+    {
+        var definition = Assert.Single(Output.Value.Definitions, d => d.Docid == "P:UsageKind.Counter.Value");
+        Assert.Equal("property", definition.Kind);
+    }
+
     [Fact] // indexer write
     public void IndexerAssignment_IsClassifiedWrite()
     {

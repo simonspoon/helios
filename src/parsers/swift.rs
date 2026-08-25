@@ -111,6 +111,14 @@ impl LanguageParser for SwiftParser {
 
         // In tree-sitter-swift, struct/class/enum/extension/actor all use class_declaration
         // with a declaration_kind field. Protocol uses protocol_declaration.
+        //
+        // Stored/computed properties in a type body are `property_declaration`
+        // (`name:` holds a `pattern` whose `bound_identifier:` is the
+        // identifier); a multi-binding `var a = 1, b = 2` repeats the `name:`
+        // field, which the query engine turns into one match per binding, so
+        // no special-casing is needed here. Protocol requirements use the
+        // distinct `protocol_property_declaration`, whose `name:` pattern is
+        // wrapped in an extra `value_binding_pattern` node.
         let symbol_query = Query::new(
             &self.language,
             r#"
@@ -120,6 +128,8 @@ impl LanguageParser for SwiftParser {
             (protocol_declaration name: (user_type) @protocol_name) @protocol_def
             (protocol_declaration name: (type_identifier) @protocol_name2) @protocol_def2
             (typealias_declaration name: (type_identifier) @type_name) @type_def
+            (property_declaration name: (pattern bound_identifier: (simple_identifier) @field_name)) @field_def
+            (protocol_property_declaration name: (pattern (value_binding_pattern) bound_identifier: (simple_identifier) @proto_field_name)) @proto_field_def
             "#,
         )
         .context("compiling Swift symbol query")?;
@@ -165,6 +175,7 @@ impl LanguageParser for SwiftParser {
                     }
                     "protocol_name" | "protocol_name2" => ("trait", text_from(src, node)),
                     "type_name" => ("type", text_from(src, node)),
+                    "field_name" | "proto_field_name" => ("field", text_from(src, node)),
                     _ => continue,
                 };
 
@@ -180,6 +191,14 @@ impl LanguageParser for SwiftParser {
 
                 let visibility = detect_visibility(src, def_node);
                 let scope = find_scope(src, node);
+
+                // A field's scope is the enclosing type; a `let`/`var` with
+                // no such ancestor lives at file scope and isn't a member
+                // (is_function_local only rules out function/closure
+                // locals, not this case).
+                if kind == "field" && scope.is_none() {
+                    continue;
+                }
 
                 // Only `fn` (function_declaration) is callable here --
                 // init/method/etc. aren't captured as symbols by this
@@ -234,15 +253,25 @@ impl LanguageParser for SwiftParser {
 
         // --- References ---
         //
-        // Member write targets (`x.count = 1`, `x.count += 1`) are
-        // deliberately not captured -- see the comment above the reference
-        // query in `rust_parser.rs` for why: no parser in this codebase
-        // indexes plain fields/properties as symbols, so a write capture
-        // has no correct symbol to resolve to.
+        // Member writes (`x.count = 1`, `x.count += 1`) are captured from
+        // `assignment` nodes whose target is a `navigation_expression` --
+        // i.e. the assignment goes through a receiver, not a bare name. A
+        // bare `count = 1` has a `directly_assignable_expression` wrapping a
+        // plain `simple_identifier` instead, so it doesn't match and stays
+        // uncaptured, same as before. `self.count = 1` *is* a genuine write
+        // here (unlike Python, Swift declares stored properties separately,
+        // so assigning through `self` is never also the declaration), and
+        // its target is a navigation_expression the same as any other
+        // receiver, so it's captured like any other member write.
         let ref_query = Query::new(
             &self.language,
             r#"
             (call_expression (simple_identifier) @call_name)
+            (assignment
+              target: (directly_assignable_expression
+                (navigation_expression
+                  suffix: (navigation_suffix suffix: (simple_identifier) @member_write)))
+              operator: _ @write_op)
             "#,
         )
         .context("compiling Swift reference query")?;
@@ -251,18 +280,51 @@ impl LanguageParser for SwiftParser {
         let mut matches = cursor.matches(&ref_query, root, src);
 
         while let Some(m) = matches.next() {
-            for c in m.captures {
-                let text = text_from(src, c.node);
-                result.references.push(ParsedReference {
-                    symbol_name: text,
-                    line: c.node.start_position().row as i64 + 1,
-                    column: c.node.start_position().column as i64,
-                    from_scope: None,
-                    // Only bare calls are captured.
-                    qualified: false,
-                    // These captures are calls, which read the callee.
-                    usage_kind: UsageKind::Read,
-                });
+            let captures: Vec<_> = m
+                .captures
+                .iter()
+                .map(|c| (ref_query.capture_names()[c.index as usize], c.node))
+                .collect();
+
+            for &(name, node) in &captures {
+                match name {
+                    "call_name" => {
+                        result.references.push(ParsedReference {
+                            symbol_name: text_from(src, node),
+                            line: node.start_position().row as i64 + 1,
+                            column: node.start_position().column as i64,
+                            from_scope: None,
+                            // Only bare calls are captured.
+                            qualified: false,
+                            // These captures are calls, which read the callee.
+                            usage_kind: UsageKind::Read,
+                            // Calls, not member writes.
+                            member: false,
+                        });
+                    }
+                    "member_write" => {
+                        let op_text = captures
+                            .iter()
+                            .find(|(n, _)| *n == "write_op")
+                            .map(|(_, n)| text_from(src, *n))
+                            .unwrap_or_default();
+                        let usage_kind = if op_text == "=" {
+                            UsageKind::Write
+                        } else {
+                            UsageKind::ReadWrite
+                        };
+                        result.references.push(ParsedReference {
+                            symbol_name: text_from(src, node),
+                            line: node.start_position().row as i64 + 1,
+                            column: node.start_position().column as i64,
+                            from_scope: None,
+                            qualified: true,
+                            usage_kind,
+                            member: true,
+                        });
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -417,14 +479,150 @@ class Service {
 
     #[test]
     fn test_assignment_targets_emit_no_reference() {
+        // A bare (unqualified) assignment target has no receiver to resolve
+        // a member write against, so it must stay uncaptured -- unlike
+        // `x.count = 1` and `x.count += 1`, which are member writes.
         let parser = SwiftParser::new();
-        let result = parser
-            .parse("func f() { count = 1; x.count = 1; x.count += 1 }")
-            .unwrap();
+        let result = parser.parse("func f() { count = 1 }").unwrap();
         assert!(
             result.references.is_empty(),
-            "assignment targets must not be captured as references: {:?}",
+            "bare assignment targets must not be captured as references: {:?}",
             result.references
         );
+    }
+
+    #[test]
+    fn test_stored_properties_are_indexed_as_fields() {
+        let parser = SwiftParser::new();
+        let source = r#"
+class Widget {
+    public var count: Int = 0
+    private let name: String
+}
+
+struct Point {
+    var x: Int
+    var y: Int
+}
+"#;
+        let result = parser.parse(source).unwrap();
+        let field = |name: &str| {
+            result
+                .symbols
+                .iter()
+                .find(|s| s.name == name && s.kind == "field")
+                .unwrap_or_else(|| panic!("no field symbol named {name}: {:?}", result.symbols))
+        };
+
+        let count = field("count");
+        assert_eq!(count.scope, Some("Widget".to_string()));
+        assert_eq!(count.visibility, "pub");
+
+        let name = field("name");
+        assert_eq!(name.scope, Some("Widget".to_string()));
+        assert_eq!(name.visibility, "private");
+
+        let x = field("x");
+        assert_eq!(x.scope, Some("Point".to_string()));
+        let y = field("y");
+        assert_eq!(y.scope, Some("Point".to_string()));
+    }
+
+    #[test]
+    fn test_computed_property_is_indexed_as_field() {
+        // A computed property is still a member reachable through a setter,
+        // so it's indexed as "field" the same as a stored property.
+        let parser = SwiftParser::new();
+        let result = parser
+            .parse("class C { var computed: Int { return 1 } }")
+            .unwrap();
+        let sym = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "computed")
+            .unwrap();
+        assert_eq!(sym.kind, "field");
+        assert_eq!(sym.scope, Some("C".to_string()));
+    }
+
+    #[test]
+    fn test_function_local_let_is_not_indexed_as_field() {
+        let parser = SwiftParser::new();
+        let result = parser.parse("func f() { let local = 1 }").unwrap();
+        assert!(
+            !result.symbols.iter().any(|s| s.name == "local"),
+            "function-local let must not be indexed: {:?}",
+            result.symbols
+        );
+    }
+
+    #[test]
+    fn test_file_scope_let_is_not_indexed_as_field() {
+        let parser = SwiftParser::new();
+        let result = parser.parse("let topLevel = 1").unwrap();
+        assert!(
+            !result.symbols.iter().any(|s| s.name == "topLevel"),
+            "file-scope let must not be indexed as a field: {:?}",
+            result.symbols
+        );
+    }
+
+    #[test]
+    fn test_property_declaration_with_initializer_emits_no_reference() {
+        // `var count = 0` inside a type body is a declaration, not a usage.
+        let parser = SwiftParser::new();
+        let result = parser.parse("class C { var count = 0 }").unwrap();
+        assert!(
+            result.references.is_empty(),
+            "a field declaration must not emit a reference: {:?}",
+            result.references
+        );
+    }
+
+    #[test]
+    fn test_qualified_member_write_is_captured() {
+        let parser = SwiftParser::new();
+        let result = parser.parse("func f() { x.count = 1 }").unwrap();
+        let r = result
+            .references
+            .iter()
+            .find(|r| r.symbol_name == "count")
+            .unwrap();
+        assert!(r.member);
+        assert!(r.qualified);
+        assert_eq!(r.usage_kind, UsageKind::Write);
+    }
+
+    #[test]
+    fn test_compound_member_write_is_read_write() {
+        let parser = SwiftParser::new();
+        for op in ["+=", "-=", "*=", "/="] {
+            let source = format!("func f() {{ x.count {op} 1 }}");
+            let result = parser.parse(&source).unwrap();
+            let r = result
+                .references
+                .iter()
+                .find(|r| r.symbol_name == "count")
+                .unwrap_or_else(|| panic!("no reference for `{op}`: {:?}", result.references));
+            assert_eq!(r.usage_kind, UsageKind::ReadWrite, "operator {op}");
+            assert!(r.member);
+        }
+    }
+
+    #[test]
+    fn test_self_member_write_is_captured() {
+        // Unlike Python, `self.count = 1` is a genuine mutation in Swift --
+        // the property is declared separately -- so it must be captured.
+        let parser = SwiftParser::new();
+        let result = parser
+            .parse("class C { func f() { self.count = 1 } }")
+            .unwrap();
+        let r = result
+            .references
+            .iter()
+            .find(|r| r.symbol_name == "count")
+            .unwrap();
+        assert!(r.member);
+        assert_eq!(r.usage_kind, UsageKind::Write);
     }
 }
