@@ -35,6 +35,17 @@ optional Roslyn helper below.
 brew install simonspoon/tap/helios
 ```
 
+### Install script
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/simonspoon/helios/main/install.sh | sh
+```
+
+Downloads the release binary for your platform, verifies its checksum, and
+installs it to `~/.local/bin`. Pass options after `| sh -s --`:
+`--bin-dir <dir>`, `--version <vX.Y.Z>`, `--with-csharp` (also installs the
+Roslyn helper below).
+
 ### From GitHub Releases
 
 Download a pre-built binary from [Releases](https://github.com/simonspoon/helios/releases) and place it on your PATH.
