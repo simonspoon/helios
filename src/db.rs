@@ -724,12 +724,36 @@ impl Database {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<Vec<(SymbolRecord, String)>> {
+        self.query_symbols_named(
+            None, file, kind, grep, scope, visibility, param, returns, limit, offset,
+        )
+    }
+
+    /// `query_symbols` plus an exact symbol-name match (`name`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_symbols_named(
+        &self,
+        name: Option<&str>,
+        file: Option<&str>,
+        kind: Option<&str>,
+        grep: Option<&str>,
+        scope: Option<&str>,
+        visibility: Option<&str>,
+        param: Option<&str>,
+        returns: Option<&str>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<Vec<(SymbolRecord, String)>> {
         let mut sql = String::from(
             "SELECT s.id, s.name, s.kind, s.file_id, s.line, s.column, s.end_line, s.visibility, s.scope, s.params, s.returns, f.path
              FROM symbols s JOIN files f ON s.file_id = f.id WHERE 1=1",
         );
         let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
+        if let Some(n) = name {
+            params_vec.push(Box::new(n.to_string()));
+            sql.push_str(&format!(" AND s.name = ?{}", params_vec.len()));
+        }
         if let Some(f) = file {
             params_vec.push(Box::new(format!("%{f}%")));
             sql.push_str(&format!(" AND f.path LIKE ?{}", params_vec.len()));

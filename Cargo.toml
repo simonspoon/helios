@@ -21,6 +21,7 @@ tree-sitter-swift = "0.7"
 tree-sitter-typescript = "0.23"
 regex = "1"
 walkdir = "2"
+toml = "0.8"
 
 [dev-dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }

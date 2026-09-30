@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use crate::db::Database;
 use crate::errors::NoIndexError;
+use crate::external;
 
 /// Read the body of a symbol from its source file.
 /// Returns the source lines from `line` to `end_line` (both 1-based).
@@ -42,6 +43,9 @@ fn read_body(
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
+    name: Option<&str>,
+    deps: bool,
+    package: Option<&str>,
     file: Option<&str>,
     kind: Option<&str>,
     grep: Option<&str>,
@@ -56,13 +60,29 @@ pub fn run(
     offset: Option<i64>,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
-    let db_path = cwd.join(".helios/index.db");
 
-    if !db_path.exists() {
-        return Err(NoIndexError.into());
-    }
-
-    let db = Database::open(&db_path).context("opening database")?;
+    // With --deps the rows come from .helios/deps.db; `pkg_of` maps each
+    // dependency file to its `name@version`, restricted to what is locked now.
+    let (db, pkg_of) = if deps {
+        let mut all = external::locked_packages(&cwd)?;
+        if all.is_empty() {
+            anyhow::bail!("no Cargo.lock packages or .venv packages found");
+        }
+        if let Some(pkg) = package {
+            all = external::find_named(all, pkg)?;
+        }
+        let selected: Vec<&external::Locked> = all.iter().collect();
+        let db = external::open_deps_db(&cwd)?;
+        external::ensure_indexed(&db, &selected)?;
+        let map = external::package_file_map(&db, &selected)?;
+        (db, Some(map))
+    } else {
+        let db_path = cwd.join(".helios/index.db");
+        if !db_path.exists() {
+            return Err(NoIndexError.into());
+        }
+        (Database::open(&db_path).context("opening database")?, None)
+    };
 
     // Compile grep pattern as regex (if provided) before querying.
     // The SQL LIKE pre-filter narrows results; the regex does precise matching.
@@ -91,53 +111,52 @@ pub fn run(
     // when regex or param/returns filtering makes the SQL-side count unreliable).
     // count_symbols doesn't know about param/returns, so any query using them
     // must also compute its own total to keep pagination correct.
-    let (results, manual_total_count) = if grep_re.is_some() || param.is_some() || returns.is_some()
-    {
-        // Fetch all LIKE/param/returns-matched results (no SQL limit/offset) so we
-        // can apply the regex and handle pagination in Rust.
-        // Pass the literal hint to LIKE for pre-filtering, not the raw regex.
-        let all = db.query_symbols(
-            file,
-            kind,
-            like_hint.as_deref(),
-            scope,
-            visibility,
-            param,
-            returns,
-            None,
-            None,
-        )?;
-        let filtered: Vec<_> = match &grep_re {
-            Some(re) => all
+    let (results, manual_total_count) =
+        if grep_re.is_some() || param.is_some() || returns.is_some() || name.is_some() || deps {
+            // Fetch all LIKE/param/returns-matched results (no SQL limit/offset) so we
+            // can apply the regex and handle pagination in Rust.
+            // Pass the literal hint to LIKE for pre-filtering, not the raw regex.
+            let all = db.query_symbols_named(
+                name,
+                file,
+                kind,
+                like_hint.as_deref(),
+                scope,
+                visibility,
+                param,
+                returns,
+                None,
+                None,
+            )?;
+            let filtered: Vec<_> = all
                 .into_iter()
-                .filter(|(sym, _)| re.is_match(&sym.name))
-                .collect(),
-            None => all,
-        };
-        let total = filtered.len() as i64;
+                .filter(|(sym, _)| grep_re.as_ref().is_none_or(|re| re.is_match(&sym.name)))
+                .filter(|(sym, _)| pkg_of.as_ref().is_none_or(|m| m.contains_key(&sym.file_id)))
+                .collect();
+            let total = filtered.len() as i64;
 
-        // Apply limit/offset in Rust after filtering
-        let start = offset.unwrap_or(0) as usize;
-        let page = if limit.is_some() || offset.is_some() {
-            let end = match limit {
-                Some(l) => (start + l as usize).min(filtered.len()),
-                None => filtered.len(),
-            };
-            if start < filtered.len() {
-                filtered[start..end].to_vec()
+            // Apply limit/offset in Rust after filtering
+            let start = offset.unwrap_or(0) as usize;
+            let page = if limit.is_some() || offset.is_some() {
+                let end = match limit {
+                    Some(l) => (start + l as usize).min(filtered.len()),
+                    None => filtered.len(),
+                };
+                if start < filtered.len() {
+                    filtered[start..end].to_vec()
+                } else {
+                    Vec::new()
+                }
             } else {
-                Vec::new()
-            }
+                filtered
+            };
+            (page, Some(total))
         } else {
-            filtered
+            let r = db.query_symbols(
+                file, kind, grep, scope, visibility, None, None, limit, offset,
+            )?;
+            (r, None)
         };
-        (page, Some(total))
-    } else {
-        let r = db.query_symbols(
-            file, kind, grep, scope, visibility, None, None, limit, offset,
-        )?;
-        (r, None)
-    };
 
     let paginated = limit.is_some() || offset.is_some();
 
@@ -159,6 +178,9 @@ pub fn run(
                     "params": sym.params,
                     "returns": sym.returns,
                 });
+                if let Some(pkg) = pkg_of.as_ref().and_then(|m| m.get(&sym.file_id)) {
+                    obj["package"] = serde_json::json!(pkg);
+                }
                 if body {
                     let body_text = read_body(&mut file_cache, &cwd, path, sym.line, sym.end_line);
                     obj["body"] = serde_json::json!(body_text);

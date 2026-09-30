@@ -7215,3 +7215,284 @@ fn test_deps_follow_impls_callers_bridges_override_to_base_caller() {
         "expected run's real caller edge one hop past the bridge, got: {stdout}"
     );
 }
+
+// --- `where` and `symbols --deps` (third-party source) ---
+
+/// Project with a Cargo.lock (registry crate fakecrate 1.2.3, plus a git dep),
+/// a fake CARGO_HOME holding fakecrate 1.2.3 and an older 1.0.0, and a fake
+/// .venv with one dist-info. No project index. Returns (project, cargo_home).
+fn create_deps_project() -> (tempfile::TempDir, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    std::fs::write(
+        p.join("Cargo.lock"),
+        r#"version = 4
+
+[[package]]
+name = "myproj"
+version = "0.1.0"
+
+[[package]]
+name = "fakecrate"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abc"
+
+[[package]]
+name = "gitdep"
+version = "0.3.0"
+source = "git+https://example.com/gitdep#deadbeef"
+"#,
+    )
+    .unwrap();
+
+    let home = tempfile::tempdir().unwrap();
+    for (ver, body) in [
+        ("1.2.3", "pub fn locked_fn() -> i32 {\n    1\n}\n"),
+        ("1.0.0", "pub fn old_fn() -> i32 {\n    0\n}\n"),
+    ] {
+        let src = home.path().join(format!(
+            "registry/src/index.crates.io-x/fakecrate-{ver}/src"
+        ));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), body).unwrap();
+    }
+
+    let site = p.join(".venv/lib/python3.12/site-packages");
+    let info = site.join("fake_py-2.0.0.dist-info");
+    std::fs::create_dir_all(&info).unwrap();
+    std::fs::write(
+        info.join("METADATA"),
+        "Name: fake-py\nVersion: 2.0.0\n\nbody\n",
+    )
+    .unwrap();
+    std::fs::write(info.join("top_level.txt"), "fake_py\n").unwrap();
+    std::fs::create_dir_all(site.join("fake_py")).unwrap();
+    std::fs::write(
+        site.join("fake_py/__init__.py"),
+        "def py_thing():\n    return 1\n",
+    )
+    .unwrap();
+
+    (dir, home)
+}
+
+fn run_deps_cmd(
+    dir: &std::path::Path,
+    home: &std::path::Path,
+    args: &[&str],
+) -> std::process::Output {
+    Command::new(helios_bin())
+        .args(args)
+        .env("CARGO_HOME", home)
+        .current_dir(dir)
+        .output()
+        .expect("run helios")
+}
+
+#[test]
+fn test_where_reports_locked_versions() {
+    let (dir, home) = create_deps_project();
+
+    let out = run_deps_cmd(dir.path(), home.path(), &["--json", "where", "fakecrate"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = json.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "only the locked version: {json}");
+    assert_eq!(rows[0]["ecosystem"], "cargo");
+    assert_eq!(rows[0]["version"], "1.2.3");
+    let path = rows[0]["path"].as_str().unwrap();
+    assert!(path.ends_with("fakecrate-1.2.3"), "{path}");
+    assert!(std::path::Path::new(path).is_absolute());
+
+    // Python: normalized name, path is the package dir.
+    let out = run_deps_cmd(
+        dir.path(),
+        home.path(),
+        &["--json", "--compact", "where", "fake_py"],
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json[0]["ecosystem"], "python");
+    assert_eq!(json[0]["version"], "2.0.0");
+    assert!(
+        json[0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("site-packages/fake_py")
+    );
+
+    // Git dependency: listed, but unresolved.
+    let out = run_deps_cmd(dir.path(), home.path(), &["where", "gitdep"]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("not found on disk"));
+
+    // Workspace members and unknown names are not dependencies.
+    let out = run_deps_cmd(dir.path(), home.path(), &["where", "myproj"]);
+    assert_eq!(out.status.code(), Some(1));
+    let out = run_deps_cmd(dir.path(), home.path(), &["where", "nope"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not found"));
+}
+
+#[test]
+fn test_symbols_deps_only_locked_version_absolute_paths() {
+    let (dir, home) = create_deps_project();
+
+    let out = run_deps_cmd(
+        dir.path(),
+        home.path(),
+        &["--json", "symbols", "locked_fn", "--deps"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = json.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{json}");
+    assert_eq!(rows[0]["package"], "fakecrate@1.2.3");
+    let file = rows[0]["file"].as_str().unwrap();
+    assert!(std::path::Path::new(file).is_absolute(), "{file}");
+    assert!(file.contains("fakecrate-1.2.3"));
+
+    // The older, unlocked version is never reported.
+    let out = run_deps_cmd(
+        dir.path(),
+        home.path(),
+        &["--json", "symbols", "old_fn", "--deps"],
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(json.as_array().unwrap().is_empty(), "{json}");
+
+    // No project index is created or required.
+    assert!(!dir.path().join(".helios/index.db").exists());
+    assert!(dir.path().join(".helios/deps.db").exists());
+}
+
+#[test]
+fn test_symbols_deps_package_body_and_no_reindex() {
+    let (dir, home) = create_deps_project();
+
+    let out = run_deps_cmd(
+        dir.path(),
+        home.path(),
+        &[
+            "--json",
+            "symbols",
+            "--deps",
+            "--package",
+            "fake-py",
+            "--body",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("indexing 1"));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = json.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{json}");
+    assert_eq!(rows[0]["name"], "py_thing");
+    assert_eq!(rows[0]["package"], "fake-py@2.0.0");
+    assert!(rows[0]["body"].as_str().unwrap().contains("return 1"));
+
+    // --package indexed only that package: the crate's symbols are absent
+    // from the db until asked for, and the second run does not re-index.
+    let out = run_deps_cmd(
+        dir.path(),
+        home.path(),
+        &["--json", "symbols", "--deps", "--package", "fake-py"],
+    );
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("indexing"));
+
+    let db = rusqlite::Connection::open(dir.path().join(".helios/deps.db")).unwrap();
+    let n: i64 = db
+        .query_row("SELECT COUNT(*) FROM packages", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+
+    // All packages: indexes only the one missing, then is quiet.
+    let out = run_deps_cmd(dir.path(), home.path(), &["symbols", "--deps"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("indexing 1"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("locked_fn") && stdout.contains("py_thing"),
+        "{stdout}"
+    );
+    let out = run_deps_cmd(dir.path(), home.path(), &["symbols", "--deps"]);
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("indexing"));
+
+    // Unknown package is an error.
+    let out = run_deps_cmd(
+        dir.path(),
+        home.path(),
+        &["symbols", "--deps", "--package", "zzz"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn test_symbols_positional_name_without_deps() {
+    let (dir, bin) = setup_indexed_project();
+    let out = Command::new(&bin)
+        .args(["--json", "symbols", "helper"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = json.as_array().unwrap();
+    assert!(!rows.is_empty());
+    assert!(rows.iter().all(|r| r["name"] == "helper"));
+    assert!(rows[0].get("package").is_none());
+}
+
+#[test]
+fn test_symbols_deps_namespace_packages_keep_own_files() {
+    let (dir, home) = create_deps_project();
+    let site = dir.path().join(".venv/lib/python3.12/site-packages");
+    for (dist, module, func) in [("nsa", "a", "fn_in_a"), ("nsb", "b", "fn_in_b")] {
+        let info = site.join(format!("{dist}-1.0.0.dist-info"));
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("top_level.txt"), "ns\n").unwrap();
+        std::fs::write(
+            info.join("RECORD"),
+            format!("ns/{module}.py,sha256=x,1\n{dist}-1.0.0.dist-info/RECORD,,\n"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(site.join("ns")).unwrap();
+        std::fs::write(
+            site.join(format!("ns/{module}.py")),
+            format!("def {func}():\n    pass\n"),
+        )
+        .unwrap();
+    }
+
+    for (pkg, want, other) in [("nsa", "fn_in_a", "fn_in_b"), ("nsb", "fn_in_b", "fn_in_a")] {
+        let out = run_deps_cmd(
+            dir.path(),
+            home.path(),
+            &["--json", "symbols", "--deps", "--package", pkg],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let names: Vec<&str> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec![want], "{pkg}: {json} (not {other})");
+        assert_eq!(json[0]["package"], format!("{pkg}@1.0.0"));
+    }
+}

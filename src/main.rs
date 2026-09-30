@@ -1,6 +1,7 @@
 mod commands;
 mod db;
 pub mod errors;
+mod external;
 mod flow;
 mod git;
 mod indexer;
@@ -53,6 +54,19 @@ enum Command {
     Update,
     /// List symbols in the index
     Symbols {
+        /// Exact symbol name (combines with the other filters)
+        name: Option<String>,
+        /// Query the source of locked third-party dependencies (Cargo.lock
+        /// registry crates, .venv packages) instead of the project. File paths
+        /// are absolute and JSON rows gain "package": "name@version". Indexes
+        /// lazily into .helios/deps.db; needs no project index. The first run
+        /// without --package indexes every locked package (tens of seconds,
+        /// one-time) — prefer --package.
+        #[arg(long)]
+        deps: bool,
+        /// With --deps, only this package (all its locked versions)
+        #[arg(long, requires = "deps")]
+        package: Option<String>,
         /// Filter by file path
         #[arg(long)]
         file: Option<String>,
@@ -83,6 +97,11 @@ enum Command {
         /// Number of symbols to skip
         #[arg(long)]
         offset: Option<i64>,
+    },
+    /// Where a locked dependency's source lives on disk (cargo and python)
+    Where {
+        /// Package name, as in Cargo.lock or the .venv
+        package: String,
     },
     /// Show dependencies for a symbol or file
     Deps {
@@ -172,6 +191,9 @@ fn main() {
         Command::Init { timeout } => commands::init::run(cli.json, compact, cli.quiet, *timeout),
         Command::Update => commands::update::run(cli.json, compact, cli.quiet),
         Command::Symbols {
+            name,
+            deps,
+            package,
             file,
             kind,
             grep,
@@ -183,6 +205,9 @@ fn main() {
             limit,
             offset,
         } => commands::symbols::run(
+            name.as_deref(),
+            *deps,
+            package.as_deref(),
             file.as_deref(),
             kind.as_deref(),
             grep.as_deref(),
@@ -196,6 +221,7 @@ fn main() {
             *limit,
             *offset,
         ),
+        Command::Where { package } => external::run_where(package, cli.json, compact),
         Command::Files { language } => commands::files::run(language.as_deref(), cli.json, compact),
         Command::Diff { impact } => commands::diff::run(*impact, cli.json, compact),
         Command::Deps {

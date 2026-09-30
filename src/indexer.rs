@@ -422,7 +422,7 @@ pub fn index_file(
 /// the on-disk index predates the current `INDEX_FORMAT_VERSION`: the
 /// content hasn't changed, but what helios extracts from it has, and the
 /// hash alone can't tell the two apart.
-fn index_file_definitions(
+pub(crate) fn index_file_definitions(
     db: &Database,
     abs_path: &Path,
     rel_path: &str,

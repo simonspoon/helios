@@ -155,9 +155,9 @@ helios update
 
 Falls back to a full re-index if not in a git repo or no previous commit is stored.
 
-### `helios symbols [OPTIONS]`
+### `helios symbols [NAME] [OPTIONS]`
 
-List and filter indexed symbols.
+List and filter indexed symbols. The optional positional `NAME` matches the symbol name exactly.
 
 ```bash
 # All functions
@@ -171,6 +171,12 @@ helios symbols --grep "^parse_"
 
 # Combine filters and paginate
 helios symbols --kind struct --file src/parsers/ --limit 20 --offset 40
+
+# Exact name
+helios symbols main
+
+# Third-party source, at the locked version
+helios symbols Deserializer --deps --package serde --body
 ```
 
 Options:
@@ -184,6 +190,8 @@ Options:
 - `--body` — Include each symbol's source body in the output
 - `--limit <N>` — Maximum number of symbols to return
 - `--offset <N>` — Number of symbols to skip
+- `--deps` — Query the source of locked dependencies instead of the project: registry crates from `Cargo.lock` (read from `$CARGO_HOME/registry/src`) and packages installed in `.venv`. `file` is an absolute path and JSON rows gain `"package": "name@version"`. Only currently locked versions are reported. Needs no project index; definitions are indexed lazily into `.helios/deps.db` (a progress note goes to stderr when indexing happens), so the first call over every package can take a while — use `--package` to index one.
+- `--package <NAME>` — With `--deps`, restrict to one package (and index only it)
 
 Output format:
 
@@ -197,6 +205,18 @@ Names are qualified with their scope (class, impl block, or namespace) when the
 symbol has one, so same-named symbols stay distinguishable. When a symbol's
 signature is known, it's appended: `(params)` for a callable, and
 ` -> returns` (callable) or `: returns` (field/const/variable) for its type.
+
+### `helios where <PACKAGE>`
+
+Print where a locked dependency's source lives on disk, so you don't have to `find /` through `~/.cargo/registry` or `.venv/.../site-packages`.
+
+```bash
+helios where serde
+# cargo serde 1.0.228 /Users/me/.cargo/registry/src/index.crates.io-.../serde-1.0.228
+helios --json where requests
+```
+
+Each line is ecosystem (`cargo` or `python`), name, locked version, and the absolute source path — or `not found on disk` (also shown for git dependencies, which are not resolved). Exits 1 if the name is in neither `Cargo.lock` nor the `.venv`. Workspace members and path dependencies are not dependencies here. Honours `--json` / `--compact`.
 
 ### `helios deps <TARGET> [--scope <S>] [--file <P>] [--depth <N>] [--to <T>] [--follow-impls]`
 
