@@ -138,7 +138,7 @@ enum Command {
         #[arg(long)]
         follow_impls: bool,
     },
-    /// Control-flow graph of one function body (Rust and C#)
+    /// Control-flow graph of one function body (Rust, C# and Swift)
     Flow {
         /// Function or method name (Class.Method, path/to/file.rs:name)
         target: String,

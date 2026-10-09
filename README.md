@@ -380,9 +380,10 @@ loops, match arms, outward calls, and returns. Calls are leaf nodes labelled
 with the callee — the callee's body is never expanded, so the graph stays
 inside the one function you asked about.
 
-**Rust and C# for now.** A target in any other indexed language exits with an
-error naming the language; the graph builder is per-language and only those two
-are mapped so far. A C# target is a method, a constructor, or an arrow-bodied
+**Rust, C# and Swift for now.** A target in any other indexed language exits
+with an error naming the language; the graph builder is per-language and only
+those are mapped so far. A Swift target is a `func`; `defer` blocks are not
+drawn. A C# target is a method, a constructor, or an arrow-bodied
 property; a property with `get`/`set` accessors is several bodies rather than
 one, and is rejected as such.
 
@@ -659,6 +660,7 @@ flow/
   mod.rs             Graph shape shared by every language, and the dispatch
   rust.rs            Rust statement mapping
   csharp.rs          C# statement mapping
+  swift.rs           Swift statement mapping
 parsers/
   mod.rs             Language detection & parser factory
   rust_parser.rs     Functions, structs, traits, enums, mods

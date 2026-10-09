@@ -7530,3 +7530,62 @@ fn test_symbols_deps_namespace_packages_keep_own_files() {
         assert_eq!(json[0]["package"], format!("{pkg}@1.0.0"));
     }
 }
+
+#[test]
+fn test_swift_member_call_is_a_caller_and_flow_works() {
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    std::fs::write(
+        dir.path().join("Engine.swift"),
+        "final class Engine {\n    func startListening(rate: Int) {}\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("Ambient.swift"),
+        r#"struct Ambient {
+    let engine = Engine()
+
+    func begin(rate: Int) {
+        guard rate > 0 else { return }
+        engine.startListening(rate: rate)
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let bin = helios_bin();
+    let init = Command::new(&bin)
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("init");
+    assert!(init.status.success(), "helios init failed");
+
+    // The receiver call `engine.startListening(...)` is a reference.
+    assert_eq!(
+        reference_rows(dir.path(), "startListening"),
+        1,
+        "member call should resolve to startListening"
+    );
+    // So is the initializer call `Engine()`.
+    assert_eq!(reference_rows(dir.path(), "Engine"), 1);
+
+    let deps = Command::new(&bin)
+        .args(["deps", "startListening"])
+        .current_dir(dir.path())
+        .output()
+        .expect("deps");
+    let stdout = String::from_utf8_lossy(&deps.stdout);
+    assert!(
+        stdout.contains("Ambient.swift"),
+        "deps should list the calling file: {stdout}"
+    );
+
+    let flow = flow_stdout(&bin, dir.path(), &["begin"]);
+    assert!(flow.contains("branch rate > 0"), "guard condition: {flow}");
+    assert!(
+        flow.contains("call engine.startListening(…)"),
+        "member call node: {flow}"
+    );
+    assert!(flow.contains("return"), "guard else return: {flow}");
+}

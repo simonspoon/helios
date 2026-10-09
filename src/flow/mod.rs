@@ -6,11 +6,12 @@
 //! of the callee's body.
 //!
 //! The graph shape is shared; the statement mapping is per-language and lives in
-//! a submodule ([`rust`], [`csharp`]). A language with no mapping parses fine but
-//! is rejected by [`build`] with a clear message.
+//! a submodule ([`rust`], [`csharp`], [`swift`]). A language with no mapping
+//! parses fine but is rejected by [`build`] with a clear message.
 
 mod csharp;
 mod rust;
+mod swift;
 
 use anyhow::{Result, bail};
 use tree_sitter::Node;
@@ -225,9 +226,10 @@ pub fn build(
     match language {
         "rust" => rust::build(source, file, name, scope, line, stored),
         "csharp" => csharp::build(source, file, name, scope, line, stored),
+        "swift" => swift::build(source, file, name, scope, line, stored),
         _ => bail!(
-            "flow does not support {language} yet (supported: rust, csharp); \
-             the graph builder is per-language and only those two are mapped so far"
+            "flow does not support {language} yet (supported: rust, csharp, swift); \
+             the graph builder is per-language and only those are mapped so far"
         ),
     }
 }

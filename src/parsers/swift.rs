@@ -83,7 +83,7 @@ fn callable_returns(source: &[u8], def_node: tree_sitter::Node) -> Option<String
         .map(|n| text_from(source, n).trim().to_string())
 }
 
-fn find_scope(source: &[u8], node: tree_sitter::Node) -> Option<String> {
+pub(crate) fn find_scope(source: &[u8], node: tree_sitter::Node) -> Option<String> {
     let mut current = node.parent();
     while let Some(parent) = current {
         if (parent.kind() == "class_declaration" || parent.kind() == "protocol_declaration")
@@ -253,7 +253,9 @@ impl LanguageParser for SwiftParser {
 
         // --- References ---
         //
-        // Member writes (`x.count = 1`, `x.count += 1`) are captured from
+        // Calls are bare (`f()`, and `Type(...)` initializers, which are
+        // syntactically the same) or through a receiver (`obj.method()`,
+        // captured as qualified). Member writes (`x.count = 1`, `x.count += 1`) are captured from
         // `assignment` nodes whose target is a `navigation_expression` --
         // i.e. the assignment goes through a receiver, not a bare name. A
         // bare `count = 1` has a `directly_assignable_expression` wrapping a
@@ -267,6 +269,16 @@ impl LanguageParser for SwiftParser {
             &self.language,
             r#"
             (call_expression (simple_identifier) @call_name)
+            (call_expression
+              (navigation_expression
+                suffix: (navigation_suffix suffix: (simple_identifier) @member_call)))
+            ; tree-sitter-swift reads `!f()` / `!a.f()` as a call whose callee is
+            ; the prefix expression, so the callee sits one level down.
+            (call_expression (prefix_expression target: (simple_identifier) @call_name))
+            (call_expression
+              (prefix_expression
+                target: (navigation_expression
+                  suffix: (navigation_suffix suffix: (simple_identifier) @member_call))))
             (assignment
               target: (directly_assignable_expression
                 (navigation_expression
@@ -294,11 +306,25 @@ impl LanguageParser for SwiftParser {
                             line: node.start_position().row as i64 + 1,
                             column: node.start_position().column as i64,
                             from_scope: None,
-                            // Only bare calls are captured.
+                            // A bare call: `f()` or an initializer `Type()`.
                             qualified: false,
                             // These captures are calls, which read the callee.
                             usage_kind: UsageKind::Read,
                             // Calls, not member writes.
+                            member: false,
+                        });
+                    }
+                    "member_call" => {
+                        // `obj.method()` / `a.b?.method()`: a call reached
+                        // through a receiver. `member: false` -- it names a
+                        // method, not a field, so it may resolve to any kind.
+                        result.references.push(ParsedReference {
+                            symbol_name: text_from(src, node),
+                            line: node.start_position().row as i64 + 1,
+                            column: node.start_position().column as i64,
+                            from_scope: None,
+                            qualified: true,
+                            usage_kind: UsageKind::Read,
                             member: false,
                         });
                     }
@@ -475,6 +501,39 @@ class Service {
             .find(|r| r.symbol_name == "doWork")
             .unwrap();
         assert_eq!(r.usage_kind, UsageKind::Read);
+    }
+
+    #[test]
+    fn test_member_and_initializer_calls_are_captured() {
+        let parser = SwiftParser::new();
+        let source = r#"
+func f() {
+    engine.startListening(a: 1)
+    a.b?.chained()
+    if !negated() && !r.negMember() {}
+    let s = Widget(size: 2)
+    plain()
+}
+"#;
+        let result = parser.parse(source).unwrap();
+        let find = |name: &str| {
+            result
+                .references
+                .iter()
+                .find(|r| r.symbol_name == name)
+                .unwrap_or_else(|| panic!("no reference {name}: {:?}", result.references))
+        };
+        assert!(!find("negated").qualified);
+        for name in ["startListening", "chained", "negMember"] {
+            let r = find(name);
+            assert!(r.qualified, "{name} is called through a receiver");
+            assert!(!r.member, "{name} is a call, not a field write");
+            assert_eq!(r.usage_kind, UsageKind::Read);
+        }
+        assert!(!find("Widget").qualified);
+        assert!(!find("plain").qualified);
+        // The receivers themselves are not calls.
+        assert!(!result.references.iter().any(|r| r.symbol_name == "engine"));
     }
 
     #[test]
