@@ -25,6 +25,30 @@ pub struct SymbolTarget {
 /// otherwise. `--scope` / `--file` force symbol mode, since they only narrow a
 /// definition.
 pub fn parse_target(target: &str, scope: Option<&str>, file: Option<&str>) -> Option<SymbolTarget> {
+    // C#'s `global::` alias prefix names the same symbol without it.
+    let target = target.strip_prefix("global::").unwrap_or(target);
+
+    // `Type::method` / `a::Type::method` (Rust's path syntax): the same shape as
+    // `Class.Method`, so it must be sorted out before the `path:name` split
+    // below mistakes the first `:` for a file separator. Scope is stored as a
+    // bare type name, so only the last qualifier segment is kept. A qualifier
+    // that looks like a file path (`src/a.rs::foo`) is not a type path.
+    if scope.is_none()
+        && file.is_none()
+        && let Some((qualifier, name)) = target.rsplit_once("::")
+        && !name.is_empty()
+        && !qualifier.contains(['/', '\\', '.'])
+        && let Some(type_name) = qualifier.rsplit("::").next()
+        && !type_name.is_empty()
+    {
+        return Some(SymbolTarget {
+            name: name.to_string(),
+            scope: Some(type_name.to_string()),
+            file: None,
+            may_be_file: false,
+        });
+    }
+
     // `path/to/file.ts:name` — a file and a name, so unambiguously a symbol.
     if let Some((path, name)) = target.rsplit_once(':')
         && !name.is_empty()

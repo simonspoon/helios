@@ -7589,3 +7589,174 @@ fn test_swift_member_call_is_a_caller_and_flow_works() {
     );
     assert!(flow.contains("return"), "guard else return: {flow}");
 }
+
+// --- Task 1530: incremental update keeps cross-file references ---
+
+fn run_in(dir: &std::path::Path, bin: &std::path::Path, args: &[&str]) -> String {
+    let output = Command::new(bin)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("helios");
+    assert!(
+        output.status.success(),
+        "helios {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn git_in(dir: &std::path::Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git");
+    assert!(output.status.success(), "git {args:?} failed");
+}
+
+/// Modifying only the file that defines a function must not drop the
+/// references to it held by an unchanged file: re-indexing the definition file
+/// deletes its symbol rows, which cascades into the caller's reference rows.
+#[test]
+fn test_update_keeps_references_from_unchanged_files() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let bin = helios_bin();
+    let p = dir.path();
+    git_in(p, &["init"]);
+    git_in(p, &["config", "user.email", "test@test.com"]);
+    git_in(p, &["config", "user.name", "Test"]);
+    std::fs::write(p.join("lib.rs"), "pub fn target_fn() -> i32 {\n    1\n}\n").unwrap();
+    std::fs::write(
+        p.join("caller.rs"),
+        "pub fn run() -> i32 {\n    target_fn()\n}\n",
+    )
+    .unwrap();
+    git_in(p, &["add", "."]);
+    git_in(p, &["commit", "-m", "initial"]);
+    run_in(p, &bin, &["init"]);
+
+    let before = run_in(p, &bin, &["--json", "deps", "target_fn"]);
+    assert!(before.contains("caller.rs"), "baseline: {before}");
+
+    // Change only the definition file.
+    std::fs::write(
+        p.join("lib.rs"),
+        "pub fn target_fn() -> i32 {\n    2\n}\n\npub fn other() {}\n",
+    )
+    .unwrap();
+    run_in(p, &bin, &["update"]);
+
+    let after = run_in(p, &bin, &["--json", "deps", "target_fn"]);
+    assert!(
+        after.contains("caller.rs"),
+        "caller lost after update: {after}"
+    );
+    // No duplicate sites from re-resolving the caller.
+    assert_eq!(
+        after.matches("caller.rs").count(),
+        before.matches("caller.rs").count(),
+        "reference duplicated or lost: {after}"
+    );
+
+    // A second update with the caller's own references must stay stable too.
+    std::fs::write(p.join("lib.rs"), "pub fn target_fn() -> i32 {\n    3\n}\n").unwrap();
+    run_in(p, &bin, &["update"]);
+    let again = run_in(p, &bin, &["--json", "deps", "target_fn"]);
+    assert_eq!(
+        again.matches("caller.rs").count(),
+        before.matches("caller.rs").count(),
+        "{again}"
+    );
+}
+
+// --- Task 1530: `Type::method` deps targets ---
+
+fn setup_rust_path_call_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let p = dir.path();
+    std::fs::write(
+        p.join("a.rs"),
+        "pub struct Diarizer;\nimpl Diarizer {\n    pub fn load() -> Diarizer {\n        Diarizer\n    }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        p.join("b.rs"),
+        "use crate::a::Diarizer;\npub fn run() {\n    let _d = Diarizer::load();\n    let _e = crate::a::Diarizer::load();\n}\n",
+    )
+    .unwrap();
+    run_in(p, &helios_bin(), &["init"]);
+    dir
+}
+
+#[test]
+fn test_deps_double_colon_target_matches_dot_target() {
+    let dir = setup_rust_path_call_project();
+    let bin = helios_bin();
+    let p = dir.path();
+    let dot = run_in(p, &bin, &["--json", "deps", "Diarizer.load"]);
+    for target in ["Diarizer::load", "a::Diarizer::load"] {
+        let out = run_in(p, &bin, &["--json", "deps", target]);
+        // `target` echoes the spelling the user typed; the rest must match.
+        assert_eq!(
+            out.replace(target, "Diarizer.load"),
+            dot,
+            "{target} should equal Diarizer.load"
+        );
+    }
+    assert!(dot.contains("a.rs"), "definition listed: {dot}");
+    assert!(dot.contains("b.rs"), "call sites listed: {dot}");
+}
+
+#[test]
+fn test_deps_unknown_double_colon_target_not_found() {
+    let dir = setup_rust_path_call_project();
+    let out = run_in(dir.path(), &helios_bin(), &["deps", "Nope::load"]);
+    assert!(out.contains("No dependencies found"), "{out}");
+}
+
+/// A caller modified in the same update as the file it references is indexed
+/// first (git lists paths alphabetically), resolving against the definition
+/// file's old symbols, which that file's re-index then cascades away.
+#[test]
+fn test_update_keeps_references_when_caller_and_definition_both_change() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let bin = helios_bin();
+    let p = dir.path();
+    git_in(p, &["init"]);
+    git_in(p, &["config", "user.email", "test@test.com"]);
+    git_in(p, &["config", "user.name", "Test"]);
+    std::fs::write(p.join("lib.rs"), "pub fn target_fn() -> i32 {\n    1\n}\n").unwrap();
+    std::fs::write(
+        p.join("caller.rs"),
+        "pub fn run() -> i32 {\n    target_fn()\n}\n",
+    )
+    .unwrap();
+    git_in(p, &["add", "."]);
+    git_in(p, &["commit", "-m", "initial"]);
+    run_in(p, &bin, &["init"]);
+
+    std::fs::write(p.join("lib.rs"), "pub fn target_fn() -> i32 {\n    2\n}\n").unwrap();
+    std::fs::write(
+        p.join("caller.rs"),
+        "pub fn run() -> i32 {\n    let x = 1;\n    x + target_fn()\n}\n",
+    )
+    .unwrap();
+    run_in(p, &bin, &["update"]);
+
+    let after = run_in(p, &bin, &["--json", "deps", "target_fn"]);
+    assert_eq!(after.matches("caller.rs").count(), 1, "{after}");
+}
+
+#[test]
+fn test_deps_global_prefix_and_path_like_qualifier() {
+    let dir = setup_rust_path_call_project();
+    let bin = helios_bin();
+    let p = dir.path();
+    let dot = run_in(p, &bin, &["--json", "deps", "Diarizer.load"]);
+    let out = run_in(p, &bin, &["--json", "deps", "global::Diarizer::load"]);
+    assert_eq!(out.replace("global::Diarizer::load", "Diarizer.load"), dot);
+    // A file-path qualifier keeps the old `path:name` reading: not a type path.
+    let out = run_in(p, &bin, &["deps", "a.rs::load"]);
+    assert!(out.contains("No dependencies found"), "{out}");
+}

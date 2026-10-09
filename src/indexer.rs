@@ -595,6 +595,18 @@ pub fn index_incremental(
 ) -> Result<IndexStats> {
     let mut stats = IndexStats::default();
 
+    // Re-indexing a changed file drops its symbol rows, and the cascade on
+    // `references_.symbol_id` takes every reference *into* them from unchanged
+    // files too. Note those files now, while the rows still exist, so their
+    // references can be re-resolved once the new definitions are in.
+    let changed_paths: Vec<String> = modified.iter().chain(deleted).cloned().collect();
+    let deleted_set: HashSet<&str> = deleted.iter().map(String::as_str).collect();
+    let referrers: Vec<String> = db
+        .files_referencing_symbols_in(&changed_paths)?
+        .into_iter()
+        .filter(|p| !deleted_set.contains(p.as_str()))
+        .collect();
+
     // Remove deleted files. `type_relations` needs no explicit delete here:
     // the bundled SQLite is built with `SQLITE_DEFAULT_FOREIGN_KEYS=1`
     // (libsqlite3-sys), so the `ON DELETE CASCADE` on `file_id` drops the
@@ -633,6 +645,33 @@ pub fn index_incremental(
                     stats.files_errored += 1;
                 }
             }
+        }
+    }
+
+    // Re-resolve every surviving file that referenced the changed ones, now
+    // that every new definition is in place. That includes files modified in
+    // this same update: one indexed before the file it references resolved
+    // against that file's old symbols, which have since been cascaded away.
+    // Old rows are dropped first so surviving references aren't inserted twice.
+    // Sidecar languages are left alone: their references are the Roslyn set
+    // (or already flagged stale), and tree-sitter guesses must not replace them
+    // — count them so `update` tells the user to re-run `init`.
+    for rel_path in &referrers {
+        let abs_path = root.join(rel_path);
+        let Some(file) = db.get_file_by_path(rel_path)? else {
+            continue;
+        };
+        if !abs_path.is_file() {
+            continue;
+        }
+        if is_sidecar_language(&file.language) {
+            stats.semantic_changed += 1;
+            continue;
+        }
+        db.delete_references_for_file(file.id)?;
+        if let Err(e) = index_file_references(db, &abs_path, rel_path, &file.language) {
+            eprintln!("warning: failed to re-resolve {}: {}", rel_path, e);
+            stats.files_errored += 1;
         }
     }
 

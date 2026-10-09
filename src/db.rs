@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct Database {
     pub conn: Connection,
@@ -1390,6 +1390,34 @@ impl Database {
             params![file_id],
         )?;
         Ok(())
+    }
+
+    /// Paths of the files that hold a reference to a symbol defined in one of
+    /// `paths` (a file's references to its own symbols don't count; a file in
+    /// `paths` that references another file in `paths` does).
+    ///
+    /// Re-indexing a file deletes its symbol rows, and `references_.symbol_id`
+    /// is `ON DELETE CASCADE`, so every reference *into* it is wiped along with
+    /// them. The incremental indexer calls this before that happens, to know
+    /// which files need their references re-resolved.
+    pub fn files_referencing_symbols_in(&self, paths: &[String]) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT rf.path FROM references_ r
+             JOIN symbols s ON r.symbol_id = s.id
+             JOIN files sf ON s.file_id = sf.id
+             JOIN files rf ON r.file_id = rf.id
+             WHERE sf.path = ?1 AND rf.id != sf.id",
+        )?;
+        let mut found: HashSet<String> = HashSet::new();
+        for path in paths {
+            let rows = stmt.query_map(params![path], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                found.insert(row?);
+            }
+        }
+        let mut found: Vec<String> = found.into_iter().collect();
+        found.sort();
+        Ok(found)
     }
 
     /// Delete every reference whose *source* file has the given language.
