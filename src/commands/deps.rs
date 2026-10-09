@@ -599,6 +599,7 @@ pub fn run(
     file: Option<&str>,
     reads: bool,
     writes: bool,
+    callers: bool,
     to: Option<&str>,
     follow_impls: bool,
 ) -> Result<()> {
@@ -689,11 +690,21 @@ pub fn run(
         (supertypes, implementors, overrides, edge_languages)
     };
 
+    // `--callers` (symbol targets only; ignored for a file target, like
+    // `--reads`/`--writes`) leaves only the References section: drop the
+    // type edges here, and the definitions/deps/transitive walks below.
+    let callers_only = callers && !is_file;
+    let (supertypes, implementors, overrides, edge_languages) = if callers_only {
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+    } else {
+        (supertypes, implementors, overrides, edge_languages)
+    };
+
     // Transitive call-graph reachability (`--depth N>1`, symbol targets
     // only) — additive, and gathered once here so depth-1 output (both
     // human and JSON) is untouched: neither branch below even looks at
     // these unless `depth > 1`.
-    let (calls_walk, callers_walk) = if !is_file && depth > 1 {
+    let (calls_walk, callers_walk) = if !is_file && !callers_only && depth > 1 {
         let calls = bfs_call_graph(
             &db,
             &defs,
@@ -759,12 +770,16 @@ pub fn run(
             println!("{}", formatted);
         } else {
             // Symbol mode: ignore depth, keep depth=1 behavior
-            let deps = db.symbol_dependencies(&symbol_ids)?;
+            let deps = if callers_only {
+                Vec::new()
+            } else {
+                db.symbol_dependencies(&symbol_ids)?
+            };
             let refs = db.symbol_references(&symbol_ids, usage_kinds.as_deref())?;
 
             let mut output = serde_json::json!({
                 "target": target,
-                "definitions": defs,
+                "definitions": if callers_only { Vec::new() } else { defs.clone() },
                 "supertypes": supertypes,
                 "implementors": implementors,
                 "overrides": overrides,
@@ -841,10 +856,14 @@ pub fn run(
             }
         } else {
             // Symbol mode: ignore depth, keep depth=1 behavior
-            let deps = db.symbol_dependencies(&symbol_ids)?;
+            let deps = if callers_only {
+                Vec::new()
+            } else {
+                db.symbol_dependencies(&symbol_ids)?
+            };
             let refs = db.symbol_references(&symbol_ids, usage_kinds.as_deref())?;
 
-            if !defs.is_empty() {
+            if !callers_only && !defs.is_empty() {
                 println!("Definitions of {}:", target);
                 for def in &defs {
                     match &def.scope {

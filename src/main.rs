@@ -124,6 +124,9 @@ enum Command {
         /// Only show references that write the target (symbol targets only; writes are recorded for C# via Roslyn only)
         #[arg(long)]
         writes: bool,
+        /// Show only callers/references of a symbol (symbol targets only)
+        #[arg(long)]
+        callers: bool,
         /// Find a call path from TARGET to this symbol, over the call graph
         /// (same target spellings as TARGET: bare name, Class.Method,
         /// path/to/file.rs:name)
@@ -231,6 +234,7 @@ fn main() {
             depth,
             reads,
             writes,
+            callers,
             to,
             follow_impls,
         } => commands::deps::run(
@@ -242,6 +246,7 @@ fn main() {
             file.as_deref(),
             *reads,
             *writes,
+            *callers,
             to.as_deref(),
             *follow_impls,
         ),

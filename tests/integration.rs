@@ -4596,6 +4596,40 @@ fn test_deps_text_output_unchanged_for_read_reference() {
     );
 }
 
+/// `--callers` keeps only the References section (text and JSON); without it
+/// the same target still prints the other sections.
+#[test]
+fn test_deps_callers_flag_shows_only_references() {
+    let (dir, bin) = setup_single_reference_project();
+
+    let run = |args: &[&str]| {
+        let output = Command::new(&bin)
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .expect("deps helper");
+        assert!(output.status.success(), "deps {args:?} must exit 0");
+        String::from_utf8_lossy(&output.stdout).to_string()
+    };
+
+    let plain = run(&["deps", "helper"]);
+    assert!(plain.contains("Definitions of helper:"), "got: {plain}");
+
+    let stdout = run(&["deps", "helper", "--callers"]);
+    assert!(
+        stdout.contains("References (where helper is used):") && stdout.contains("(reference)"),
+        "expected the caller lines, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Definitions of") && !stdout.contains("Dependencies"),
+        "expected only the References section, got: {stdout}"
+    );
+
+    let value = deps_json(&bin, dir.path(), &["helper", "--callers"]);
+    assert!(!value["dependents"].as_array().unwrap().is_empty());
+    assert!(value["definitions"].as_array().unwrap().is_empty());
+}
+
 /// `--writes` on a symbol that is only ever called (never assigned) returns
 /// no reference lines.
 #[test]
