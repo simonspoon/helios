@@ -135,6 +135,8 @@ brew upgrade helios helios-csharp
 
 Create a full index of the project. Walks all files (respecting `.gitignore`), parses symbols with tree-sitter, and stores results in `.helios/index.db`.
 
+In a linked git worktree with no `.helios/index.db`, any query command (not `init`, `where` or `status`) copies the main worktree's index (paths are repo-relative), runs an incremental update, and prints a one-line note to stderr. With no main index either, commands exit 2 and ask you to run `helios init`.
+
 ```bash
 helios init
 # Indexed 42 files (156 symbols) in 2.34s

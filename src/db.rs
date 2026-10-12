@@ -1855,6 +1855,12 @@ impl Database {
             .context("querying metadata")
     }
 
+    pub fn delete_metadata(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM metadata WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
     // --- Cleanup for re-indexing a file ---
 
     pub fn clear_file_data(&self, file_id: i64) -> Result<()> {

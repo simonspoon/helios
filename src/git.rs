@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 /// Get the current HEAD commit hash
@@ -150,4 +150,35 @@ pub fn tracked_files() -> Result<Vec<String>> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     Ok(stdout.lines().map(|l| l.to_string()).collect())
+}
+
+/// Root of the main worktree when `cwd` is the top of a linked worktree
+/// (git-common-dir differs from git-dir); None otherwise, including for a bare
+/// main repo or when `cwd` is a subdirectory of the worktree.
+pub fn linked_worktree_main_root(cwd: &Path) -> Option<PathBuf> {
+    let rev_parse = |arg: &str| -> Option<PathBuf> {
+        let out = Command::new("git")
+            .args(["rev-parse", "--path-format=absolute", arg])
+            .current_dir(cwd)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let p = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        Some(p.canonicalize().unwrap_or(p))
+    };
+    let git_dir = rev_parse("--git-dir")?;
+    let common_dir = rev_parse("--git-common-dir")?;
+    if git_dir == common_dir {
+        return None;
+    }
+    let top = rev_parse("--show-toplevel")?;
+    if top != cwd.canonicalize().ok()? {
+        return None;
+    }
+    if common_dir.file_name()? != ".git" {
+        return None;
+    }
+    common_dir.parent().map(Path::to_path_buf)
 }

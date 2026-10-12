@@ -7,6 +7,7 @@ mod git;
 mod indexer;
 mod parsers;
 mod resolver;
+mod seed;
 mod sidecar;
 
 use clap::{Parser, Subcommand};
@@ -190,6 +191,21 @@ fn main() {
 
     let compact = cli.compact;
 
+    // A linked worktree starts without an index; seed it from the main
+    // worktree's before any query command (init, where and status don't need
+    // one). A seed failure only warns, so the command still reports the
+    // normal no-index error.
+    if !matches!(
+        &cli.command,
+        Command::Init { .. } | Command::Where { .. } | Command::Status
+    ) {
+        let seeded = std::env::current_dir()
+            .map_err(anyhow::Error::from)
+            .and_then(|cwd| seed::seed_from_main_worktree(&cwd));
+        if let Err(e) = seeded {
+            eprintln!("warning: could not seed index from main worktree: {e:#}");
+        }
+    }
     let result = match &cli.command {
         Command::Init { timeout } => commands::init::run(cli.json, compact, cli.quiet, *timeout),
         Command::Update => commands::update::run(cli.json, compact, cli.quiet),

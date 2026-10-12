@@ -7760,3 +7760,90 @@ fn test_deps_global_prefix_and_path_like_qualifier() {
     let out = run_in(p, &bin, &["deps", "a.rs::load"]);
     assert!(out.contains("No dependencies found"), "{out}");
 }
+
+fn init_git_repo_with_source(dir: &std::path::Path) {
+    git(dir, &["init", "-q"]);
+    git(dir, &["config", "user.email", "t@example.com"]);
+    git(dir, &["config", "user.name", "t"]);
+    std::fs::write(dir.join("lib.rs"), "pub fn seeded_marker() -> i32 { 1 }\n").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "init"]);
+}
+
+#[test]
+fn test_linked_worktree_seeds_index_from_main() {
+    let root = tempfile::tempdir().expect("temp dir");
+    let main = root.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    init_git_repo_with_source(&main);
+    let bin = helios_bin();
+    let init = Command::new(&bin)
+        .arg("init")
+        .current_dir(&main)
+        .output()
+        .expect("helios init");
+    assert!(init.status.success());
+
+    let wt = root.path().join("wt");
+    git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+    assert!(!wt.join(".helios/index.db").exists());
+
+    // status is a read-only probe and must not seed.
+    let status = Command::new(&bin)
+        .arg("status")
+        .current_dir(&wt)
+        .output()
+        .expect("status");
+    assert!(!String::from_utf8_lossy(&status.stderr).contains("seeded"));
+    assert!(!wt.join(".helios/index.db").exists());
+
+    // A function committed only on the worktree branch proves update ran.
+    std::fs::write(
+        wt.join("extra.rs"),
+        "pub fn wt_only_marker() -> i32 { 2 }\n",
+    )
+    .unwrap();
+    git(&wt, &["add", "."]);
+    git(&wt, &["commit", "-q", "-m", "wt"]);
+
+    let out = Command::new(&bin)
+        .args(["symbols", "seeded_marker"])
+        .current_dir(&wt)
+        .output()
+        .expect("symbols");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("seeded_marker"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("seeded"));
+    assert!(wt.join(".helios/index.db").exists());
+
+    let wt_out = Command::new(&bin)
+        .args(["symbols", "wt_only_marker"])
+        .current_dir(&wt)
+        .output()
+        .expect("symbols");
+    assert!(String::from_utf8_lossy(&wt_out.stdout).contains("wt_only_marker"));
+
+    let again = Command::new(&bin)
+        .args(["symbols", "seeded_marker"])
+        .current_dir(&wt)
+        .output()
+        .expect("symbols");
+    assert!(!String::from_utf8_lossy(&again.stderr).contains("seeded"));
+}
+
+#[test]
+fn test_plain_repo_without_index_exits_2_naming_init() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    init_git_repo_with_source(dir.path());
+    let out = Command::new(helios_bin())
+        .arg("symbols")
+        .current_dir(dir.path())
+        .output()
+        .expect("symbols");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("helios init"));
+}
